@@ -16,6 +16,7 @@ pub struct AppConfig {
     pub ui: UiConfig,
     pub debug: DebugConfig,
     pub power: PowerConfig,
+    pub codex: CodexConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +64,21 @@ pub struct PowerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_duration_secs: Option<u64>,
     pub prevent_closed_display_sleep: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodexConfig {
+    pub active_profile_id: String,
+    pub profiles: Vec<CodexProfileConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexProfileConfig {
+    pub id: String,
+    pub name: String,
+    pub codex_home: String,
 }
 
 impl Default for GeneralConfig {
@@ -126,6 +142,155 @@ impl Default for PowerConfig {
     }
 }
 
+fn default_codex_home_path() -> String {
+    runtime_env::home_dir()
+        .map(|home| home.join(".codex").to_string_lossy().to_string())
+        .unwrap_or_else(|| ".codex".to_string())
+}
+
+fn default_codex_profile() -> CodexProfileConfig {
+    CodexProfileConfig {
+        id: "default".to_string(),
+        name: "Default (.codex)".to_string(),
+        codex_home: default_codex_home_path(),
+    }
+}
+
+impl Default for CodexConfig {
+    fn default() -> Self {
+        Self {
+            active_profile_id: "default".to_string(),
+            profiles: vec![default_codex_profile()],
+        }
+    }
+}
+
+impl CodexConfig {
+    pub fn normalize(&mut self) {
+        let mut normalized = Vec::new();
+        let mut seen_ids = std::collections::BTreeSet::new();
+        let mut seen_paths = std::collections::BTreeSet::new();
+
+        for profile in self.profiles.drain(..) {
+            let id = profile.id.trim();
+            let name = profile.name.trim();
+            let codex_home = profile.codex_home.trim();
+            if id.is_empty()
+                || name.is_empty()
+                || codex_home.is_empty()
+                || !seen_ids.insert(id.to_string())
+            {
+                continue;
+            }
+            let canonical_home = canonicalize_codex_home_or_original(codex_home);
+            if !seen_paths.insert(canonical_home) {
+                continue;
+            }
+            normalized.push(CodexProfileConfig {
+                id: id.to_string(),
+                name: name.to_string(),
+                codex_home: codex_home.to_string(),
+            });
+        }
+
+        if let Some(default_profile) = normalized
+            .iter_mut()
+            .find(|profile| profile.id == "default")
+        {
+            if default_profile.name.trim().is_empty() {
+                default_profile.name = "Default (.codex)".to_string();
+            }
+            if default_profile.codex_home.trim().is_empty() {
+                default_profile.codex_home = default_codex_home_path();
+            }
+        } else {
+            normalized.insert(0, default_codex_profile());
+        }
+
+        if normalized.is_empty() {
+            normalized.push(default_codex_profile());
+        }
+
+        for profile in discover_local_codex_profiles() {
+            let canonical_home = canonicalize_codex_home_or_original(&profile.codex_home);
+            if !seen_ids.insert(profile.id.clone()) || !seen_paths.insert(canonical_home) {
+                continue;
+            }
+            normalized.push(profile);
+        }
+
+        if !normalized
+            .iter()
+            .any(|profile| profile.id == self.active_profile_id)
+        {
+            self.active_profile_id = normalized[0].id.clone();
+        }
+
+        self.profiles = normalized;
+    }
+
+    pub fn active_profile(&self) -> &CodexProfileConfig {
+        self.profile_by_id(&self.active_profile_id)
+            .unwrap_or_else(|| {
+                self.profiles
+                    .first()
+                    .expect("codex profiles should never be empty")
+            })
+    }
+
+    pub fn profile_by_id(&self, profile_id: &str) -> Option<&CodexProfileConfig> {
+        self.profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+    }
+}
+
+fn canonicalize_codex_home_or_original(path: &str) -> String {
+    fs::canonicalize(path)
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.trim().to_string())
+}
+
+fn discover_local_codex_profiles() -> Vec<CodexProfileConfig> {
+    let Some(home_dir) = runtime_env::home_dir() else {
+        return Vec::new();
+    };
+
+    let entries = match fs::read_dir(home_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut profiles = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if !file_name.starts_with(".codex") || file_name == ".codex" || file_name == ".codex-shared"
+        {
+            continue;
+        }
+
+        let path = entry.path();
+        if !path.is_dir() || !path.join("state_5.sqlite").is_file() {
+            continue;
+        }
+
+        let id = file_name.trim_start_matches('.').trim().to_string();
+        if id.is_empty() {
+            continue;
+        }
+
+        profiles.push(CodexProfileConfig {
+            id: id.clone(),
+            name: file_name.to_string(),
+            codex_home: path.to_string_lossy().to_string(),
+        });
+    }
+
+    profiles.sort_by(|left, right| left.id.cmp(&right.id));
+    profiles
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -133,6 +298,7 @@ impl Default for AppConfig {
             ui: UiConfig::default(),
             debug: DebugConfig::default(),
             power: PowerConfig::default(),
+            codex: CodexConfig::default(),
         }
     }
 }
@@ -175,23 +341,27 @@ impl AppConfig {
         let path = Self::path();
 
         if !path.exists() {
-            let config = Self::default();
+            let mut config = Self::default();
+            config.codex.normalize();
             config.save_unlocked()?;
             return Ok(config);
         }
 
         let raw = fs::read_to_string(&path)?;
-        let config = toml::from_str::<Self>(&raw).unwrap_or_default();
+        let mut config = toml::from_str::<Self>(&raw).unwrap_or_default();
+        config.codex.normalize();
         Ok(config)
     }
 
     fn save_unlocked(&self) -> anyhow::Result<()> {
+        let mut normalized = self.clone();
+        normalized.codex.normalize();
         let path = Self::path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let raw = toml::to_string_pretty(self)?;
+        let raw = toml::to_string_pretty(&normalized)?;
         let temp_path = path.with_extension("toml.tmp");
         fs::write(&temp_path, raw)?;
         replace_file(&temp_path, &path)?;
@@ -281,7 +451,8 @@ mod tests {
             .into_iter()
             .map(|key| (key, std::env::var_os(key)))
             .collect();
-        let root = std::env::temp_dir().join(format!("panes-app-config-home-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("supacodex-app-config-home-{}", Uuid::new_v4()));
         let local_app_data = root.join("AppData").join("Local");
         let roaming_app_data = root.join("AppData").join("Roaming");
         fs::create_dir_all(&local_app_data).expect("temp local app data should exist");

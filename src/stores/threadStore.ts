@@ -23,6 +23,7 @@ interface ThreadState {
   threadsByWorkspace: Record<string, Thread[]>;
   archivedThreadsByWorkspace: Record<string, Thread[]>;
   activeThreadId: string | null;
+  loadedOnce: boolean;
   loading: boolean;
   error?: string;
   createThread: (input: CreateThreadInput) => Promise<string | null>;
@@ -114,13 +115,14 @@ function threadMatchesRequestedModel(thread: Thread, modelId: string): boolean {
   return thread.modelId === modelId || readThreadLastModelId(thread) === modelId;
 }
 
-const LAST_THREAD_KEY = "panes:lastActiveThreadId";
+const LAST_THREAD_KEY = "supacodex:lastActiveThreadId";
 
 export const useThreadStore = create<ThreadState>((set, get) => ({
   threads: [],
   threadsByWorkspace: {},
   archivedThreadsByWorkspace: {},
   activeThreadId: null,
+  loadedOnce: false,
   loading: false,
   createThread: async ({ workspaceId, repoId, engineId, modelId, title }) => {
     const effectiveEngine = engineId ?? DEFAULT_ENGINE;
@@ -268,6 +270,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
         threadsByWorkspace: {},
         archivedThreadsByWorkspace: {},
         activeThreadId: null,
+        loadedOnce: true,
         loading: false,
         error: undefined,
       });
@@ -299,10 +302,11 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
         threadsByWorkspace,
         threads,
         activeThreadId: restoredId,
+        loadedOnce: true,
         loading: false,
       });
     } catch (error) {
-      set({ loading: false, error: String(error) });
+      set({ loadedOnce: true, loading: false, error: String(error) });
     }
   },
   removeThread: async (threadId) => {

@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
+import { ChevronLeft, ChevronRight } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { Sidebar } from "../sidebar/Sidebar";
 import { ChatPanel } from "../chat/ChatPanel";
 import { HarnessPanel } from "../onboarding/HarnessPanel";
@@ -7,9 +9,9 @@ import { WorkspaceSettingsPage } from "../workspace/WorkspaceSettingsPage";
 import { GitPanel } from "../git/GitPanel";
 import { usesCustomWindowFrame } from "../../lib/windowActions";
 import { useUiStore } from "../../stores/uiStore";
-import { handleDragDoubleClick, handleDragMouseDown } from "../../lib/windowDrag";
+import { handleDragMouseDown } from "../../lib/windowDrag";
 
-const SIDEBAR_WIDTH_KEY = "panes:sidebar-width";
+const SIDEBAR_WIDTH_KEY = "supacodex:sidebar-width";
 const MIN_SIDEBAR = 160;
 const MAX_SIDEBAR = 380;
 const DEFAULT_SIDEBAR = 220;
@@ -26,21 +28,25 @@ function loadSidebarWidth(): number {
 }
 
 export function ThreeColumnLayout() {
+  const { t } = useTranslation(["app", "git"]);
   const showSidebar = useUiStore((state) => state.showSidebar);
-  const sidebarPinned = useUiStore((state) => state.sidebarPinned);
   const showGitPanel = useUiStore((state) => state.showGitPanel);
   const focusMode = useUiStore((state) => state.focusMode);
   const activeView = useUiStore((state) => state.activeView);
+  const toggleSidebar = useUiStore((state) => state.toggleSidebar);
+  const toggleGitPanel = useUiStore((state) => state.toggleGitPanel);
   const customWindowFrame = usesCustomWindowFrame();
 
-  const sidebarVisible = showSidebar && sidebarPinned;
+  const sidebarVisible = showSidebar;
   const centerDefaultSize = showGitPanel ? 74 : 100;
   const fullBleedContent = focusMode || !showSidebar;
   const showFocusDragStrip = focusMode && !showSidebar && !showGitPanel && !customWindowFrame;
 
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
+  const [revealedClosedEdge, setRevealedClosedEdge] = useState<"left" | "right" | null>(null);
   const draggingRef = useRef(false);
   const handleRef = useRef<HTMLDivElement>(null);
+  const contentCardRef = useRef<HTMLDivElement>(null);
 
   // Persist sidebar width
   useEffect(() => {
@@ -68,19 +74,54 @@ export function ThreeColumnLayout() {
     document.addEventListener("mouseup", onUp);
   }, [sidebarWidth]);
 
+  const handleContentPointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    const element = contentCardRef.current;
+    if (!element || focusMode) {
+      return;
+    }
+
+    const rect = element.getBoundingClientRect();
+    const pointerX = event.clientX - rect.left;
+    const edgeRevealThreshold = 52;
+
+    if (!showSidebar && pointerX <= edgeRevealThreshold) {
+      setRevealedClosedEdge("left");
+      return;
+    }
+
+    if (!showGitPanel && pointerX >= rect.width - edgeRevealThreshold) {
+      setRevealedClosedEdge("right");
+      return;
+    }
+
+    setRevealedClosedEdge(null);
+  }, [focusMode, showGitPanel, showSidebar]);
+
+  const handleContentPointerLeave = useCallback(() => {
+    setRevealedClosedEdge(null);
+  }, []);
+
   return (
     <div className="layout-root">
-      {/* Unpinned sidebar — collapsed rail + hover flyout */}
-      {showSidebar && !sidebarPinned && <Sidebar />}
-
-      {/* Pinned sidebar */}
       {sidebarVisible && (
-        <div className="layout-sidebar" style={{ width: sidebarWidth }}>
-          <Sidebar />
+        <div className="layout-sidebar-shell" style={{ width: sidebarWidth }}>
+          <div className="layout-sidebar">
+            <Sidebar />
+          </div>
+          {!focusMode && (
+            <button
+              type="button"
+              className="layout-edge-toggle layout-edge-toggle-left-open"
+              aria-label={t("app:sidebar.hideSidebarPanel")}
+              title={t("app:sidebar.hideSidebarPanel")}
+              onClick={toggleSidebar}
+            >
+              <ChevronLeft size={12} />
+            </button>
+          )}
         </div>
       )}
 
-      {/* Sidebar resize handle (pinned only) */}
       {sidebarVisible && (
         <div
           ref={handleRef}
@@ -90,12 +131,46 @@ export function ThreeColumnLayout() {
       )}
 
       {/* Floating content card */}
-      <div className={`content-card ${fullBleedContent ? "content-card-full" : ""}`}>
+      <div
+        ref={contentCardRef}
+        className={`content-card ${fullBleedContent ? "content-card-full" : ""}`}
+        onPointerMove={handleContentPointerMove}
+        onPointerLeave={handleContentPointerLeave}
+      >
+        {!focusMode && !showSidebar && (
+          <button
+            type="button"
+            className={`layout-edge-toggle layout-edge-toggle-left-closed ${
+              revealedClosedEdge === "left" ? "layout-edge-toggle-revealed" : ""
+            }`}
+            tabIndex={revealedClosedEdge === "left" ? 0 : -1}
+            aria-hidden={revealedClosedEdge === "left" ? undefined : true}
+            aria-label={t("app:sidebar.showSidebarPanel")}
+            title={t("app:sidebar.showSidebarPanel")}
+            onClick={toggleSidebar}
+          >
+            <ChevronRight size={12} />
+          </button>
+        )}
+        {!focusMode && !showGitPanel && (
+          <button
+            type="button"
+            className={`layout-edge-toggle layout-edge-toggle-right-closed ${
+              revealedClosedEdge === "right" ? "layout-edge-toggle-revealed" : ""
+            }`}
+            tabIndex={revealedClosedEdge === "right" ? 0 : -1}
+            aria-hidden={revealedClosedEdge === "right" ? undefined : true}
+            aria-label={t("app:sidebar.showGitPanel")}
+            title={t("app:sidebar.showGitPanel")}
+            onClick={toggleGitPanel}
+          >
+            <ChevronLeft size={12} />
+          </button>
+        )}
         {showFocusDragStrip && (
           <div
             className="focus-drag-strip"
             onMouseDown={handleDragMouseDown}
-            onDoubleClick={handleDragDoubleClick}
           />
         )}
         <PanelGroup
@@ -119,7 +194,18 @@ export function ThreeColumnLayout() {
 
           {showGitPanel && (
             <Panel defaultSize={26} minSize={18} maxSize={40}>
-              <div className="content-panel" style={{ height: "100%" }}>
+              <div className="content-panel layout-git-shell" style={{ height: "100%" }}>
+                {!focusMode && (
+                  <button
+                    type="button"
+                    className="layout-edge-toggle layout-edge-toggle-right-open"
+                    aria-label={t("app:sidebar.hideGitPanel")}
+                    title={t("app:sidebar.hideGitPanel")}
+                    onClick={toggleGitPanel}
+                  >
+                    <ChevronRight size={12} />
+                  </button>
+                )}
                 <GitPanel />
               </div>
             </Panel>

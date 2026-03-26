@@ -220,7 +220,7 @@ mod tests {
     use uuid::Uuid;
 
     fn with_temp_path<T>(f: impl FnOnce(PathBuf, PathBuf) -> T) -> T {
-        let root = std::env::temp_dir().join(format!("panes-reveal-path-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("supacodex-reveal-path-{}", Uuid::new_v4()));
         let dir = root.join("nested");
         let file = dir.join("file.txt");
         fs::create_dir_all(&dir).expect("temp dir should exist");

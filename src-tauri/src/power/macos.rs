@@ -26,8 +26,8 @@ use super::{
     SpawnedKeepAwakeChild, SupportStatus,
 };
 
-const ASSERTION_NAME: &str = "Panes Keep Awake";
-const DISPLAY_ASSERTION_NAME: &str = "Panes Keep Display Awake";
+const ASSERTION_NAME: &str = "SupaCodex Keep Awake";
+const DISPLAY_ASSERTION_NAME: &str = "SupaCodex Keep Display Awake";
 const K_IOPM_ASSERTION_LEVEL_ON: u32 = 255;
 const K_IO_MESSAGE_CAN_SYSTEM_SLEEP: u32 = 0xE000_0270;
 const K_IO_MESSAGE_SYSTEM_WILL_SLEEP: u32 = 0xE000_0280;
@@ -408,7 +408,7 @@ fn spawn_notification_thread(
     let thread_state = state.clone();
 
     let handle = thread::Builder::new()
-        .name("panes-macos-power".to_string())
+        .name("supacodex-macos-power".to_string())
         .spawn(move || {
             if let Err(error) = notification_thread_main(thread_state.clone(), ready_tx) {
                 state.status_code.store(1, Ordering::Release);

@@ -6,8 +6,16 @@ use std::{
 };
 
 use crate::{
+    codex_profiles::{
+        build_codex_resume_command as build_codex_resume_command_string,
+        codex_profile_id_from_metadata, detect_codex_projects, runtime_profile_from_config,
+    },
     config::app_config::AppConfig,
     locale::{normalize_app_locale, resolve_app_locale},
+    models::{
+        CodexDetectedProjectDto, CodexDetectedProjectProfileDto, CodexDetectedThreadDto,
+        CodexProfileDto, CodexProfilesStateDto,
+    },
     state::AppState,
     terminal_notifications::{
         agent_notification_settings_status, install_terminal_notification_integration,
@@ -21,6 +29,29 @@ use tauri_plugin_notification::NotificationExt;
 
 fn err_to_string(error: impl ToString) -> String {
     error.to_string()
+}
+
+fn map_codex_profile_dto(
+    profile: &crate::config::app_config::CodexProfileConfig,
+) -> CodexProfileDto {
+    CodexProfileDto {
+        id: profile.id.clone(),
+        name: profile.name.clone(),
+        codex_home: profile.codex_home.clone(),
+        is_default: profile.id == "default",
+    }
+}
+
+fn codex_profiles_state_dto(config: &AppConfig) -> CodexProfilesStateDto {
+    CodexProfilesStateDto {
+        active_profile_id: config.codex.active_profile_id.clone(),
+        profiles: config
+            .codex
+            .profiles
+            .iter()
+            .map(map_codex_profile_dto)
+            .collect(),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -117,7 +148,7 @@ fn preview_notification_sound_via_notification(
     let mut notification = app
         .notification()
         .builder()
-        .title("Panes")
+        .title("SupaCodex")
         .body("Notification sound preview");
     if sound != "none" && !sound.is_empty() {
         notification = notification.sound(sound);
@@ -288,4 +319,169 @@ pub async fn show_agent_notification(
     body: String,
 ) -> Result<(), String> {
     show_agent_desktop_notification(&app, &title, &body).map_err(err_to_string)
+}
+
+#[tauri::command]
+pub async fn get_codex_profiles() -> Result<CodexProfilesStateDto, String> {
+    tokio::task::spawn_blocking(move || {
+        let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        Ok(codex_profiles_state_dto(&config))
+    })
+    .await
+    .map_err(err_to_string)?
+}
+
+#[tauri::command]
+pub async fn save_codex_profiles(
+    state: State<'_, AppState>,
+    profiles: Vec<CodexProfileDto>,
+    active_profile_id: String,
+) -> Result<CodexProfilesStateDto, String> {
+    let config_write_lock = state.config_write_lock.clone();
+    let engines = state.engines.clone();
+    let _guard = config_write_lock.lock_owned().await;
+
+    let (dto, runtime_profile) = tokio::task::spawn_blocking(move || {
+        let mut config = AppConfig::load_or_create().map_err(err_to_string)?;
+        config.codex.active_profile_id = active_profile_id.trim().to_string();
+        config.codex.profiles = profiles
+            .into_iter()
+            .map(|profile| crate::config::app_config::CodexProfileConfig {
+                id: profile.id,
+                name: profile.name,
+                codex_home: profile.codex_home,
+            })
+            .collect();
+        config.codex.normalize();
+        let dto = codex_profiles_state_dto(&config);
+        let runtime_profile = runtime_profile_from_config(&config);
+        config.save().map_err(err_to_string)?;
+        Ok::<_, String>((dto, runtime_profile))
+    })
+    .await
+    .map_err(err_to_string)??;
+
+    engines
+        .set_codex_profile(runtime_profile)
+        .await
+        .map_err(err_to_string)?;
+
+    Ok(dto)
+}
+
+#[tauri::command]
+pub async fn set_active_codex_profile(
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> Result<CodexProfilesStateDto, String> {
+    let config_write_lock = state.config_write_lock.clone();
+    let engines = state.engines.clone();
+    let _guard = config_write_lock.lock_owned().await;
+
+    let (dto, runtime_profile) = tokio::task::spawn_blocking(move || {
+        let mut config = AppConfig::load_or_create().map_err(err_to_string)?;
+        config.codex.active_profile_id = profile_id.trim().to_string();
+        config.codex.normalize();
+        let runtime_profile = runtime_profile_from_config(&config);
+        let dto = codex_profiles_state_dto(&config);
+        config.save().map_err(err_to_string)?;
+        Ok::<_, String>((dto, runtime_profile))
+    })
+    .await
+    .map_err(err_to_string)??;
+
+    engines
+        .set_codex_profile(runtime_profile)
+        .await
+        .map_err(err_to_string)?;
+
+    Ok(dto)
+}
+
+#[tauri::command]
+pub async fn list_codex_detected_projects(
+    state: State<'_, AppState>,
+) -> Result<Vec<CodexDetectedProjectDto>, String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        let workspaces = crate::db::workspaces::list_workspaces(&db).map_err(err_to_string)?;
+        let projects = detect_codex_projects(&config, &workspaces).map_err(err_to_string)?;
+        Ok::<_, String>(
+            projects
+                .into_iter()
+                .map(|project| CodexDetectedProjectDto {
+                    path: project.path,
+                    name: project.name,
+                    thread_count: project.thread_count,
+                    last_activity_at: project.last_activity_at,
+                    workspace_id: project.workspace_id,
+                    profiles: project
+                        .profiles
+                        .into_iter()
+                        .map(|profile| CodexDetectedProjectProfileDto {
+                            profile_id: profile.profile_id,
+                            profile_name: profile.profile_name,
+                            thread_count: profile.thread_count,
+                            last_activity_at: profile.last_activity_at,
+                            latest_thread_title: profile.latest_thread_title,
+                        })
+                        .collect(),
+                    threads: project
+                        .threads
+                        .into_iter()
+                        .map(|thread| CodexDetectedThreadDto {
+                            engine_thread_id: thread.engine_thread_id,
+                            title: thread.title,
+                            preview: thread.preview,
+                            created_at: thread.created_at,
+                            updated_at: thread.updated_at,
+                            profile_id: thread.profile_id,
+                            profile_name: thread.profile_name,
+                            model_provider: thread.model_provider,
+                            archived: thread.archived,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        )
+    })
+    .await
+    .map_err(err_to_string)?
+}
+
+#[tauri::command]
+pub async fn build_codex_resume_command_for_thread(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<Option<String>, String> {
+    let db = state.db.clone();
+    let active_profile = state.engines.active_codex_profile().await;
+    tokio::task::spawn_blocking(move || {
+        let thread = crate::db::threads::get_thread(&db, &thread_id)
+            .map_err(err_to_string)?
+            .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+
+        if thread.engine_id != "codex" {
+            return Ok(None);
+        }
+
+        let Some(engine_thread_id) = thread.engine_thread_id.as_deref() else {
+            return Ok(None);
+        };
+
+        let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        let profile = codex_profile_id_from_metadata(thread.engine_metadata.as_ref())
+            .as_deref()
+            .and_then(|profile_id| config.codex.profile_by_id(profile_id))
+            .or_else(|| config.codex.profile_by_id(&active_profile.id))
+            .unwrap_or_else(|| config.codex.active_profile());
+
+        Ok(Some(build_codex_resume_command_string(
+            profile,
+            engine_thread_id,
+        )))
+    })
+    .await
+    .map_err(err_to_string)?
 }

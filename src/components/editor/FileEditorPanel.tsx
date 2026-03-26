@@ -55,6 +55,17 @@ export function FileEditorPanel() {
             <div
               key={tab.id}
               onClick={() => setActiveTab(tab.id)}
+              onMouseDown={(event) => {
+                if (event.button === 1) {
+                  event.preventDefault();
+                }
+              }}
+              onAuxClick={(event) => {
+                if (event.button === 1) {
+                  event.preventDefault();
+                  requestCloseTab(tab.id);
+                }
+              }}
               className={`editor-tab ${tab.id === activeTabId ? "active" : ""}`}
             >
               <FileText

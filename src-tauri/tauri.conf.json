@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Panes",
+  "productName": "SupaCodex",
   "version": "0.46.1",
-  "identifier": "com.panes.app",
+  "identifier": "com.supacodex.app",
   "build": {
     "beforeDevCommand": "pnpm run dev",
     "beforeBuildCommand": "node scripts/build-desktop.mjs",
@@ -14,12 +14,13 @@
     "windows": [
       {
         "create": false,
-        "title": "Panes",
+        "title": "SupaCodex",
         "width": 1460,
         "height": 920,
         "minWidth": 1080,
         "minHeight": 680,
         "resizable": true,
+        "transparent": true,
         "decorations": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true
@@ -42,11 +43,11 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": false
   },
   "plugins": {
     "updater": {
-      "endpoints": ["https://wygoralves.github.io/panes/latest.json"],
+      "endpoints": [],
       "dialog": false,
       "windows": {
         "installMode": "passive"

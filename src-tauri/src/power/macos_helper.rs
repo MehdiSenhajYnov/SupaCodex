@@ -1,10 +1,10 @@
 //! Communication layer between the Tauri app and the privileged
-//! `PanesKeepAwakeHelper` daemon that controls `IOPMSetSystemPowerSetting`.
+//! `SupaCodexKeepAwakeHelper` daemon that controls `IOPMSetSystemPowerSetting`.
 //!
 //! The helper runs as root via launchd (registered through `SMAppService`) and
 //! listens on a Unix domain socket.  This module provides:
 //!
-//! - Status queries via the bundled `PanesHelperRegistrar` binary
+//! - Status queries via the bundled `SupaCodexHelperRegistrar` binary
 //! - `preventSleep` / `allowSleep` commands over the Unix socket
 //! - Connection management with reconnection on failure
 
@@ -21,9 +21,9 @@ use tokio::{
     time::timeout,
 };
 
-const HELPER_SOCKET_PATH: &str = "/var/run/com.panes.app.keepawake.sock";
+const HELPER_SOCKET_PATH: &str = "/var/run/com.supacodex.app.keepawake.sock";
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
-const REGISTRAR_BINARY_NAME: &str = "PanesHelperRegistrar";
+const REGISTRAR_BINARY_NAME: &str = "SupaCodexHelperRegistrar";
 
 /// Registration status of the privileged helper daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,14 +73,14 @@ struct HelperResponse {
 // Registrar (status / register / unregister)
 // ---------------------------------------------------------------------------
 
-/// Resolve the path to the bundled `PanesHelperRegistrar` binary.
+/// Resolve the path to the bundled `SupaCodexHelperRegistrar` binary.
 ///
 /// In a Tauri `.app` bundle the layout is:
-///   Panes.app/Contents/MacOS/Panes          (main binary)
-///   Panes.app/Contents/MacOS/PanesHelperRegistrar
+///   SupaCodex.app/Contents/MacOS/SupaCodex          (main binary)
+///   SupaCodex.app/Contents/MacOS/SupaCodexHelperRegistrar
 ///
 /// During development (`cargo test` / `cargo run`) the build script emits the
-/// helper next to the Cargo binary under `target/<profile>/PanesHelperRegistrar`.
+/// helper next to the Cargo binary under `target/<profile>/SupaCodexHelperRegistrar`.
 /// Older builds may still leave a copy in `src-tauri/helper/build`.
 fn resolve_registrar_path() -> Option<PathBuf> {
     // Production: next to the main executable inside the app bundle.
@@ -106,14 +106,14 @@ fn resolve_registrar_path() -> Option<PathBuf> {
 
 fn run_registrar(args: &[&str]) -> Result<RegistrarOutput, String> {
     let registrar = resolve_registrar_path()
-        .ok_or_else(|| "PanesHelperRegistrar binary not found".to_string())?;
+        .ok_or_else(|| "SupaCodexHelperRegistrar binary not found".to_string())?;
 
     let output = std::process::Command::new(&registrar)
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
-        .map_err(|e| format!("failed to run PanesHelperRegistrar: {e}"))?;
+        .map_err(|e| format!("failed to run SupaCodexHelperRegistrar: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str::<RegistrarOutput>(stdout.trim())
@@ -373,7 +373,10 @@ mod tests {
 
     #[test]
     fn socket_path_is_expected() {
-        assert_eq!(HELPER_SOCKET_PATH, "/var/run/com.panes.app.keepawake.sock");
+        assert_eq!(
+            HELPER_SOCKET_PATH,
+            "/var/run/com.supacodex.app.keepawake.sock"
+        );
     }
 
     #[test]

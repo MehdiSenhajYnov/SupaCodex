@@ -37,7 +37,11 @@ export function isTerminalInputFocused(doc: Document | undefined = globalThis.do
     && activeElement.classList.contains("xterm-helper-textarea");
 }
 
-export function shouldHandleAppShortcutWhileTerminalFocused(key: string, shiftKey: boolean): boolean {
+export function shouldHandleAppShortcutWhileTerminalFocused(
+  key: string,
+  shiftKey: boolean,
+  altKey = false,
+): boolean {
   const normalizedKey = key.toLowerCase();
 
   // Keep browser/WebView save-page suppression active in every focus state.
@@ -47,6 +51,19 @@ export function shouldHandleAppShortcutWhileTerminalFocused(key: string, shiftKe
 
   // These shortcuts are owned by the app and do not have a native-menu fallback.
   if (normalizedKey === "i" && shiftKey) {
+    return true;
+  }
+
+  if (
+    altKey &&
+    (
+      normalizedKey === "arrowleft"
+      || normalizedKey === "arrowright"
+      || normalizedKey === "arrowup"
+      || normalizedKey === "arrowdown"
+      || normalizedKey === "w"
+    )
+  ) {
     return true;
   }
 

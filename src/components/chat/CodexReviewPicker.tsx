@@ -1,7 +1,8 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDown, Search } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { useAnchoredPopoverPosition } from "../shared/anchoredPopoverPosition";
 import type { CodexReviewDelivery, CodexReviewTarget } from "../../types";
 
 interface CodexReviewPickerProps {
@@ -36,24 +37,17 @@ export function CodexReviewPicker({
   const [customInstructions, setCustomInstructions] = useState("");
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState({ bottom: 0, left: 0 });
+  const pos = useAnchoredPopoverPosition({
+    open,
+    triggerRef,
+    popoverRef,
+    preferredDirection: "top",
+    align: "center",
+  });
 
   useEffect(() => {
     setBaseBranch(defaultBaseBranch ?? "");
   }, [defaultBaseBranch]);
-
-  useLayoutEffect(() => {
-    if (!open || !triggerRef.current) {
-      return;
-    }
-
-    const rect = triggerRef.current.getBoundingClientRect();
-    const left = Math.max(8, Math.min(rect.left, window.innerWidth - 420));
-    setPos({
-      bottom: window.innerHeight - rect.top + 6,
-      left,
-    });
-  }, [open]);
 
   useEffect(() => {
     if (!open) {
@@ -149,7 +143,7 @@ export function CodexReviewPicker({
             style={{
               position: "fixed",
               zIndex: 1300,
-              bottom: pos.bottom,
+              top: pos.top,
               left: pos.left,
               width: "min(400px, calc(100vw - 16px))",
             }}

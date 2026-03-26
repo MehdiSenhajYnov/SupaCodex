@@ -60,7 +60,7 @@ function run(command, args) {
   });
 }
 
-if (process.env.PANES_SKIP_DESKTOP_PREBUILD === "1") {
+if (process.env.SUPACODEX_SKIP_DESKTOP_PREBUILD === "1") {
   await ensureArtifactsExist();
   console.log("Using prebuilt desktop artifacts.");
   process.exit(0);

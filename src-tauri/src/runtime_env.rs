@@ -277,7 +277,7 @@ fn augmented_path_entries_for(
         entries.push(PathBuf::from("/nix/var/nix/profiles/default/bin"));
         entries.push(PathBuf::from("/run/current-system/sw/bin"));
         // /etc/environment is sourced by PAM/systemd on most distros.
-        // When Panes is launched from a .desktop file (e.g. .deb install),
+        // When SupaCodex is launched from a .desktop file (e.g. .deb install),
         // the process PATH is minimal — this fills the gap.
         entries.extend(parse_path_from_env_file(
             Path::new("/etc/environment"),
@@ -615,19 +615,19 @@ fn app_data_dir_for(
 ) -> PathBuf {
     if is_windows {
         if let Some(path) = local_app_data {
-            return path.join("Panes");
+            return path.join("SupaCodex");
         }
         if let Some(path) = roaming_app_data {
-            return path.join("Panes");
+            return path.join("SupaCodex");
         }
         if let Some(home) = home {
-            return home.join("AppData").join("Local").join("Panes");
+            return home.join("AppData").join("Local").join("SupaCodex");
         }
-        return env::temp_dir().join("Panes");
+        return env::temp_dir().join("SupaCodex");
     }
 
     home.map(legacy_app_data_dir_for)
-        .unwrap_or_else(|| Path::new(".").join(".agent-workspace"))
+        .unwrap_or_else(|| Path::new(".").join(".supacodex"))
 }
 
 fn non_empty_os_str(value: Option<&OsStr>) -> Option<&OsStr> {
@@ -635,7 +635,7 @@ fn non_empty_os_str(value: Option<&OsStr>) -> Option<&OsStr> {
 }
 
 fn legacy_app_data_dir_for(home: &Path) -> PathBuf {
-    home.join(".agent-workspace")
+    home.join(".supacodex")
 }
 
 fn migrate_legacy_app_data_dir_for(current: &Path, legacy: Option<&Path>) -> std::io::Result<()> {
@@ -988,7 +988,7 @@ mod tests {
     fn windows_login_probe_shells_prefer_pwsh_before_powershell() {
         let _env_guard = env_lock().lock().expect("env lock poisoned");
         let temp_dir = std::env::temp_dir().join(format!(
-            "panes-runtime-env-pwsh-{}",
+            "supacodex-runtime-env-pwsh-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time after epoch")
@@ -1040,7 +1040,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = std::env::temp_dir().join(format!(
-            "panes-runtime-env-{}",
+            "supacodex-runtime-env-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time after epoch")
@@ -1069,7 +1069,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = std::env::temp_dir().join(format!(
-            "panes-runtime-env-command-shell-{}",
+            "supacodex-runtime-env-command-shell-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time after epoch")
@@ -1106,7 +1106,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = std::env::temp_dir().join(format!(
-            "panes-runtime-env-shells-{}",
+            "supacodex-runtime-env-shells-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time after epoch")
@@ -1208,26 +1208,29 @@ mod tests {
             Some(Path::new(r"C:\Users\panes\AppData\Roaming")),
             Some(Path::new(r"C:\Users\panes")),
         );
-        assert_eq!(normalize_path(&path), "C:/Users/panes/AppData/Local/Panes");
+        assert_eq!(
+            normalize_path(&path),
+            "C:/Users/supacodex/AppData/Local/SupaCodex"
+        );
     }
 
     #[test]
     fn app_data_dir_for_unix_uses_dot_agent_workspace() {
         let path = app_data_dir_for(false, None, None, Some(Path::new("/home/panes")));
-        assert_eq!(path, PathBuf::from("/home/panes/.agent-workspace"));
+        assert_eq!(path, PathBuf::from("/home/supacodex/.supacodex"));
     }
 
     #[test]
     fn app_data_dir_for_windows_falls_back_to_absolute_temp_dir() {
         let path = app_data_dir_for(true, None, None, None);
-        assert_eq!(path, std::env::temp_dir().join("Panes"));
+        assert_eq!(path, std::env::temp_dir().join("SupaCodex"));
         assert!(path.is_absolute());
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn parse_path_from_env_file_extracts_paths() {
-        let dir = std::env::temp_dir().join(format!("panes-env-file-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("supacodex-env-file-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("create temp dir");
         let env_file = dir.join("environment");
         let home = Path::new("/home/panes");
@@ -1255,7 +1258,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn parse_path_from_env_file_skips_variable_references() {
-        let dir = std::env::temp_dir().join(format!("panes-env-var-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("supacodex-env-var-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("create temp dir");
         let env_file = dir.join("environment");
         let home = Path::new("/home/panes");
@@ -1274,7 +1277,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn parse_path_from_env_file_expands_home_and_supports_spaced_assignment() {
-        let dir = std::env::temp_dir().join(format!("panes-env-home-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("supacodex-env-home-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("create temp dir");
         let env_file = dir.join("environment");
         let home = Path::new("/home/panes");
@@ -1297,7 +1300,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_user_environment_path_entries_reads_conf_files() {
-        let dir = std::env::temp_dir().join(format!("panes-envd-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("supacodex-envd-{}", Uuid::new_v4()));
         let env_d = dir.join(".config/environment.d");
         fs::create_dir_all(&env_d).expect("create environment.d dir");
 
@@ -1314,7 +1317,7 @@ mod tests {
 
     #[test]
     fn npm_global_bin_from_npmrc_reads_prefix() {
-        let dir = std::env::temp_dir().join(format!("panes-npmrc-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("supacodex-npmrc-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("create temp dir");
 
         // Absolute prefix
@@ -1363,9 +1366,10 @@ mod tests {
 
     #[test]
     fn migrate_legacy_app_data_dir_moves_existing_legacy_tree() {
-        let root = std::env::temp_dir().join(format!("panes-app-data-migrate-{}", Uuid::new_v4()));
-        let current = root.join("AppData").join("Local").join("Panes");
-        let legacy = root.join(".agent-workspace");
+        let root =
+            std::env::temp_dir().join(format!("supacodex-app-data-migrate-{}", Uuid::new_v4()));
+        let current = root.join("AppData").join("Local").join("SupaCodex");
+        let legacy = root.join(".supacodex");
 
         fs::create_dir_all(legacy.join("logs")).expect("legacy app data dir should exist");
         fs::write(legacy.join("config.toml"), "theme = \"dark\"\n")
@@ -1385,9 +1389,10 @@ mod tests {
 
     #[test]
     fn migrate_legacy_app_data_dir_preserves_existing_target_data() {
-        let root = std::env::temp_dir().join(format!("panes-app-data-preserve-{}", Uuid::new_v4()));
-        let current = root.join("AppData").join("Local").join("Panes");
-        let legacy = root.join(".agent-workspace");
+        let root =
+            std::env::temp_dir().join(format!("supacodex-app-data-preserve-{}", Uuid::new_v4()));
+        let current = root.join("AppData").join("Local").join("SupaCodex");
+        let legacy = root.join(".supacodex");
 
         fs::create_dir_all(&current).expect("current app data dir should exist");
         fs::create_dir_all(&legacy).expect("legacy app data dir should exist");

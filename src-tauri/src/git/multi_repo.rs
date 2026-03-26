@@ -198,8 +198,8 @@ mod tests {
 
         let tree_id = index.write_tree().expect("write tree");
         let tree = repo.find_tree(tree_id).expect("find tree");
-        let signature =
-            Signature::now("Panes Test", "panes-test@example.com").expect("build signature");
+        let signature = Signature::now("SupaCodex Test", "supacodex-test@example.com")
+            .expect("build signature");
 
         repo.commit(
             Some("HEAD"),
@@ -218,7 +218,7 @@ mod tests {
             .expect("system time")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "panes-default-branch-{suffix}-{}-{nonce}",
+            "supacodex-default-branch-{suffix}-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&path).expect("create temp dir");

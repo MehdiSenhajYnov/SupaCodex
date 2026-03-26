@@ -12,6 +12,7 @@ interface WorkspaceState {
   workspaces: Workspace[];
   archivedWorkspaces: Workspace[];
   activeWorkspaceId: string | null;
+  loadedOnce: boolean;
   repos: Repo[];
   activeRepoId: string | null;
   reposLoading: boolean;
@@ -33,8 +34,8 @@ interface WorkspaceState {
   rescanWorkspace: (workspaceId: string, scanDepth?: number) => Promise<Workspace | null>;
 }
 
-const LAST_WORKSPACE_KEY = "panes:lastActiveWorkspaceId";
-const LAST_REPO_BY_WORKSPACE_KEY = "panes:lastActiveRepoByWorkspace";
+const LAST_WORKSPACE_KEY = "supacodex:lastActiveWorkspaceId";
+const LAST_REPO_BY_WORKSPACE_KEY = "supacodex:lastActiveRepoByWorkspace";
 let reposLoadSeq = 0;
 
 type LastRepoByWorkspace = Record<string, string>;
@@ -135,6 +136,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   workspaces: [],
   archivedWorkspaces: [],
   activeWorkspaceId: null,
+  loadedOnce: false,
   repos: [],
   activeRepoId: null,
   reposLoading: false,
@@ -145,7 +147,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       const workspaces = await ipc.listWorkspaces();
       const savedId = localStorage.getItem(LAST_WORKSPACE_KEY);
       const activeWorkspaceId = resolveStartupWorkspaceId(workspaces, savedId);
-      set({ workspaces, activeWorkspaceId, loading: false });
+      set({ workspaces, activeWorkspaceId, loadedOnce: true, loading: false });
       if (activeWorkspaceId) {
         await useTerminalStore.getState().prepareWorkspaceActivation(activeWorkspaceId);
         useGitStore.getState().loadDraftsForWorkspace(activeWorkspaceId);
@@ -153,7 +155,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       }
       await get().refreshArchivedWorkspaces();
     } catch (error) {
-      set({ loading: false, error: String(error) });
+      set({ loadedOnce: true, loading: false, error: String(error) });
     }
   },
   refreshArchivedWorkspaces: async () => {

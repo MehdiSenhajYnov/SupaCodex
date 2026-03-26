@@ -34,8 +34,9 @@ use crate::{process_utils, runtime_env};
 use super::{
     codex_event_mapper::TurnEventMapper, codex_protocol::IncomingMessage,
     codex_transport::CodexTransport, ActionResult, ApprovalRequestRoute, CodexRemoteThreadSummary,
-    Engine, EngineEvent, EngineThread, ModelAvailabilityNux, ModelInfo, ModelUpgradeInfo,
-    ReasoningEffortOption, SandboxPolicy, ThreadScope, ThreadSyncSnapshot, TurnAttachment,
+    CodexThreadTranscriptSnapshot, Engine, EngineEvent, EngineThread, ModelAvailabilityNux,
+    ModelInfo, ModelUpgradeInfo, ReasoningEffortOption, SandboxPolicy, ThreadScope,
+    ThreadSyncSnapshot, ThreadTranscriptMessage, ThreadTranscriptMessageRole, TurnAttachment,
     TurnCompletionStatus, TurnInput, TurnInputItem,
 };
 
@@ -50,6 +51,7 @@ const THREAD_LIST_METHODS: &[&str] = &["thread/list"];
 const THREAD_FORK_METHODS: &[&str] = &["thread/fork"];
 const THREAD_ROLLBACK_METHODS: &[&str] = &["thread/rollback"];
 const THREAD_COMPACT_START_METHODS: &[&str] = &["thread/compact/start"];
+const THREAD_SHELL_COMMAND_METHODS: &[&str] = &["thread/shellCommand"];
 const REVIEW_START_METHODS: &[&str] = &["review/start"];
 const EXPERIMENTAL_FEATURE_LIST_METHODS: &[&str] = &["experimentalFeature/list"];
 const COLLABORATION_MODE_LIST_METHODS: &[&str] = &["collaborationMode/list"];
@@ -82,6 +84,7 @@ const PLAN_MODE_PROMPT_PREFIX: &str =
 pub struct CodexEngine {
     state: Arc<Mutex<CodexState>>,
     runtime_events: broadcast::Sender<CodexRuntimeEvent>,
+    profile: Arc<Mutex<CodexRuntimeProfile>>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +132,7 @@ impl Default for CodexEngine {
         Self {
             state: Arc::new(Mutex::new(CodexState::default())),
             runtime_events,
+            profile: Arc::new(Mutex::new(CodexRuntimeProfile::default())),
         }
     }
 }
@@ -139,6 +143,26 @@ pub struct CodexExecutableResolution {
     pub source: &'static str,
     pub app_path: Option<String>,
     pub login_shell_executable: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexRuntimeProfile {
+    pub id: String,
+    pub name: String,
+    pub codex_home: PathBuf,
+}
+
+impl Default for CodexRuntimeProfile {
+    fn default() -> Self {
+        let codex_home = runtime_env::home_dir()
+            .map(|home| home.join(".codex"))
+            .unwrap_or_else(|| PathBuf::from(".codex"));
+        Self {
+            id: "default".to_string(),
+            name: "Default (.codex)".to_string(),
+            codex_home,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -730,7 +754,7 @@ impl Engine for CodexEngine {
                             reason.as_deref(),
                         );
                         log::warn!(
-                            "codex requested external ChatGPT token refresh, but Panes does not manage chatgptAuthTokens mode"
+                            "codex requested external ChatGPT token refresh, but SupaCodex does not manage chatgptAuthTokens mode"
                         );
                         self
                             .publish_external_auth_tokens_warning(
@@ -749,7 +773,7 @@ impl Engine for CodexEngine {
                         .respond_error(
                           &raw_id,
                           -32601,
-                          "`account/chatgptAuthTokens/refresh` is not supported by Panes",
+                          "`account/chatgptAuthTokens/refresh` is not supported by SupaCodex",
                           Some(serde_json::json!({
                             "method": method,
                             "normalizedMethod": normalized_method,
@@ -1044,6 +1068,35 @@ impl Engine for CodexEngine {
 impl CodexEngine {
     pub fn subscribe_runtime_events(&self) -> broadcast::Receiver<CodexRuntimeEvent> {
         self.runtime_events.subscribe()
+    }
+
+    pub async fn set_profile(&self, profile: CodexRuntimeProfile) -> anyhow::Result<()> {
+        {
+            let state = self.state.lock().await;
+            if !state.active_turn_ids.is_empty() {
+                anyhow::bail!("cannot switch Codex profile while a turn is still active");
+            }
+        }
+
+        let changed = {
+            let mut current = self.profile.lock().await;
+            if *current == profile {
+                false
+            } else {
+                *current = profile;
+                true
+            }
+        };
+
+        if changed {
+            self.invalidate_transport("codex profile changed").await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn active_profile(&self) -> CodexRuntimeProfile {
+        self.profile.lock().await.clone()
     }
 
     pub async fn prewarm(&self) -> anyhow::Result<()> {
@@ -1449,7 +1502,7 @@ impl CodexEngine {
                             reason.as_deref(),
                         );
                         log::warn!(
-                            "codex requested external ChatGPT token refresh during review, but Panes does not manage chatgptAuthTokens mode"
+                            "codex requested external ChatGPT token refresh during review, but SupaCodex does not manage chatgptAuthTokens mode"
                         );
                         self
                             .publish_external_auth_tokens_warning(
@@ -1468,7 +1521,7 @@ impl CodexEngine {
                         .respond_error(
                           &raw_id,
                           -32601,
-                          "`account/chatgptAuthTokens/refresh` is not supported by Panes",
+                          "`account/chatgptAuthTokens/refresh` is not supported by SupaCodex",
                           Some(serde_json::json!({
                             "method": method,
                             "normalizedMethod": normalized_method,
@@ -1630,6 +1683,393 @@ impl CodexEngine {
         Ok(())
     }
 
+    pub async fn send_shell_command(
+        &self,
+        engine_thread_id: &str,
+        command: &str,
+        event_tx: mpsc::Sender<EngineEvent>,
+        cancellation: CancellationToken,
+    ) -> Result<(), anyhow::Error> {
+        let trimmed_command = command.trim();
+        if trimmed_command.is_empty() {
+            return Err(anyhow::anyhow!("shell command cannot be empty"));
+        }
+
+        let transport = self.ensure_ready_transport().await?;
+        if let Some(message) = self.unsupported_external_auth_tokens_message().await {
+            return Err(anyhow::anyhow!(message));
+        }
+
+        let mut mapper = TurnEventMapper::default();
+        let mut subscription = transport.subscribe();
+        let thread_id = engine_thread_id.to_string();
+
+        let transport_for_shell_command = transport.clone();
+        let thread_id_for_shell_command = thread_id.clone();
+        let command_for_shell_command = trimmed_command.to_string();
+        let shell_command_task = tokio::spawn(async move {
+            request_thread_shell_command(
+                transport_for_shell_command.as_ref(),
+                &thread_id_for_shell_command,
+                &command_for_shell_command,
+            )
+            .await
+        });
+
+        let mut shell_command_task = shell_command_task;
+        let mut request_done = false;
+        let mut completion_seen = false;
+        let mut expected_turn_id: Option<String> = None;
+        let mut completion_last_progress_at: Option<Instant> = None;
+        let completion_inactivity_timeout = completion_inactivity_timeout();
+
+        while !completion_seen || !request_done {
+            tokio::select! {
+              _ = cancellation.cancelled() => {
+                shell_command_task.abort();
+                self
+                  .interrupt(&thread_id)
+                  .await
+                  .context("failed to interrupt codex shell command on cancellation")?;
+                return Ok(());
+              }
+              response = &mut shell_command_task, if !request_done => {
+                request_done = true;
+                let result = match response {
+                  Ok(Ok(result)) => result,
+                  Ok(Err(error)) => {
+                    if is_auth_related_error(&error.to_string()) {
+                      self
+                        .invalidate_transport(
+                          "resetting codex transport after auth failure while starting shell command",
+                        )
+                        .await;
+                    }
+                    return Err(error).context("thread/shellCommand request failed");
+                  }
+                  Err(error) => {
+                    return Err(anyhow::Error::from(error).context("thread/shellCommand task join failed"));
+                  }
+                };
+
+                if let Some(turn_id) = extract_turn_id(&result) {
+                  rebind_expected_turn_id(
+                    &mut expected_turn_id,
+                    &turn_id,
+                    &thread_id,
+                    "thread/shellCommand result",
+                  );
+                  self.set_active_turn(&thread_id, &turn_id).await;
+                }
+
+                for event in mapper.map_turn_result(&result) {
+                  if event_indicates_sandbox_denial(&event) {
+                    self.force_external_sandbox_for_thread(&thread_id).await;
+                  }
+                  if event_indicates_auth_failure(&event) {
+                    self
+                      .invalidate_transport(
+                        "resetting codex transport after auth failure during shell command result",
+                      )
+                      .await;
+                  }
+                  if matches!(event, EngineEvent::TurnCompleted { .. }) {
+                    completion_seen = true;
+                    self.clear_active_turn(&thread_id).await;
+                  }
+                  event_tx.send(event).await.ok();
+                }
+
+                if !completion_seen {
+                  completion_last_progress_at = Some(Instant::now());
+                }
+              }
+              incoming = subscription.recv() => {
+                match incoming {
+                  Ok(IncomingMessage::Notification { method, params }) => {
+                    let normalized_method = normalize_method(&method);
+                    if let Some(error_message) =
+                      transport_failure_message(normalized_method.as_str(), &params)
+                    {
+                      self.clear_active_turn(&thread_id).await;
+                      self.invalidate_transport(&error_message).await;
+                      if request_done
+                        && self
+                          .try_emit_reconciled_turn_completion(
+                            &thread_id,
+                            expected_turn_id.as_deref(),
+                            &event_tx,
+                            "stream failure while waiting for shell command events",
+                            TurnCompletionRecoveryMode::StreamLost,
+                          )
+                          .await
+                      {
+                        completion_seen = true;
+                        break;
+                      }
+                      return Err(anyhow::anyhow!(error_message));
+                    }
+
+                    if !belongs_to_thread(&params, &thread_id) {
+                      continue;
+                    }
+                    if normalized_method == "turn/started" {
+                      if let Some(turn_id) = extract_turn_id(&params) {
+                        rebind_expected_turn_id(
+                          &mut expected_turn_id,
+                          &turn_id,
+                          &thread_id,
+                          "turn/started shell notification",
+                        );
+                        self.set_active_turn(&thread_id, &turn_id).await;
+                      }
+                    } else if !belongs_to_turn(&params, expected_turn_id.as_deref()) {
+                      continue;
+                    }
+
+                    if normalized_method == "turn/completed" {
+                      self.clear_active_turn(&thread_id).await;
+                    }
+                    if request_done && !completion_seen {
+                      completion_last_progress_at = Some(Instant::now());
+                    }
+
+                    let mapped_events = mapper.map_notification(&method, &params);
+                    if mapped_events.is_empty()
+                        && !is_known_codex_notification_method(&normalized_method)
+                    {
+                        log::debug!(
+                            "codex notification not mapped during shell command: method={method}, normalized={normalized_method}, params_keys={:?}",
+                            params.as_object().map(|object| object.keys().collect::<Vec<_>>())
+                        );
+                    }
+
+                    for event in mapped_events {
+                      if event_indicates_sandbox_denial(&event) {
+                        self.force_external_sandbox_for_thread(&thread_id).await;
+                      }
+                      if event_indicates_auth_failure(&event) {
+                        self
+                          .invalidate_transport(
+                            "resetting codex transport after auth failure during streamed shell command event",
+                          )
+                          .await;
+                      }
+                      if matches!(event, EngineEvent::TurnCompleted { .. }) {
+                        completion_seen = true;
+                        self.clear_active_turn(&thread_id).await;
+                      }
+                      event_tx.send(event).await.ok();
+                    }
+                  }
+                  Ok(IncomingMessage::Request { id, raw_id, method, params }) => {
+                    log::debug!(
+                      "codex shell server request: method={method}, id={id}, raw_id={raw_id}, params_keys={:?}",
+                      params.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                    );
+                    if !belongs_to_thread(&params, &thread_id) {
+                      log::warn!("codex shell server request dropped by belongs_to_thread: method={method}");
+                      continue;
+                    }
+                    if !belongs_to_turn(&params, expected_turn_id.as_deref()) {
+                      log::warn!("codex shell server request dropped by belongs_to_turn: method={method}");
+                      continue;
+                    }
+                    let normalized_method = normalize_method(&method);
+                    if method_signature(&method) == "accountchatgptauthtokensrefresh" {
+                        let reason = extract_any_string(&params, &["reason"]);
+                        let previous_account_id =
+                            extract_any_string(&params, &["previousAccountId", "previous_account_id"]);
+                        let message = unsupported_external_auth_tokens_message(
+                            previous_account_id.as_deref(),
+                            reason.as_deref(),
+                        );
+                        log::warn!(
+                            "codex requested external ChatGPT token refresh during shell command, but SupaCodex does not manage chatgptAuthTokens mode"
+                        );
+                        self
+                            .publish_external_auth_tokens_warning(
+                                previous_account_id.clone(),
+                                reason.clone(),
+                            )
+                            .await;
+                        event_tx
+                            .send(EngineEvent::Error {
+                                message,
+                                recoverable: true,
+                            })
+                            .await
+                            .ok();
+                        transport
+                        .respond_error(
+                          &raw_id,
+                          -32601,
+                          "`account/chatgptAuthTokens/refresh` is not supported by SupaCodex",
+                          Some(serde_json::json!({
+                            "method": method,
+                            "normalizedMethod": normalized_method,
+                          })),
+                        )
+                        .await
+                        .ok();
+                      continue;
+                    }
+
+                    if let Some(approval) =
+                        mapper.map_server_request(&id, &raw_id, &method, &params)
+                    {
+                      if request_done && !completion_seen {
+                        completion_last_progress_at = Some(Instant::now());
+                      }
+                      self
+                        .register_approval_request(
+                          &approval.approval_id,
+                          &raw_id,
+                          &approval.server_method,
+                        )
+                        .await;
+                      event_tx.send(approval.event).await.ok();
+                    } else {
+                      let message = format!("Unsupported Codex server request method `{method}`");
+
+                      event_tx
+                        .send(EngineEvent::Error {
+                          message: message.clone(),
+                          recoverable: true,
+                        })
+                        .await
+                        .ok();
+
+                      transport
+                        .respond_error(
+                          &raw_id,
+                          -32601,
+                          &message,
+                          Some(serde_json::json!({
+                            "method": method,
+                            "normalizedMethod": normalized_method,
+                          })),
+                        )
+                        .await
+                        .ok();
+                    }
+                  }
+                  Ok(IncomingMessage::Response(_)) => {}
+                  Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    let error_message = format!(
+                        "codex transport lagged while waiting for shell command events; skipped {skipped} messages"
+                    );
+                    self.clear_active_turn(&thread_id).await;
+                    self.invalidate_transport(&error_message).await;
+                    if request_done
+                        && self
+                            .try_emit_reconciled_turn_completion(
+                                &thread_id,
+                                expected_turn_id.as_deref(),
+                                &event_tx,
+                                "lagged shell-command subscription",
+                                TurnCompletionRecoveryMode::StreamLost,
+                            )
+                            .await
+                    {
+                        completion_seen = true;
+                        break;
+                    }
+                    return Err(anyhow::anyhow!(error_message));
+                  }
+                  Err(broadcast::error::RecvError::Closed) => {
+                    self.clear_active_turn(&thread_id).await;
+                    self
+                      .invalidate_transport("codex transport subscription closed while waiting for shell command events")
+                      .await;
+                    if request_done
+                        && self
+                            .try_emit_reconciled_turn_completion(
+                                &thread_id,
+                                expected_turn_id.as_deref(),
+                                &event_tx,
+                                "closed shell-command subscription",
+                                TurnCompletionRecoveryMode::StreamLost,
+                            )
+                            .await
+                    {
+                        completion_seen = true;
+                        break;
+                    }
+                    return Err(anyhow::anyhow!(
+                      "codex transport closed while waiting for shell command events"
+                    ));
+                  }
+                }
+              }
+              _ = tokio::time::sleep(Duration::from_millis(200)), if request_done && !completion_seen && completion_inactivity_timeout.is_some() => {
+                if let Some(last_progress_at) = completion_last_progress_at {
+                  if Instant::now().duration_since(last_progress_at)
+                    >= completion_inactivity_timeout.expect("guarded by is_some")
+                  {
+                    log::warn!(
+                      "codex shell command completion inactivity timeout reached for thread {thread_id}; synthesizing completion"
+                    );
+                    break;
+                  }
+                }
+              }
+            }
+        }
+
+        if !completion_seen {
+            if !self
+                .try_emit_reconciled_turn_completion(
+                    &thread_id,
+                    expected_turn_id.as_deref(),
+                    &event_tx,
+                    "shell command completion inactivity timeout",
+                    TurnCompletionRecoveryMode::CompletionTimeout,
+                )
+                .await
+            {
+                event_tx
+                    .send(EngineEvent::Error {
+                        message: "Timed out waiting for `turn/completed` from codex shell command"
+                            .to_string(),
+                        recoverable: false,
+                    })
+                    .await
+                    .ok();
+                event_tx
+                    .send(EngineEvent::TurnCompleted {
+                        token_usage: None,
+                        status: TurnCompletionStatus::Failed,
+                    })
+                    .await
+                    .ok();
+            }
+        }
+
+        self.clear_active_turn(&thread_id).await;
+        Ok(())
+    }
+
+    pub async fn run_active_shell_command(
+        &self,
+        engine_thread_id: &str,
+        command: &str,
+    ) -> Result<(), anyhow::Error> {
+        let trimmed_command = command.trim();
+        if trimmed_command.is_empty() {
+            return Err(anyhow::anyhow!("shell command cannot be empty"));
+        }
+
+        let transport = self.ensure_ready_transport().await?;
+        if let Some(message) = self.unsupported_external_auth_tokens_message().await {
+            return Err(anyhow::anyhow!(message));
+        }
+
+        request_thread_shell_command(transport.as_ref(), engine_thread_id, trimmed_command)
+            .await
+            .map(|_| ())
+    }
+
     pub async fn health_report(&self) -> CodexHealthReport {
         let resolution = resolve_codex_executable().await;
         let version_result = self.probe_version_from_resolution(&resolution).await;
@@ -1706,12 +2146,12 @@ impl CodexEngine {
 
         if prefer_external_sandbox_by_default() {
             Some(
-                "Panes is forcing Codex external sandbox mode on macOS to avoid opaque tool-call failures in local workspace-write mode. Set `PANES_CODEX_PREFER_WORKSPACE_WRITE=1` only for diagnostics."
+                "SupaCodex is forcing Codex external sandbox mode on macOS to avoid opaque tool-call failures in local workspace-write mode. Set `SUPACODEX_CODEX_PREFER_WORKSPACE_WRITE=1` only for diagnostics."
                     .to_string(),
             )
         } else {
             Some(
-                "macOS denied Codex local sandbox (`sandbox-exec`). Commands may fail unless Panes uses external sandbox mode. This is an OS/policy restriction, not a promptable permission.".to_string(),
+                "macOS denied Codex local sandbox (`sandbox-exec`). Commands may fail unless SupaCodex uses external sandbox mode. This is an OS/policy restriction, not a promptable permission.".to_string(),
             )
         }
     }
@@ -1720,11 +2160,12 @@ impl CodexEngine {
         &self,
         resolution: &CodexExecutableResolution,
     ) -> Result<String, String> {
+        let profile = self.active_profile().await;
         let executable = resolution
             .executable
             .as_ref()
             .ok_or_else(|| CODEX_MISSING_DEFAULT_DETAILS.to_string())?;
-        let output = codex_command(executable)
+        let output = codex_command(executable, &profile)
             .arg("--version")
             .output()
             .await
@@ -1865,6 +2306,38 @@ impl CodexEngine {
             preview: extract_thread_preview(&result),
             raw_status: extract_thread_runtime_status_type(&result),
             active_flags: extract_thread_runtime_active_flags(&result),
+        })
+    }
+
+    pub async fn read_thread_transcript_snapshot(
+        &self,
+        engine_thread_id: &str,
+    ) -> anyhow::Result<CodexThreadTranscriptSnapshot> {
+        let transport = self.ensure_ready_transport().await?;
+        let params = serde_json::json!({
+          "threadId": engine_thread_id,
+          "includeTurns": true,
+        });
+
+        let result = request_with_fallback(
+            transport.as_ref(),
+            THREAD_READ_METHODS,
+            params,
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .context("failed to read codex thread transcript")?;
+
+        Ok(CodexThreadTranscriptSnapshot {
+            sync: ThreadSyncSnapshot {
+                title: extract_thread_title(&result),
+                preview: extract_thread_preview(&result),
+                raw_status: extract_thread_runtime_status_type(&result),
+                active_flags: extract_thread_runtime_active_flags(&result),
+            },
+            messages: extract_thread_transcript_messages(&result),
+            created_at: extract_thread_created_at(&result),
+            updated_at: extract_thread_updated_at(&result),
         })
     }
 
@@ -2062,6 +2535,7 @@ impl CodexEngine {
 
     async fn spawn_transport_with_backoff(&self) -> anyhow::Result<Arc<CodexTransport>> {
         let resolution = resolve_codex_executable().await;
+        let profile = self.active_profile().await;
         let codex_executable = resolution.executable.as_ref().ok_or_else(|| {
             anyhow::anyhow!(codex_unavailable_details(&resolution)
                 .unwrap_or_else(|| CODEX_MISSING_DEFAULT_DETAILS.to_string()))
@@ -2071,7 +2545,8 @@ impl CodexEngine {
         let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 0..TRANSPORT_RESTART_MAX_ATTEMPTS {
-            match CodexTransport::spawn(codex_executable.to_string_lossy().as_ref()).await {
+            match CodexTransport::spawn(codex_executable.to_string_lossy().as_ref(), &profile).await
+            {
                 Ok(transport) => return Ok(Arc::new(transport)),
                 Err(error) => {
                     log::warn!(
@@ -2124,8 +2599,8 @@ impl CodexEngine {
 
         let initialize_params = serde_json::json!({
           "clientInfo": {
-            "name": "panes",
-            "title": "Panes",
+            "name": "supacodex",
+            "title": "SupaCodex",
             "version": env!("CARGO_PKG_VERSION"),
           },
           "capabilities": {
@@ -2947,7 +3422,7 @@ fn codex_unavailable_details_for_platform(
 
     match (platform, resolution.login_shell_executable.as_ref()) {
         ("macos", Some(shell_path)) => Some(format!(
-            "Codex was found in your login shell at `{}`, but Panes does not see this in its app PATH. This is common when launching from Finder on macOS. App PATH: `{}`",
+            "Codex was found in your login shell at `{}`, but SupaCodex does not see this in its app PATH. This is common when launching from Finder on macOS. App PATH: `{}`",
             shell_path.display(),
             path_preview
         )),
@@ -2956,7 +3431,7 @@ fn codex_unavailable_details_for_platform(
             CODEX_MISSING_DEFAULT_DETAILS, path_preview
         )),
         (_, Some(shell_path)) => Some(format!(
-            "Codex was found in your login shell at `{}`, but Panes does not see this in its app PATH. App PATH: `{}`",
+            "Codex was found in your login shell at `{}`, but SupaCodex does not see this in its app PATH. App PATH: `{}`",
             shell_path.display(),
             path_preview
         )),
@@ -2989,23 +3464,23 @@ fn codex_execution_failure_details_for_platform(
     {
         if platform == "windows" {
             return format!(
-                "Codex executable was found at `{executable}`, but Panes could not find `node` when launching it. This usually means Node.js is not installed or its install directory is missing from PATH on Windows. App PATH: `{path_preview}`. Error: {error}"
+                "Codex executable was found at `{executable}`, but SupaCodex could not find `node` when launching it. This usually means Node.js is not installed or its install directory is missing from PATH on Windows. App PATH: `{path_preview}`. Error: {error}"
             );
         }
 
         if platform != "macos" {
             return format!(
-                "Codex executable was found at `{executable}`, but Panes could not find `node` when launching it. App PATH: `{path_preview}`. Error: {error}"
+                "Codex executable was found at `{executable}`, but SupaCodex could not find `node` when launching it. App PATH: `{path_preview}`. Error: {error}"
             );
         }
 
         return format!(
-            "Codex executable was found at `{executable}`, but Panes could not find `node` when launching it (Finder-launched apps often have a limited PATH). App PATH: `{path_preview}`. Error: {error}"
+            "Codex executable was found at `{executable}`, but SupaCodex could not find `node` when launching it (Finder-launched apps often have a limited PATH). App PATH: `{path_preview}`. Error: {error}"
         );
     }
 
     format!(
-        "Codex executable was found at `{executable}`, but Panes could not run it. App PATH: `{path_preview}`. Error: {error}"
+        "Codex executable was found at `{executable}`, but SupaCodex could not run it. App PATH: `{path_preview}`. Error: {error}"
     )
 }
 
@@ -3076,11 +3551,11 @@ fn codex_fix_commands_for_platform(
                         "launchctl setenv PATH \"{}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\"",
                         bin_dir.display()
                     ));
-                    fixes.push("open -a Panes".to_string());
+                    fixes.push("open -a SupaCodex".to_string());
                 }
             } else {
                 fixes.push("/bin/zsh -lic 'command -v codex && codex --version'".to_string());
-                fixes.push("open -a Panes".to_string());
+                fixes.push("open -a SupaCodex".to_string());
             }
         } else if execution_error.is_some() {
             if let Some(executable) = resolution.executable.as_ref() {
@@ -3095,7 +3570,7 @@ fn codex_fix_commands_for_platform(
                 "/bin/zsh -lic 'command -v node && command -v codex && codex --version'"
                     .to_string(),
             );
-            fixes.push("open -a Panes".to_string());
+            fixes.push("open -a SupaCodex".to_string());
         }
 
         return fixes;
@@ -3108,7 +3583,7 @@ fn codex_fix_commands_for_platform(
             fixes.push("where codex".to_string());
             fixes.push("echo %APPDATA%".to_string());
             fixes.push(
-                "Ensure `%APPDATA%\\npm` is present in PATH, then restart Panes.".to_string(),
+                "Ensure `%APPDATA%\\npm` is present in PATH, then restart SupaCodex.".to_string(),
             );
             return fixes;
         }
@@ -3118,7 +3593,7 @@ fn codex_fix_commands_for_platform(
             fixes.push("where codex".to_string());
             fixes.push("echo %PATH%".to_string());
             fixes.push(
-                "Ensure Node.js 20+ is installed and visible to Panes, then restart the app."
+                "Ensure Node.js 20+ is installed and visible to SupaCodex, then restart the app."
                     .to_string(),
             );
         }
@@ -3145,12 +3620,13 @@ fn codex_augmented_path(executable: &Path) -> Option<OsString> {
     )
 }
 
-fn codex_command(executable: &Path) -> Command {
+fn codex_command(executable: &Path, profile: &CodexRuntimeProfile) -> Command {
     let mut command = Command::new(executable);
     process_utils::configure_tokio_command(&mut command);
     if let Some(augmented_path) = codex_augmented_path(executable) {
         command.env("PATH", augmented_path);
     }
+    command.env("CODEX_HOME", &profile.codex_home);
     command
 }
 
@@ -3286,6 +3762,24 @@ async fn request_turn_steer(
     request_with_fallback(transport, TURN_STEER_METHODS, params, TURN_REQUEST_TIMEOUT)
         .await
         .context("codex turn/steer request failed")
+}
+
+async fn request_thread_shell_command(
+    transport: &CodexTransport,
+    thread_id: &str,
+    command: &str,
+) -> anyhow::Result<serde_json::Value> {
+    request_with_fallback(
+        transport,
+        THREAD_SHELL_COMMAND_METHODS,
+        serde_json::json!({
+            "threadId": thread_id,
+            "command": command,
+        }),
+        TURN_REQUEST_TIMEOUT,
+    )
+    .await
+    .context("codex thread/shellCommand request failed")
 }
 
 async fn build_turn_start_params(
@@ -3853,7 +4347,7 @@ async fn detect_macos_sandbox_exec_failure() -> bool {
 fn prefer_external_sandbox_by_default() -> bool {
     #[cfg(target_os = "macos")]
     {
-        let override_workspace_write = env::var("PANES_CODEX_PREFER_WORKSPACE_WRITE")
+        let override_workspace_write = env::var("SUPACODEX_CODEX_PREFER_WORKSPACE_WRITE")
             .ok()
             .map(|value| {
                 let normalized = value.trim().to_lowercase();
@@ -4098,7 +4592,7 @@ fn build_reconciled_turn_completion_events(
     {
         events.push(EngineEvent::Error {
             message:
-                "Codex finished after Panes lost the live event stream, so the transcript may be incomplete."
+                "Codex finished after SupaCodex lost the live event stream, so the transcript may be incomplete."
                     .to_string(),
             recoverable: true,
         });
@@ -4157,6 +4651,129 @@ fn extract_thread_preview(value: &serde_json::Value) -> Option<String> {
     }
 
     None
+}
+
+fn extract_thread_created_at(value: &serde_json::Value) -> Option<i64> {
+    let thread = value.get("thread").unwrap_or(value);
+    extract_any_i64(thread, &["createdAt", "created_at"])
+}
+
+fn extract_thread_updated_at(value: &serde_json::Value) -> Option<i64> {
+    let thread = value.get("thread").unwrap_or(value);
+    extract_any_i64(thread, &["updatedAt", "updated_at"])
+        .or_else(|| extract_thread_created_at(value))
+}
+
+fn extract_thread_transcript_messages(value: &serde_json::Value) -> Vec<ThreadTranscriptMessage> {
+    let Some(turns) = extract_thread_turns(value) else {
+        return Vec::new();
+    };
+
+    let mut messages = Vec::new();
+    for turn in turns {
+        let Some(items) = turn.get("items").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+
+        let mut user_messages = Vec::<String>::new();
+        let mut final_answers = Vec::<String>::new();
+        let mut commentary_messages = Vec::<String>::new();
+
+        for item in items {
+            match item.get("type").and_then(serde_json::Value::as_str) {
+                Some("userMessage") => {
+                    if let Some(text) = extract_user_message_text(item) {
+                        user_messages.push(text);
+                    }
+                }
+                Some("agentMessage") => {
+                    let Some(text) = extract_any_string(item, &["text"])
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                    else {
+                        continue;
+                    };
+
+                    match item
+                        .get("phase")
+                        .and_then(serde_json::Value::as_str)
+                        .map(normalize_method)
+                        .as_deref()
+                    {
+                        Some("final_answer") => final_answers.push(text),
+                        _ => commentary_messages.push(text),
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for content in user_messages {
+            messages.push(ThreadTranscriptMessage {
+                role: ThreadTranscriptMessageRole::User,
+                content,
+            });
+        }
+
+        let assistant_content = if !final_answers.is_empty() {
+            Some(join_transcript_segments(&final_answers))
+        } else if !commentary_messages.is_empty() {
+            commentary_messages
+                .last()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        } else {
+            extract_nested_string(turn, &["error", "message"])
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+
+        if let Some(content) = assistant_content {
+            messages.push(ThreadTranscriptMessage {
+                role: ThreadTranscriptMessageRole::Assistant,
+                content,
+            });
+        }
+    }
+
+    messages
+}
+
+fn extract_user_message_text(item: &serde_json::Value) -> Option<String> {
+    let content_items = item.get("content").and_then(serde_json::Value::as_array)?;
+    let mut segments = Vec::new();
+
+    for entry in content_items {
+        match entry.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") => {
+                if let Some(text) = extract_any_string(entry, &["text"]) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        segments.push(trimmed.to_string());
+                    }
+                }
+            }
+            Some("image") | Some("localImage") if segments.is_empty() => {
+                segments.push("[Image]".to_string());
+            }
+            _ => {}
+        }
+    }
+
+    if segments.is_empty() {
+        None
+    } else {
+        Some(join_transcript_segments(&segments))
+    }
+}
+
+fn join_transcript_segments(segments: &[String]) -> String {
+    segments
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn thread_runtime_from_start_response(
@@ -4404,15 +5021,15 @@ fn unsupported_external_auth_tokens_message(
 ) -> String {
     match (previous_account_id, reason) {
         (Some(previous_account_id), Some(reason)) => format!(
-            "Codex is using external ChatGPT auth tokens for account `{previous_account_id}` after `{reason}`, but Panes cannot refresh those tokens. Re-authenticate outside Panes or switch Codex to a managed auth mode."
+            "Codex is using external ChatGPT auth tokens for account `{previous_account_id}` after `{reason}`, but SupaCodex cannot refresh those tokens. Re-authenticate outside SupaCodex or switch Codex to a managed auth mode."
         ),
         (Some(previous_account_id), None) => format!(
-            "Codex is using external ChatGPT auth tokens for account `{previous_account_id}`, but Panes cannot refresh those tokens. Re-authenticate outside Panes or switch Codex to a managed auth mode."
+            "Codex is using external ChatGPT auth tokens for account `{previous_account_id}`, but SupaCodex cannot refresh those tokens. Re-authenticate outside SupaCodex or switch Codex to a managed auth mode."
         ),
         (None, Some(reason)) => format!(
-            "Codex is using external ChatGPT auth tokens after `{reason}`, but Panes cannot refresh those tokens. Re-authenticate outside Panes or switch Codex to a managed auth mode."
+            "Codex is using external ChatGPT auth tokens after `{reason}`, but SupaCodex cannot refresh those tokens. Re-authenticate outside SupaCodex or switch Codex to a managed auth mode."
         ),
-        (None, None) => "Codex is using external ChatGPT auth tokens, but Panes cannot refresh those tokens. Re-authenticate outside Panes or switch Codex to a managed auth mode.".to_string(),
+        (None, None) => "Codex is using external ChatGPT auth tokens, but SupaCodex cannot refresh those tokens. Re-authenticate outside SupaCodex or switch Codex to a managed auth mode.".to_string(),
     }
 }
 
@@ -5809,7 +6426,7 @@ fn parse_optional_timeout_seconds(raw: Option<&str>) -> Option<Duration> {
 
 fn completion_inactivity_timeout() -> Option<Duration> {
     parse_optional_timeout_seconds(
-        env::var("PANES_CODEX_COMPLETION_INACTIVITY_TIMEOUT_SECS")
+        env::var("SUPACODEX_CODEX_COMPLETION_INACTIVITY_TIMEOUT_SECS")
             .ok()
             .as_deref(),
     )
@@ -6442,6 +7059,88 @@ mod tests {
                 Some("turn-active"),
             ),
             None
+        );
+    }
+
+    #[test]
+    fn extract_thread_transcript_messages_prefers_final_answer_and_keeps_user_turns() {
+        let messages = extract_thread_transcript_messages(&json!({
+            "thread": {
+                "turns": [
+                    {
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "content": [
+                                    { "type": "text", "text": "How do I launch the app?" }
+                                ]
+                            },
+                            {
+                                "type": "agentMessage",
+                                "text": "Checking the project first.",
+                                "phase": "commentary"
+                            },
+                            {
+                                "type": "agentMessage",
+                                "text": "Run `pnpm tauri:dev`.",
+                                "phase": "final_answer"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }));
+
+        assert_eq!(
+            messages,
+            vec![
+                ThreadTranscriptMessage {
+                    role: ThreadTranscriptMessageRole::User,
+                    content: "How do I launch the app?".to_string(),
+                },
+                ThreadTranscriptMessage {
+                    role: ThreadTranscriptMessageRole::Assistant,
+                    content: "Run `pnpm tauri:dev`.".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_thread_transcript_messages_falls_back_to_last_commentary() {
+        let messages = extract_thread_transcript_messages(&json!({
+            "thread": {
+                "turns": [
+                    {
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "content": [
+                                    { "type": "text", "text": "Continue." }
+                                ]
+                            },
+                            {
+                                "type": "agentMessage",
+                                "text": "First progress update.",
+                                "phase": "commentary"
+                            },
+                            {
+                                "type": "agentMessage",
+                                "text": "Latest progress update.",
+                                "phase": "commentary"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }));
+
+        assert_eq!(
+            messages.last(),
+            Some(&ThreadTranscriptMessage {
+                role: ThreadTranscriptMessageRole::Assistant,
+                content: "Latest progress update.".to_string(),
+            })
         );
     }
 
@@ -7143,7 +7842,7 @@ mod tests {
                     },
                     {
                         "name": "user-skill",
-                        "path": "/Users/panes/.codex/user-skill",
+                        "path": "/Users/supacodex/.codex/user-skill",
                         "description": "User skill",
                         "enabled": true,
                         "scope": "user"
@@ -7234,7 +7933,7 @@ mod tests {
                 {
                     "name": {
                         "type": "user",
-                        "file": "/Users/panes/.codex/config.toml"
+                        "file": "/Users/supacodex/.codex/config.toml"
                     },
                     "version": "v2",
                     "config": {}
@@ -7252,7 +7951,7 @@ mod tests {
         assert_eq!(mapped.layers.len(), 1);
         assert_eq!(
             mapped.layers[0].source,
-            "user:/Users/panes/.codex/config.toml"
+            "user:/Users/supacodex/.codex/config.toml"
         );
         assert_eq!(mapped.layers[0].version, "v2");
         assert!(mapped.approval_policy.is_some());

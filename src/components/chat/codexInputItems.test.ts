@@ -35,7 +35,7 @@ describe("buildCodexInputItems", () => {
   });
 
   it("falls back to a single text item when no references match", () => {
-    expect(buildCodexInputItems("Plain message", [], [])).toEqual([
+    expect(buildCodexInputItems("Plain message", [], [], [])).toEqual([
       { type: "text", text: "Plain message" },
     ]);
   });
@@ -54,10 +54,44 @@ describe("buildCodexInputItems", () => {
           },
         ],
         [],
+        [],
       ),
     ).toEqual([
       { type: "text", text: "Keep $unknown and use " },
       { type: "skill", name: "lint", path: "/skills/lint" },
+    ]);
+  });
+
+  it("converts matching plugins into mention input items", () => {
+    expect(
+      buildCodexInputItems(
+        "Use $deploy after tests",
+        [],
+        [],
+        [
+          {
+            name: "default",
+            path: "/plugins/default",
+            plugins: [
+              {
+                id: "deploy",
+                name: "Deploy Helper",
+                enabled: true,
+                installed: true,
+                capabilities: ["composer"],
+              },
+            ],
+          },
+        ],
+      ),
+    ).toEqual([
+      { type: "text", text: "Use " },
+      {
+        type: "mention",
+        name: "Deploy Helper",
+        path: "plugin://deploy@default",
+      },
+      { type: "text", text: " after tests" },
     ]);
   });
 });

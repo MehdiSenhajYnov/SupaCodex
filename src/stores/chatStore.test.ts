@@ -1071,6 +1071,95 @@ describe("chatStore send", () => {
     expect(mockIpc.getThreadMessagesWindow).toHaveBeenCalledWith("thread-1", null, 80);
   });
 
+  it("syncs Codex threads whose transcript import is still pending", async () => {
+    const thread = {
+      id: "thread-1",
+      workspaceId: "workspace-1",
+      repoId: null,
+      engineId: "codex" as const,
+      modelId: "gpt-5.3-codex",
+      engineThreadId: "engine-thread-1",
+      engineMetadata: {
+        codexSyncRequired: false,
+        codexTranscriptImported: false,
+      },
+      title: "Thread 1",
+      status: "idle" as const,
+      messageCount: 0,
+      totalTokens: 0,
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+    };
+
+    useThreadStore.setState({
+      threads: [thread],
+      threadsByWorkspace: {
+        "workspace-1": [thread],
+      },
+      archivedThreadsByWorkspace: {},
+      activeThreadId: "thread-1",
+      loading: false,
+      error: undefined,
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    expect(mockIpc.syncThreadFromEngine).toHaveBeenCalledWith("thread-1");
+    expect(mockIpc.getThreadMessagesWindow).toHaveBeenCalledWith("thread-1", null, 80);
+  });
+
+  it("rebinds the active Codex thread when transcript import is still pending", async () => {
+    const thread = {
+      id: "thread-1",
+      workspaceId: "workspace-1",
+      repoId: null,
+      engineId: "codex" as const,
+      modelId: "gpt-5.3-codex",
+      engineThreadId: "engine-thread-1",
+      engineMetadata: {
+        codexSyncRequired: false,
+        codexTranscriptImported: false,
+      },
+      title: "Thread 1",
+      status: "idle" as const,
+      messageCount: 0,
+      totalTokens: 0,
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+    };
+    const existingUnlisten = vi.fn();
+
+    useThreadStore.setState({
+      threads: [thread],
+      threadsByWorkspace: {
+        "workspace-1": [thread],
+      },
+      archivedThreadsByWorkspace: {},
+      activeThreadId: "thread-1",
+      loading: false,
+      error: undefined,
+    });
+    useChatStore.setState({
+      threadId: "thread-1",
+      messages: [],
+      olderCursor: null,
+      hasOlderMessages: false,
+      loadingOlderMessages: false,
+      olderLoadBlockedUntil: 0,
+      status: "idle",
+      streaming: false,
+      usageLimits: null,
+      error: undefined,
+      unlisten: existingUnlisten,
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    expect(existingUnlisten).toHaveBeenCalledTimes(1);
+    expect(mockIpc.syncThreadFromEngine).toHaveBeenCalledWith("thread-1");
+    expect(mockIpc.getThreadMessagesWindow).toHaveBeenCalledWith("thread-1", null, 80);
+  });
+
   it("normalizes deny approvals to decline in optimistic state", async () => {
     useChatStore.setState({
       threadId: "thread-1",

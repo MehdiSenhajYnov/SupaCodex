@@ -1,6 +1,6 @@
 {
   "app": {
-    "submenu": "Panes",
+    "submenu": "SupaCodex",
     "aboutComment": "The open-source cockpit for AI-assisted coding",
     "websiteLabel": "GitHub"
   },
@@ -20,6 +20,11 @@
     "toggleFullscreen": "Toggle Full Screen",
     "search": "Search",
     "toggleTerminal": "Toggle Terminal",
+    "previousConversation": "Previous Conversation",
+    "nextConversation": "Next Conversation",
+    "previousOpenProject": "Previous Open Project",
+    "nextOpenProject": "Next Open Project",
+    "closeConversation": "Close Conversation",
     "close": "Close"
   }
 }

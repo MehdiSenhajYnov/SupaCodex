@@ -1,7 +1,7 @@
 #[cfg(any(target_os = "linux", test))]
-const WAYLAND_CLIENT_PRELOAD_ENV: &str = "PANES_WAYLAND_CLIENT_PRELOAD";
+const WAYLAND_CLIENT_PRELOAD_ENV: &str = "SUPACODEX_WAYLAND_CLIENT_PRELOAD";
 #[cfg(any(target_os = "linux", test))]
-const ORIGINAL_LD_PRELOAD_ENV: &str = "PANES_ORIGINAL_LD_PRELOAD";
+const ORIGINAL_LD_PRELOAD_ENV: &str = "SUPACODEX_ORIGINAL_LD_PRELOAD";
 #[cfg(target_os = "linux")]
 const SYSTEM_WAYLAND_CLIENT_CANDIDATES: &[&str] = &[
     "/usr/lib64/libwayland-client.so.0",
@@ -452,7 +452,10 @@ mod tests {
 
     #[test]
     fn helper_env_var_names_are_stable() {
-        assert_eq!(WAYLAND_CLIENT_PRELOAD_ENV, "PANES_WAYLAND_CLIENT_PRELOAD");
-        assert_eq!(ORIGINAL_LD_PRELOAD_ENV, "PANES_ORIGINAL_LD_PRELOAD");
+        assert_eq!(
+            WAYLAND_CLIENT_PRELOAD_ENV,
+            "SUPACODEX_WAYLAND_CLIENT_PRELOAD"
+        );
+        assert_eq!(ORIGINAL_LD_PRELOAD_ENV, "SUPACODEX_ORIGINAL_LD_PRELOAD");
     }
 }

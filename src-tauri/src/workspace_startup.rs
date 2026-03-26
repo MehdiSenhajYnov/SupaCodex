@@ -749,7 +749,7 @@ mod tests {
     fn workspace_root() -> PathBuf {
         static ROOT: OnceLock<PathBuf> = OnceLock::new();
         ROOT.get_or_init(|| {
-            let root = std::env::temp_dir().join("panes-startup-preset-tests");
+            let root = std::env::temp_dir().join("supacodex-startup-preset-tests");
             std::fs::create_dir_all(&root).unwrap();
             std::fs::create_dir_all(root.join("apps/repo")).unwrap();
             std::fs::create_dir_all(root.join("apps/web")).unwrap();

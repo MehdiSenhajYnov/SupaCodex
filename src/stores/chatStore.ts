@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { ipc, listenThreadEvents } from "../lib/ipc";
 import { recordPerfMetric } from "../lib/perfTelemetry";
+import { useCodexProfileStore } from "./codexProfileStore";
 import { useThreadStore } from "./threadStore";
 import type {
   ApprovalResponse,
@@ -45,6 +46,15 @@ interface ChatState {
       attachments?: ChatAttachment[];
       inputItems?: ChatInputItem[];
       planMode?: boolean;
+    },
+  ) => Promise<boolean>;
+  runCodexShellCommand: (
+    command: string,
+    options?: {
+      threadIdOverride?: string;
+      engineId?: string | null;
+      modelId?: string | null;
+      reasoningEffort?: string | null;
     },
   ) => Promise<boolean>;
   steer: (
@@ -92,6 +102,14 @@ const inflightActionOutputHydration = new Map<string, Promise<void>>();
 
 function isCodexThreadSyncRequired(metadata: Record<string, unknown> | undefined): boolean {
   return metadata?.codexSyncRequired === true;
+}
+
+function isCodexTranscriptImportPending(metadata: Record<string, unknown> | undefined): boolean {
+  return metadata?.codexTranscriptImported === false;
+}
+
+function shouldSyncCodexThread(metadata: Record<string, unknown> | undefined): boolean {
+  return isCodexThreadSyncRequired(metadata) || isCodexTranscriptImportPending(metadata);
 }
 
 function isThreadTurnActive(status: ThreadStatus): boolean {
@@ -1421,7 +1439,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setActiveThread: async (threadId) => {
     const currentThreadId = get().threadId;
     const currentUnlisten = get().unlisten;
-    if (threadId && threadId === currentThreadId && currentUnlisten) {
+    const currentThread =
+      threadId
+        ? useThreadStore.getState().threads.find((thread) => thread.id === threadId)
+        : null;
+    const shouldForceRebind =
+      threadId === currentThreadId &&
+      currentUnlisten !== undefined &&
+      currentThread?.engineId === "codex" &&
+      shouldSyncCodexThread(currentThread.engineMetadata);
+
+    if (threadId && threadId === currentThreadId && currentUnlisten && !shouldForceRebind) {
       return;
     }
 
@@ -1456,10 +1484,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       const threadState = useThreadStore.getState();
       let activeThread = threadState.threads.find((thread) => thread.id === threadId);
-      if (activeThread?.engineId === "codex" && isCodexThreadSyncRequired(activeThread.engineMetadata)) {
+      if (activeThread?.engineId === "codex") {
+        try {
+          await useCodexProfileStore.getState().ensureActiveProfileForThread(activeThread);
+        } catch (error) {
+          console.warn(`Failed to switch Codex profile for thread ${threadId}:`, error);
+        }
+      }
+      if (activeThread?.engineId === "codex" && shouldSyncCodexThread(activeThread.engineMetadata)) {
         try {
           const syncedThread = await ipc.syncThreadFromEngine(threadId);
           threadState.applyThreadUpdateLocal(syncedThread);
+          await useCodexProfileStore.getState().ensureActiveProfileForThread(syncedThread);
           activeThread = syncedThread;
         } catch (error) {
           console.warn(`Failed to sync Codex thread ${threadId}:`, error);
@@ -1811,6 +1847,86 @@ export const useChatStore = create<ChatState>((set, get) => ({
       pendingTurnMetaByThread.delete(threadId);
       set((state) => ({
         messages: state.messages.filter((item) => item.id !== optimisticAssistantMessage.id),
+        status: "error",
+        streaming: false,
+        error: String(error),
+      }));
+      return false;
+    }
+  },
+  runCodexShellCommand: async (command, options) => {
+    const trimmedCommand = command.trim();
+    if (!trimmedCommand) {
+      set({ error: "Shell command cannot be empty." });
+      return false;
+    }
+
+    const state = get();
+    const threadId = options?.threadIdOverride ?? state.threadId;
+    if (!threadId) {
+      set({ error: "No active thread selected" });
+      return false;
+    }
+
+    if (state.streaming) {
+      if (options?.threadIdOverride && options.threadIdOverride !== state.threadId) {
+        set({ error: "Cannot target a different thread while another turn is active." });
+        return false;
+      }
+      try {
+        await ipc.runCodexShellCommand(threadId, trimmedCommand, null);
+        set({ error: undefined });
+        return true;
+      } catch (error) {
+        set({ error: String(error) });
+        return false;
+      }
+    }
+
+    const startedAt = performance.now();
+    const clientTurnId = crypto.randomUUID();
+    const optimisticAssistantMessageId = crypto.randomUUID();
+    pendingTurnMetaByThread.set(threadId, {
+      turnEngineId: options?.engineId ?? "codex",
+      turnModelId: options?.modelId ?? null,
+      turnReasoningEffort: options?.reasoningEffort ?? null,
+      clientTurnId,
+      assistantMessageId: optimisticAssistantMessageId,
+      startedAt,
+      firstShellRecorded: false,
+      firstContentRecorded: false,
+      firstTextRecorded: false,
+    });
+
+    const userMessage = createOptimisticUserMessage(threadId, `!${trimmedCommand}`, {
+      attachments: [],
+      inputItems: [],
+      planMode: false,
+    });
+    const optimisticAssistantMessage = createStreamingAssistantMessage(threadId, {
+      id: optimisticAssistantMessageId,
+      clientTurnId,
+    });
+
+    set((current) => ({
+      messages: applyHydrationWindow([
+        ...current.messages,
+        userMessage,
+        optimisticAssistantMessage,
+      ]),
+      status: "streaming",
+      streaming: true,
+      error: undefined,
+    }));
+    schedulePendingTurnShellMetric(threadId, clientTurnId);
+
+    try {
+      await ipc.runCodexShellCommand(threadId, trimmedCommand, clientTurnId);
+      return true;
+    } catch (error) {
+      pendingTurnMetaByThread.delete(threadId);
+      set((current) => ({
+        messages: current.messages.filter((item) => item.id !== optimisticAssistantMessage.id),
         status: "error",
         streaming: false,
         error: String(error),

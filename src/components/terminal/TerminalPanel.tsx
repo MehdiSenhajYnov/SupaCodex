@@ -5,7 +5,6 @@ import { useTranslation } from "react-i18next";
 import { useHarnessStore } from "../../stores/harnessStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { toast } from "../../stores/toastStore";
-import { handleDragDoubleClick, handleDragMouseDown } from "../../lib/windowDrag";
 import { isLinuxDesktop, isMacDesktop } from "../../lib/windowActions";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
 import { getHarnessIcon } from "../shared/HarnessLogos";
@@ -238,7 +237,7 @@ const PENDING_OUTPUT_MAX_CHARS = 256 * 1024;
 const OUTPUT_DROP_WARN_COOLDOWN_MS = 5000;
 const TERMINAL_SCROLLBACK_LINES = 2000;
 const DETACHED_TERMINAL_IDLE_EVICTION_MS = 2 * 60 * 1000;
-const TERMINAL_EDIT_EVENT = "panes:terminal-edit-action";
+const TERMINAL_EDIT_EVENT = "supacodex:terminal-edit-action";
 const OUTPUT_FLUSH_STALL_FALLBACK_WINDOW_MS = 30000;
 const OUTPUT_FLUSH_STALL_FALLBACK_THRESHOLD = 3;
 const OUTPUT_RESUME_RETRY_BASE_MS = 125;
@@ -1892,10 +1891,10 @@ function createCachedTerminal(
     lineHeight: 1.3,
     scrollback: TERMINAL_SCROLLBACK_LINES,
     theme: {
-      background: "#050505",
+      background: "rgba(0, 0, 0, 0)",
       foreground: "#f5f5f5",
-      selectionBackground: "rgba(255, 107, 107, 0.28)",
-      cursor: "#FF6B6B",
+      selectionBackground: "rgba(139, 92, 246, 0.28)",
+      cursor: "#8B5CF6",
     },
   });
 
@@ -3647,8 +3646,8 @@ export function TerminalPanel({ workspaceId }: TerminalPanelProps) {
           repoMode: "fixed_repo",
           repoPath: repo.path,
           baseBranch: repo.defaultBranch,
-          baseDir: ".panes/worktrees",
-          branchPrefix: "panes/preset",
+          baseDir: ".supacodex/worktrees",
+          branchPrefix: "supacodex/preset",
         };
       }
     }
@@ -3811,6 +3810,17 @@ export function TerminalPanel({ workspaceId }: TerminalPanelProps) {
                   setActiveGroup(workspaceId, group.id);
                 }}
                 onPointerDown={(e) => handleTabPointerDown(e, group.id)}
+                onMouseDown={(event) => {
+                  if (event.button === 1) {
+                    event.preventDefault();
+                  }
+                }}
+                onAuxClick={(event) => {
+                  if (event.button === 1) {
+                    event.preventDefault();
+                    closeGroupFromMenu(group.id);
+                  }
+                }}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   setTerminalCtxMenu(null);
@@ -3912,8 +3922,8 @@ export function TerminalPanel({ workspaceId }: TerminalPanelProps) {
               </button>
               {(() => {
                 const activeGroup = groups.find((g) => g.id === activeGroupId);
-                const hasManyPanes = activeGroup && collectSessionIds(activeGroup.root).length > 1;
-                if (!hasManyPanes) return null;
+                const hasManySupaCodex = activeGroup && collectSessionIds(activeGroup.root).length > 1;
+                if (!hasManySupaCodex) return null;
                 const isBroadcasting = workspaceState?.broadcastGroupId === activeGroupId;
                 return (
                   <button

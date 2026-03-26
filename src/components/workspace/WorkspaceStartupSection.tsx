@@ -293,7 +293,7 @@ export function WorkspaceStartupSection({ workspace }: WorkspaceStartupSectionPr
   const [pendingApplyPreset, setPendingApplyPreset] = useState<WorkspaceStartupPreset | null>(null);
   const [liveSessionCount, setLiveSessionCount] = useState(0);
   const [expandedTabs, setExpandedTabs] = useState<Record<string, boolean>>({});
-  const [expandedPanes, setExpandedPanes] = useState<Record<string, boolean>>({});
+  const [expandedSupaCodex, setExpandedSupaCodex] = useState<Record<string, boolean>>({});
   const loadRequestIdRef = useRef(0);
   const applyInFlightRef = useRef(false);
   const mountedRef = useRef(true);
@@ -954,8 +954,8 @@ export function WorkspaceStartupSection({ workspace }: WorkspaceStartupSectionPr
                                       repoMode: g.worktree?.repoMode ?? "active_repo",
                                       repoPath: g.worktree?.repoPath ?? null,
                                       baseBranch: g.worktree?.baseBranch ?? null,
-                                      baseDir: g.worktree?.baseDir ?? ".panes/worktrees",
-                                      branchPrefix: g.worktree?.branchPrefix ?? "panes/preset",
+                                      baseDir: g.worktree?.baseDir ?? ".supacodex/worktrees",
+                                      branchPrefix: g.worktree?.branchPrefix ?? "supacodex/preset",
                                     }
                                   : null,
                               }))
@@ -1044,7 +1044,7 @@ export function WorkspaceStartupSection({ workspace }: WorkspaceStartupSectionPr
                                     },
                                   }))
                                 }
-                                placeholder=".panes/worktrees"
+                                placeholder=".supacodex/worktrees"
                               />
                             </div>
                             <div className="wss-wt-row">
@@ -1062,7 +1062,7 @@ export function WorkspaceStartupSection({ workspace }: WorkspaceStartupSectionPr
                                     },
                                   }))
                                 }
-                                placeholder="panes/preset"
+                                placeholder="supacodex/preset"
                               />
                             </div>
                           </div>
@@ -1071,10 +1071,10 @@ export function WorkspaceStartupSection({ workspace }: WorkspaceStartupSectionPr
                     </div>
                   )}
 
-                  {/* Panes */}
+                  {/* SupaCodex */}
                   <div className="wss-panes">
                     {group.sessions.map((session, si) => {
-                      const paneExpanded = expandedPanes[session.id] ?? false;
+                      const paneExpanded = expandedSupaCodex[session.id] ?? false;
 
                       return (
                         <div key={session.id} className="wss-pane">
@@ -1115,7 +1115,7 @@ export function WorkspaceStartupSection({ workspace }: WorkspaceStartupSectionPr
                               type="button"
                               className={`wss-icon-btn ${paneExpanded ? "wss-icon-btn-active" : ""}`}
                               onClick={() =>
-                                setExpandedPanes((p) => ({ ...p, [session.id]: !p[session.id] }))
+                                setExpandedSupaCodex((p) => ({ ...p, [session.id]: !p[session.id] }))
                               }
                               title={t("startup.moreOptions")}
                             >

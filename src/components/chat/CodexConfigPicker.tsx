@@ -1,7 +1,8 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDown, SlidersHorizontal } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { useAnchoredPopoverPosition } from "../shared/anchoredPopoverPosition";
 
 export interface CodexConfigPatch {
   updatePersonality: boolean;
@@ -93,7 +94,13 @@ export function CodexConfigPicker({
   );
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState({ bottom: 0, left: 0 });
+  const pos = useAnchoredPopoverPosition({
+    open,
+    triggerRef,
+    popoverRef,
+    preferredDirection: "top",
+    align: "center",
+  });
 
   const initialDraft = useMemo(
     () =>
@@ -132,19 +139,6 @@ export function CodexConfigPicker({
     setDraft(initialDraft);
     setError(null);
   }, [initialDraft, open]);
-
-  useLayoutEffect(() => {
-    if (!open || !triggerRef.current) {
-      return;
-    }
-
-    const rect = triggerRef.current.getBoundingClientRect();
-    const left = Math.max(8, Math.min(rect.left, window.innerWidth - 440));
-    setPos({
-      bottom: window.innerHeight - rect.top + 6,
-      left,
-    });
-  }, [open]);
 
   useEffect(() => {
     if (!open) {
@@ -268,7 +262,7 @@ export function CodexConfigPicker({
             style={{
               position: "fixed",
               zIndex: 1300,
-              bottom: pos.bottom,
+              top: pos.top,
               left: pos.left,
             }}
           >

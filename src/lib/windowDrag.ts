@@ -18,15 +18,19 @@ export function handleDragMouseDown(e: React.MouseEvent) {
   if (e.button !== 0) return;
   if (isInteractive(e.target)) return;
   if (!isTauri()) return;
-  getCurrentWindow().startDragging().catch((error) => {
-    reportWindowActionError("start dragging window", error);
-  });
-}
 
-export function handleDragDoubleClick(e: React.MouseEvent) {
-  if (isInteractive(e.target)) return;
-  if (!isTauri()) return;
-  getCurrentWindow().toggleMaximize().catch((error) => {
-    reportWindowActionError("toggle maximize window", error);
+  const currentWindow = getCurrentWindow();
+  const action =
+    e.detail === 2
+      ? currentWindow.toggleMaximize()
+      : e.detail === 1
+        ? currentWindow.startDragging()
+        : null;
+
+  action?.catch((error) => {
+    reportWindowActionError(
+      e.detail === 2 ? "toggle maximize window" : "start dragging window",
+      error,
+    );
   });
 }

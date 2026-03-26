@@ -174,19 +174,19 @@ struct TokioKeepAwakeChild {
 }
 
 const KEEP_AWAKE_SPAWN_GRACE_PERIOD: Duration = Duration::from_millis(150);
-const WINDOWS_KEEP_AWAKE_MARKER: &str = "PANES_KEEP_AWAKE_WINDOWS";
+const WINDOWS_KEEP_AWAKE_MARKER: &str = "SUPACODEX_KEEP_AWAKE_WINDOWS";
 
 #[cfg(any(target_os = "linux", test))]
 fn build_linux_gnome_inhibit_args(owner_pid: u32, tail: &Path) -> Vec<OsString> {
     vec![
         OsString::from("--app-id"),
-        OsString::from("Panes"),
+        OsString::from("SupaCodex"),
         OsString::from("--inhibit"),
         OsString::from("suspend"),
         OsString::from("--inhibit"),
         OsString::from("idle"),
         OsString::from("--reason"),
-        OsString::from("Keep system awake while Panes is open"),
+        OsString::from("Keep system awake while SupaCodex is open"),
         tail.as_os_str().to_os_string(),
         OsString::from(format!("--pid={owner_pid}")),
         OsString::from("-f"),
@@ -1409,8 +1409,8 @@ fn resolve_backend_spec(profile: &PowerProfile) -> Result<BackendSpec, String> {
                 args: vec![
                     OsString::from(what_arg),
                     OsString::from("--mode=block"),
-                    OsString::from("--who=Panes"),
-                    OsString::from("--why=Keep system awake while Panes is open"),
+                    OsString::from("--who=SupaCodex"),
+                    OsString::from("--why=Keep system awake while SupaCodex is open"),
                     tail.into_os_string(),
                     OsString::from(format!("--pid={owner_pid}")),
                     OsString::from("-f"),
@@ -1475,7 +1475,7 @@ fn resolve_display_inhibit_spec() -> Result<Option<BackendSpec>, String> {
     let script = format!(
         "COOKIE=$({gdbus} call --session --dest org.freedesktop.ScreenSaver \
          --object-path /org/freedesktop/ScreenSaver \
-         --method org.freedesktop.ScreenSaver.Inhibit \"Panes\" \"Keep display awake\" 2>/dev/null \
+         --method org.freedesktop.ScreenSaver.Inhibit \"SupaCodex\" \"Keep display awake\" 2>/dev/null \
          | tr -dc '0-9') && \
          [ -n \"$COOKIE\" ] && \
          trap \"{gdbus} call --session --dest org.freedesktop.ScreenSaver \
@@ -1526,7 +1526,7 @@ fn build_windows_keep_awake_script(owner_pid: u32, profile: &PowerProfile) -> St
     let flags_expr = flags.join(" -bor ");
 
     let screen_saver_type = if profile.prevent_screen_saver {
-        "public static class PanesScreenSaver { \
+        "public static class SupaCodexScreenSaver { \
          [DllImport(\"user32.dll\", SetLastError=true)] \
          public static extern bool SystemParametersInfo(uint action, uint param, IntPtr vparam, uint init); \
          } "
@@ -1536,14 +1536,14 @@ fn build_windows_keep_awake_script(owner_pid: u32, profile: &PowerProfile) -> St
 
     let screen_saver_disable = if profile.prevent_screen_saver {
         "$screenSaverWasActive = (Get-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop' -Name ScreenSaveActive -ErrorAction SilentlyContinue).ScreenSaveActive -eq '1'; \
-         [PanesScreenSaver]::SystemParametersInfo(0x11, 0, [IntPtr]::Zero, 0) | Out-Null; "
+         [SupaCodexScreenSaver]::SystemParametersInfo(0x11, 0, [IntPtr]::Zero, 0) | Out-Null; "
     } else {
         ""
     };
 
     let screen_saver_restore = if profile.prevent_screen_saver {
         "$screenSaverRestoreValue = if ($screenSaverWasActive) { 1 } else { 0 }; \
-         [PanesScreenSaver]::SystemParametersInfo(0x11, $screenSaverRestoreValue, [IntPtr]::Zero, 0) | Out-Null; "
+         [SupaCodexScreenSaver]::SystemParametersInfo(0x11, $screenSaverRestoreValue, [IntPtr]::Zero, 0) | Out-Null; "
     } else {
         ""
     };
@@ -1553,7 +1553,7 @@ fn build_windows_keep_awake_script(owner_pid: u32, profile: &PowerProfile) -> St
 $ownerPid = {owner_pid}; \
 $signature = @'\
 using System.Runtime.InteropServices; \
-public static class PanesKeepAwakeNative {{ \
+public static class SupaCodexKeepAwakeNative {{ \
   [DllImport(\"kernel32.dll\", SetLastError=true)] \
   public static extern uint SetThreadExecutionState(uint esFlags); \
 }} \
@@ -1566,11 +1566,11 @@ $displayRequired = 0x00000002; \
 {screen_saver_disable}\
 try {{ \
   while (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue) {{ \
-    [PanesKeepAwakeNative]::SetThreadExecutionState({flags_expr}) | Out-Null; \
+    [SupaCodexKeepAwakeNative]::SetThreadExecutionState({flags_expr}) | Out-Null; \
     Start-Sleep -Seconds 30; \
   }} \
 }} finally {{ \
-  [PanesKeepAwakeNative]::SetThreadExecutionState($continuous) | Out-Null; \
+  [SupaCodexKeepAwakeNative]::SetThreadExecutionState($continuous) | Out-Null; \
   {screen_saver_restore}\
 }}"
     )
@@ -1592,7 +1592,7 @@ mod tests {
             .into_iter()
             .map(|key| (key, std::env::var_os(key)))
             .collect();
-        let root = std::env::temp_dir().join(format!("panes-power-home-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("supacodex-power-home-{}", Uuid::new_v4()));
         let local_app_data = root.join("AppData").join("Local");
         let roaming_app_data = root.join("AppData").join("Roaming");
         fs::create_dir_all(&local_app_data).expect("temp local app data should exist");
@@ -1762,7 +1762,7 @@ mod tests {
     }
 
     fn temp_state_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("panes-keep-awake-{}", Uuid::new_v4()))
+        std::env::temp_dir().join(format!("supacodex-keep-awake-{}", Uuid::new_v4()))
     }
 
     #[tokio::test]
@@ -2047,7 +2047,7 @@ mod tests {
             .expect("fake commands lock poisoned")
             .insert(
                 10,
-                Some("/Applications/Panes.app/Contents/MacOS/Panes".to_string()),
+                Some("/Applications/SupaCodex.app/Contents/MacOS/SupaCodex".to_string()),
             );
         process_ops
             .start_markers
@@ -2290,7 +2290,7 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "/dev/null"));
         assert!(args
             .iter()
-            .any(|arg| arg == format!("--pid={}", std::process::id())));
+            .any(|arg| *arg == format!("--pid={}", std::process::id())));
     }
 
     #[test]
@@ -2304,13 +2304,13 @@ mod tests {
             args,
             vec![
                 "--app-id".to_string(),
-                "Panes".to_string(),
+                "SupaCodex".to_string(),
                 "--inhibit".to_string(),
                 "suspend".to_string(),
                 "--inhibit".to_string(),
                 "idle".to_string(),
                 "--reason".to_string(),
-                "Keep system awake while Panes is open".to_string(),
+                "Keep system awake while SupaCodex is open".to_string(),
                 "/usr/bin/tail".to_string(),
                 "--pid=77".to_string(),
                 "-f".to_string(),
@@ -2359,7 +2359,7 @@ mod tests {
         };
         let args = build_windows_keep_awake_args(77, &profile);
         let script = args.last().unwrap().to_string_lossy().into_owned();
-        assert!(script.contains("PanesScreenSaver"));
+        assert!(script.contains("SupaCodexScreenSaver"));
         assert!(script.contains("SystemParametersInfo"));
         assert!(script.contains("ScreenSaveActive"));
         assert!(script

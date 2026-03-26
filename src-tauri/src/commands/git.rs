@@ -384,10 +384,10 @@ pub async fn add_git_worktree(
         )
         .map_err(err_to_string)?;
 
-        // Keep .panes/ ignored, but don't fail the command after successful creation.
-        if let Err(error) = ensure_gitignore_entry(&repo_path, ".panes/") {
+        // Keep .supacodex/ ignored, but don't fail the command after successful creation.
+        if let Err(error) = ensure_gitignore_entry(&repo_path, ".supacodex/") {
             eprintln!(
-                "warning: failed to ensure .panes/ in .gitignore for '{}': {}",
+                "warning: failed to ensure .supacodex/ in .gitignore for '{}': {}",
                 repo_path, error
             );
         }

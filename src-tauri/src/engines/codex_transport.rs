@@ -11,9 +11,12 @@ use tokio::{
 
 use crate::{process_utils, runtime_env};
 
-use super::codex_protocol::{
-    notification_payload, parse_incoming, request_payload, response_error_payload,
-    response_success_payload, IncomingMessage, RpcResponse,
+use super::{
+    codex::CodexRuntimeProfile,
+    codex_protocol::{
+        notification_payload, parse_incoming, request_payload, response_error_payload,
+        response_success_payload, IncomingMessage, RpcResponse,
+    },
 };
 
 pub struct CodexTransport {
@@ -25,12 +28,16 @@ pub struct CodexTransport {
 }
 
 impl CodexTransport {
-    pub async fn spawn(codex_executable: &str) -> anyhow::Result<Self> {
+    pub async fn spawn(
+        codex_executable: &str,
+        profile: &CodexRuntimeProfile,
+    ) -> anyhow::Result<Self> {
         let mut command = Command::new(codex_executable);
         process_utils::configure_tokio_command(&mut command);
         if let Some(augmented_path) = codex_augmented_path(codex_executable) {
             command.env("PATH", augmented_path);
         }
+        command.env("CODEX_HOME", &profile.codex_home);
 
         let mut child = command
             .arg("app-server")

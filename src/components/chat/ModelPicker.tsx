@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Check, ChevronDown, ChevronRight } from "lucide-react";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import { getHarnessIcon } from "../shared/HarnessLogos";
+import { useAnchoredPopoverPosition } from "../shared/anchoredPopoverPosition";
 import type { EngineHealth, EngineInfo, EngineModel } from "../../types";
 
 /* ── Props ── */
@@ -129,7 +130,13 @@ export function ModelPicker({
   const [legacyExpanded, setLegacyExpanded] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState({ bottom: 0, left: 0 });
+  const pos = useAnchoredPopoverPosition({
+    open,
+    triggerRef,
+    popoverRef,
+    preferredDirection: "top",
+    align: "center",
+  });
 
   // Sync active engine when selection changes externally
   useEffect(() => {
@@ -140,17 +147,6 @@ export function ModelPicker({
   useEffect(() => {
     setLegacyExpanded(false);
   }, [activeEngineId]);
-
-  // Position popover above trigger
-  useLayoutEffect(() => {
-    if (!open || !triggerRef.current) return;
-    const rect = triggerRef.current.getBoundingClientRect();
-    const left = Math.max(8, Math.min(rect.left, window.innerWidth - 460));
-    setPos({
-      bottom: window.innerHeight - rect.top + 6,
-      left,
-    });
-  }, [open]);
 
   // Click outside + Escape
   useEffect(() => {
@@ -242,7 +238,7 @@ export function ModelPicker({
           className="mp-popover"
           style={{
             position: "fixed",
-            bottom: pos.bottom,
+            top: pos.top,
             left: pos.left,
           }}
         >

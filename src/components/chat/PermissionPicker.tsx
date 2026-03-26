@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Check, ChevronDown, Monitor, Shield, SquareTerminal } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { useAnchoredPopoverPosition } from "../shared/anchoredPopoverPosition";
 import type { TrustLevel } from "../../types";
 
 type PermissionOption<T extends string = string> = {
@@ -84,7 +85,13 @@ export function PermissionPicker({
   const [activeSection, setActiveSection] = useState<string>("");
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState({ bottom: 0, left: 0 });
+  const pos = useAnchoredPopoverPosition({
+    open,
+    triggerRef,
+    popoverRef,
+    preferredDirection: "top",
+    align: "center",
+  });
 
   const resolvedApprovalTitle = approvalTitle ?? t("permissionPicker.approvalPolicy");
 
@@ -229,20 +236,6 @@ export function PermissionPicker({
     trustScopeLabel,
   ]);
 
-  useLayoutEffect(() => {
-    if (!open || !triggerRef.current) {
-      return;
-    }
-
-    const rect = triggerRef.current.getBoundingClientRect();
-    const left = Math.max(8, Math.min(rect.left, window.innerWidth - 460));
-
-    setPos({
-      bottom: window.innerHeight - rect.top + 6,
-      left,
-    });
-  }, [open]);
-
   useEffect(() => {
     if (!open) {
       return;
@@ -291,7 +284,7 @@ export function PermissionPicker({
           className="pp-popover"
           style={{
             position: "fixed",
-            bottom: pos.bottom,
+            top: pos.top,
             left: pos.left,
           }}
         >

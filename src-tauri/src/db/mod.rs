@@ -704,7 +704,7 @@ mod tests {
     use uuid::Uuid;
 
     fn test_db() -> Database {
-        let path = std::env::temp_dir().join(format!("panes-db-mod-{}.db", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("supacodex-db-mod-{}.db", Uuid::new_v4()));
         let db = Database {
             path,
             pool: Arc::new(ConnectionPool {

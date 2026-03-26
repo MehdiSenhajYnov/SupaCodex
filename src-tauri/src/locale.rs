@@ -86,7 +86,7 @@ fn resolve_app_locale_with_system(
 pub fn native_strings(locale: &str) -> NativeStrings {
     match normalize_app_locale(locale).unwrap_or(DEFAULT_APP_LOCALE) {
         PT_BR_APP_LOCALE => NativeStrings {
-            app_menu: "Panes",
+            app_menu: "SupaCodex",
             about_comments: "O cockpit open-source para programacao com assistencia de IA",
             edit_menu: "Editar",
             undo: "Desfazer",
@@ -106,7 +106,7 @@ pub fn native_strings(locale: &str) -> NativeStrings {
             close: "Fechar",
         },
         _ => NativeStrings {
-            app_menu: "Panes",
+            app_menu: "SupaCodex",
             about_comments: "The open-source cockpit for AI-assisted coding",
             edit_menu: "Edit",
             undo: "Undo",

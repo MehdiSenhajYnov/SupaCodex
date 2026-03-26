@@ -7,14 +7,14 @@ use std::{
 use anyhow::Context;
 
 #[cfg(target_os = "linux")]
-const APPIMAGE_DISABLE_ENV: &str = "PANES_DISABLE_APPIMAGE_INTEGRATION";
+const APPIMAGE_DISABLE_ENV: &str = "SUPACODEX_DISABLE_APPIMAGE_INTEGRATION";
 #[cfg(target_os = "linux")]
 const APPIMAGE_ENV: &str = "APPIMAGE";
-const APP_ID: &str = "com.panes.app";
-const APP_NAME: &str = "Panes";
+const APP_ID: &str = "com.supacodex.app";
+const APP_NAME: &str = "SupaCodex";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const DESKTOP_FILE_NAME: &str = "com.panes.app.desktop";
-const DESKTOP_ENTRY_MARKER: &str = "# Managed by Panes AppImage integration";
+const DESKTOP_FILE_NAME: &str = "com.supacodex.app.desktop";
+const DESKTOP_ENTRY_MARKER: &str = "# Managed by SupaCodex AppImage integration";
 #[cfg(target_os = "linux")]
 const DEFAULT_XDG_DATA_DIRS: &str = "/usr/local/share:/usr/share";
 
@@ -142,7 +142,7 @@ fn build_desktop_entry(appimage_path: &Path) -> String {
     let escaped_exec = escape_desktop_exec_arg(appimage_path);
     let escaped_try_exec = escape_desktop_string(&appimage_path.to_string_lossy());
     format!(
-        "{DESKTOP_ENTRY_MARKER}\n[Desktop Entry]\nType=Application\nName={APP_NAME}\nExec={escaped_exec} %U\nTryExec={escaped_try_exec}\nIcon={APP_ID}\nTerminal=false\nCategories=Development;\nStartupNotify=true\nX-AppImage-Version={APP_VERSION}\nX-Panes-Managed=true\n"
+        "{DESKTOP_ENTRY_MARKER}\n[Desktop Entry]\nType=Application\nName={APP_NAME}\nExec={escaped_exec} %U\nTryExec={escaped_try_exec}\nIcon={APP_ID}\nTerminal=false\nCategories=Development;\nStartupNotify=true\nX-AppImage-Version={APP_VERSION}\nX-SupaCodex-Managed=true\n"
     )
 }
 
@@ -331,7 +331,7 @@ fn remove_managed_desktop_entry(desktop_entry_path: &Path) -> anyhow::Result<boo
 fn is_managed_entry(path: &Path) -> anyhow::Result<bool> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read desktop entry {}", path.display()))?;
-    Ok(raw.contains(DESKTOP_ENTRY_MARKER) || raw.contains("X-Panes-Managed=true"))
+    Ok(raw.contains(DESKTOP_ENTRY_MARKER) || raw.contains("X-SupaCodex-Managed=true"))
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> anyhow::Result<bool> {
@@ -419,7 +419,7 @@ mod tests {
     impl TestPaths {
         fn new() -> Self {
             let root =
-                env::temp_dir().join(format!("panes-appimage-integration-{}", Uuid::new_v4()));
+                env::temp_dir().join(format!("supacodex-appimage-integration-{}", Uuid::new_v4()));
             let home = root.join("home");
             let data_home = root.join("xdg-data");
             let system_data_home = root.join("system-data");
@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn skips_when_disabled() {
         let paths = TestPaths::new();
-        let mut env = integration_env(&paths, Some(paths.appimage_path("Panes.AppImage")));
+        let mut env = integration_env(&paths, Some(paths.appimage_path("SupaCodex.AppImage")));
         env.disabled = true;
 
         let status = ensure_appimage_desktop_integration_with_env(&env)
@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn writes_managed_desktop_entry_and_icons() {
         let paths = TestPaths::new();
-        let appimage_path = paths.appimage_path("Panes Beta.AppImage");
+        let appimage_path = paths.appimage_path("SupaCodex Beta.AppImage");
 
         let status = ensure_appimage_desktop_integration_with_env(&integration_env(
             &paths,
@@ -514,7 +514,7 @@ mod tests {
         let desktop_entry = fs::read_to_string(paths.managed_desktop_entry())
             .expect("desktop entry should be written");
         assert!(desktop_entry.contains(DESKTOP_ENTRY_MARKER));
-        assert!(desktop_entry.contains("X-Panes-Managed=true"));
+        assert!(desktop_entry.contains("X-SupaCodex-Managed=true"));
         assert!(desktop_entry.contains(&format!("Icon={APP_ID}")));
         assert!(desktop_entry.contains(&format!(
             "Exec={} %U",
@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn second_run_is_unchanged() {
         let paths = TestPaths::new();
-        let env = integration_env(&paths, Some(paths.appimage_path("Panes.AppImage")));
+        let env = integration_env(&paths, Some(paths.appimage_path("SupaCodex.AppImage")));
 
         let first = ensure_appimage_desktop_integration_with_env(&env)
             .expect("initial integration should succeed");
@@ -546,8 +546,9 @@ mod tests {
     #[test]
     fn rewrites_desktop_entry_when_appimage_path_changes() {
         let paths = TestPaths::new();
-        let first_env = integration_env(&paths, Some(paths.appimage_path("Panes One.AppImage")));
-        let second_path = paths.appimage_path("Panes Two.AppImage");
+        let first_env =
+            integration_env(&paths, Some(paths.appimage_path("SupaCodex One.AppImage")));
+        let second_path = paths.appimage_path("SupaCodex Two.AppImage");
 
         ensure_appimage_desktop_integration_with_env(&first_env)
             .expect("initial integration should succeed");
@@ -562,13 +563,15 @@ mod tests {
         let desktop_entry = fs::read_to_string(paths.managed_desktop_entry())
             .expect("desktop entry should be readable");
         assert!(desktop_entry.contains(&escape_desktop_exec_arg(&second_path)));
-        assert!(!desktop_entry.contains("Panes One.AppImage\" %U\nTryExec=Panes One.AppImage"));
+        assert!(
+            !desktop_entry.contains("SupaCodex One.AppImage\" %U\nTryExec=SupaCodex One.AppImage")
+        );
     }
 
     #[test]
     fn removes_managed_local_entry_when_system_install_exists() {
         let paths = TestPaths::new();
-        let env = integration_env(&paths, Some(paths.appimage_path("Panes.AppImage")));
+        let env = integration_env(&paths, Some(paths.appimage_path("SupaCodex.AppImage")));
 
         ensure_appimage_desktop_integration_with_env(&env)
             .expect("initial integration should succeed");
@@ -585,7 +588,7 @@ mod tests {
         .expect("system applications dir should exist");
         fs::write(
             &system_entry,
-            "[Desktop Entry]\nName=Panes\nTryExec=/bin/sh\nExec=/bin/sh -c true\n",
+            "[Desktop Entry]\nName=SupaCodex\nTryExec=/bin/sh\nExec=/bin/sh -c true\n",
         )
         .expect("system desktop entry should be written");
 
@@ -605,14 +608,14 @@ mod tests {
     #[test]
     fn preserves_unmanaged_local_entry_and_icons() {
         let paths = TestPaths::new();
-        let env = integration_env(&paths, Some(paths.appimage_path("Panes.AppImage")));
+        let env = integration_env(&paths, Some(paths.appimage_path("SupaCodex.AppImage")));
 
         ensure_appimage_desktop_integration_with_env(&env)
             .expect("initial integration should succeed");
 
         fs::write(
             paths.managed_desktop_entry(),
-            "[Desktop Entry]\nName=Panes Custom\nIcon=custom-panes\n",
+            "[Desktop Entry]\nName=SupaCodex Custom\nIcon=custom-supacodex\n",
         )
         .expect("unmanaged local entry should be written");
 
@@ -625,7 +628,7 @@ mod tests {
         );
         let desktop_entry = fs::read_to_string(paths.managed_desktop_entry())
             .expect("local desktop entry should still exist");
-        assert!(desktop_entry.contains("Name=Panes Custom"));
+        assert!(desktop_entry.contains("Name=SupaCodex Custom"));
         assert!(!desktop_entry.contains(DESKTOP_ENTRY_MARKER));
         for size in [32_u32, 64, 128, 256, 512] {
             assert!(
@@ -638,7 +641,7 @@ mod tests {
     #[test]
     fn escapes_exec_path_with_spaces_and_percent_signs() {
         let paths = TestPaths::new();
-        let appimage_path = paths.appimage_path("Panes 100%.AppImage");
+        let appimage_path = paths.appimage_path("SupaCodex 100%.AppImage");
 
         ensure_appimage_desktop_integration_with_env(&integration_env(
             &paths,
@@ -658,7 +661,7 @@ mod tests {
     #[test]
     fn ignores_broken_system_desktop_entry() {
         let paths = TestPaths::new();
-        let env = integration_env(&paths, Some(paths.appimage_path("Panes.AppImage")));
+        let env = integration_env(&paths, Some(paths.appimage_path("SupaCodex.AppImage")));
 
         ensure_appimage_desktop_integration_with_env(&env)
             .expect("initial integration should succeed");
@@ -675,7 +678,7 @@ mod tests {
         .expect("system applications dir should exist");
         fs::write(
             &system_entry,
-            "[Desktop Entry]\nName=Panes\nExec=/definitely/missing/panes %U\n",
+            "[Desktop Entry]\nName=SupaCodex\nExec=/definitely/missing/supacodex %U\n",
         )
         .expect("broken system desktop entry should be written");
 

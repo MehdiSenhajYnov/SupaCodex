@@ -14,7 +14,7 @@ function parseArgs(argv) {
   const positionals = [];
   const options = {
     output: null,
-    repo: process.env.GITHUB_REPOSITORY || "wygoralves/panes",
+    repo: process.env.GITHUB_REPOSITORY || "replace-with-your-fork/supacodex",
     template: join(root, "scripts", "templates", "homebrew-cask.rb.tpl"),
   };
 
@@ -48,7 +48,7 @@ function parseArgs(argv) {
   }
 
   if (!options.output) {
-    options.output = join(root, "dist", "homebrew", "panes.rb");
+    options.output = join(root, "dist", "homebrew", "supacodex.rb");
   }
 
   return {
@@ -63,7 +63,7 @@ function githubHeaders() {
   const token = process.env.GITHUB_TOKEN;
   const headers = {
     Accept: "application/vnd.github+json",
-    "User-Agent": "panes-homebrew-cask",
+    "User-Agent": "supacodex-homebrew-cask",
   };
 
   if (token) {

@@ -1,8 +1,8 @@
-# Contributing to Panes
+# Contributing to SupaCodex
 
-Thanks for contributing to Panes.
+Thanks for contributing to SupaCodex.
 
-Panes is a local-first desktop cockpit for AI-assisted coding. The project accepts external contributions, but merges stay maintainer-reviewed. Please assume that every change lands through a pull request and a final maintainer check.
+SupaCodex is a local-first desktop cockpit for AI-assisted coding. The project accepts external contributions, but merges stay maintainer-reviewed. Please assume that every change lands through a pull request and a final maintainer check.
 
 ## Before you start
 

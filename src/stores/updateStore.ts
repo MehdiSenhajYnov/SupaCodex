@@ -2,6 +2,8 @@ import { create } from "zustand";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
+export const UPDATES_ENABLED = false;
+
 type UpdateStatus = "idle" | "checking" | "available" | "downloading" | "ready" | "error";
 
 interface UpdateState {
@@ -24,6 +26,10 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
   snoozed: false,
 
   checkForUpdate: async () => {
+    if (!UPDATES_ENABLED) {
+      set({ status: "idle", error: null });
+      return;
+    }
     if (get().status === "checking") return;
     set({ status: "checking", error: null });
     try {
@@ -40,6 +46,13 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
   },
 
   downloadAndInstall: async () => {
+    if (!UPDATES_ENABLED) {
+      set({
+        status: "error",
+        error: "Updates are disabled until this fork is connected to its own release channel.",
+      });
+      return;
+    }
     set({ status: "downloading", error: null });
     try {
       const update = await check();

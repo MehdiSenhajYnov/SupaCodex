@@ -1,5 +1,5 @@
 (function () {
-  var STORAGE_KEY = "panes-landing-locale";
+  var STORAGE_KEY = "supacodex-landing-locale";
   var DEFAULT_LOCALE = "en";
   var SUPPORTED_LOCALES = ["en", "pt-BR"];
   var initialized = false;
@@ -7,7 +7,7 @@
   var TRANSLATIONS = {
     en: {
       meta: {
-        title: "Panes | The Agent Development Environment",
+        title: "SupaCodex | The Agent Development Environment",
         description:
           "Your agents write the code. You need a cockpit. Chat, terminal, git, and approvals in one native window. Engine-agnostic, open-source, built with Rust.",
       },
@@ -65,7 +65,7 @@
         startupPreset: "Startup preset",
         startupSubtitle: "Configure what happens when you open this workspace",
         defaultView: "Default view",
-        twoPanes: "2 panes",
+        twoSupaCodex: "2 panes",
         onePane: "1 pane",
         broadcast: "broadcast",
       },
@@ -85,7 +85,7 @@
           "Open any folder, auto-detect nested git repos. Manage monorepos and multi-service architectures with context-aware chat threads per repo.",
         raceTitle: "Race agents side by side.",
         raceBody:
-          "Launch multiple CLI agents into split panes. Broadcast the same prompt to all of them at once. Optionally give each agent its own git worktree so they never collide.",
+          "Launch multiple CLI agents into split supacodex. Broadcast the same prompt to all of them at once. Optionally give each agent its own git worktree so they never collide.",
         startupTitle: "Your workspace, ready on open.",
         startupBody:
           "Configure startup presets: default view, terminal groups, agent assignments, split layouts, and broadcast mode. Open a project and everything is already set up.",
@@ -93,7 +93,7 @@
       manifesto: {
         ariaLabel: "Product philosophy",
         textHtml:
-          "IDEs were designed for writing code. But you barely write code anymore. You orchestrate, review, and approve. <strong>Panes is the cockpit for that workflow.</strong>",
+          "IDEs were designed for writing code. But you barely write code anymore. You orchestrate, review, and approve. <strong>SupaCodex is the cockpit for that workflow.</strong>",
         orchestrate: "orchestrate",
         review: "review",
         approve: "approve",
@@ -109,12 +109,12 @@
       },
       footer: {
         tagline: "The open-source Agent Development Environment.",
-        copyright: "&copy; 2026 Panes. MIT License.",
+        copyright: "&copy; 2026 SupaCodex. MIT License.",
       },
     },
     "pt-BR": {
       meta: {
-        title: "Panes | O Agent Development Environment",
+        title: "SupaCodex | O Agent Development Environment",
         description:
           "Os agentes escrevem o código. Você precisa de um cockpit. Chat, terminal, git e aprovações numa janela nativa. Funciona com qualquer engine, open source, feito em Rust.",
       },
@@ -172,7 +172,7 @@
         startupPreset: "Preset de startup",
         startupSubtitle: "Configure o que acontece ao abrir esse workspace",
         defaultView: "View padrão",
-        twoPanes: "2 painéis",
+        twoSupaCodex: "2 painéis",
         onePane: "1 painel",
         broadcast: "broadcast",
       },
@@ -192,7 +192,7 @@
           "Abre qualquer pasta, detecta repos Git automaticamente. Monorepos, multi-serviço — cada repo tem sua thread de chat com contexto próprio.",
         raceTitle: "Rode agentes lado a lado.",
         raceBody:
-          "Abre vários agentes de CLI em split panes. Manda o mesmo prompt pra todos de uma vez. Cada agente pode ter sua própria worktree pra não ter conflito.",
+          "Abre vários agentes de CLI em split supacodex. Manda o mesmo prompt pra todos de uma vez. Cada agente pode ter sua própria worktree pra não ter conflito.",
         startupTitle: "Workspace pronto ao abrir.",
         startupBody:
           "Configure presets de startup: view padrão, grupos de terminal, agentes, layouts e broadcast. Abriu o projeto, tá tudo pronto.",
@@ -200,7 +200,7 @@
       manifesto: {
         ariaLabel: "Filosofia do produto",
         textHtml:
-          "IDEs foram feitas pra escrever código. Mas hoje você quase não escreve mais. Você orquestra, revisa e aprova. <strong>Panes é o cockpit desse fluxo.</strong>",
+          "IDEs foram feitas pra escrever código. Mas hoje você quase não escreve mais. Você orquestra, revisa e aprova. <strong>SupaCodex é o cockpit desse fluxo.</strong>",
         orchestrate: "orquestrar",
         review: "revisar",
         approve: "aprovar",
@@ -216,7 +216,7 @@
       },
       footer: {
         tagline: "O Agent Development Environment open source.",
-        copyright: "&copy; 2026 Panes. Licença MIT.",
+        copyright: "&copy; 2026 SupaCodex. Licença MIT.",
       },
     },
   };
@@ -432,7 +432,7 @@
       getValue(nextLocale, "common.editor"),
     ]);
     setTextAll("#product .story-scene:nth-of-type(5) .v-startup-group-badges .v-startup-badge:not(.v-startup-badge-accent)", [
-      getValue(nextLocale, "mock.twoPanes"),
+      getValue(nextLocale, "mock.twoSupaCodex"),
       getValue(nextLocale, "mock.onePane"),
     ]);
     setText("#product .story-scene:nth-of-type(5) .v-startup-badge-accent span", getValue(nextLocale, "mock.broadcast"));
@@ -500,7 +500,7 @@
     applyLocale(detectInitialLocale(), true);
   }
 
-  window.panesLandingI18n = {
+  window.supacodexLandingI18n = {
     init: init,
     applyLocale: applyLocale,
     resolveLocale: resolveLocale,

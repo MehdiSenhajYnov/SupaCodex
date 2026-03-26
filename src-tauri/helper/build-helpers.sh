@@ -13,7 +13,7 @@ MIN_MACOS="13.0"
 
 mkdir -p "$OUTPUT_DIR"
 
-echo "Building PanesKeepAwakeHelper (universal)..."
+echo "Building SupaCodexKeepAwakeHelper (universal)..."
 swiftc -O -parse-as-library \
   -target arm64-apple-macos${MIN_MACOS} \
   "$SCRIPT_DIR/keepawake-helper.swift" \
@@ -27,11 +27,11 @@ swiftc -O -parse-as-library \
 lipo -create \
   "$OUTPUT_DIR/keepawake-helper-arm64" \
   "$OUTPUT_DIR/keepawake-helper-x86_64" \
-  -output "$OUTPUT_DIR/com.panes.app.helper.keepawake"
+  -output "$OUTPUT_DIR/com.supacodex.app.helper.keepawake"
 
 rm "$OUTPUT_DIR/keepawake-helper-arm64" "$OUTPUT_DIR/keepawake-helper-x86_64"
 
-echo "Building PanesHelperRegistrar (universal)..."
+echo "Building SupaCodexHelperRegistrar (universal)..."
 swiftc -O \
   -target arm64-apple-macos${MIN_MACOS} \
   "$SCRIPT_DIR/keepawake-registrar.swift" \
@@ -45,9 +45,9 @@ swiftc -O \
 lipo -create \
   "$OUTPUT_DIR/registrar-arm64" \
   "$OUTPUT_DIR/registrar-x86_64" \
-  -output "$OUTPUT_DIR/PanesHelperRegistrar"
+  -output "$OUTPUT_DIR/SupaCodexHelperRegistrar"
 
 rm "$OUTPUT_DIR/registrar-arm64" "$OUTPUT_DIR/registrar-x86_64"
 
 echo "Helper binaries built in $OUTPUT_DIR"
-ls -la "$OUTPUT_DIR/com.panes.app.helper.keepawake" "$OUTPUT_DIR/PanesHelperRegistrar"
+ls -la "$OUTPUT_DIR/com.supacodex.app.helper.keepawake" "$OUTPUT_DIR/SupaCodexHelperRegistrar"

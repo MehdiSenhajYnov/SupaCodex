@@ -1,9 +1,14 @@
 import { Dropdown } from "./Dropdown";
 import { runEditMenuAction } from "../../lib/nativeEditActions";
+import {
+  formatShortcutBinding,
+  getEffectiveShortcutBinding,
+  type ShortcutActionId,
+} from "../../lib/shortcutBindings";
+import { executeShortcutAction } from "../../lib/shortcutActions";
 import { useOnboardingStore } from "../../stores/onboardingStore";
-import { useTerminalStore } from "../../stores/terminalStore";
+import { useShortcutStore } from "../../stores/shortcutStore";
 import { useUiStore } from "../../stores/uiStore";
-import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { useTranslation } from "react-i18next";
 import {
   canCustomWindowResize,
@@ -14,13 +19,13 @@ import {
   closeCurrentWindow,
   minimizeCurrentWindow,
   toggleCurrentWindowMaximize,
-  toggleWindowFullscreen,
 } from "../../lib/windowActions";
-import { handleDragDoubleClick, handleDragMouseDown } from "../../lib/windowDrag";
+import { handleDragMouseDown } from "../../lib/windowDrag";
 import { CustomWindowResizeHandles } from "./CustomWindowResizeHandles";
 
 interface CustomWindowFrameProps {
   frameState: CustomWindowFrameState;
+  centerTitle?: string | null;
 }
 
 const MENU_SENTINEL = "__custom-window-menu__";
@@ -36,9 +41,10 @@ const MENU_TRIGGER_STYLE = {
   gap: 6,
 } as const;
 
-export function CustomWindowFrame({ frameState }: CustomWindowFrameProps) {
+export function CustomWindowFrame({ frameState, centerTitle }: CustomWindowFrameProps) {
   const { t } = useTranslation(["app", "native"]);
   const showChrome = shouldShowCustomWindowChrome(frameState);
+  const shortcutOverrides = useShortcutStore((state) => state.overrides);
 
   const panesMenuOptions = [
     { value: "open-setup", label: t("app:sidebar.engineSetup") },
@@ -53,13 +59,23 @@ export function CustomWindowFrame({ frameState }: CustomWindowFrameProps) {
     { value: "edit-select-all", label: t("native:menu.selectAll"), shortcut: "Ctrl+A" },
   ];
   const viewMenuOptions = [
-    { value: "toggle-sidebar", label: t("native:menu.toggleSidebar"), shortcut: "Ctrl+B" },
-    { value: "toggle-git-panel", label: t("native:menu.toggleGitPanel"), shortcut: "Ctrl+Shift+B" },
-    { value: "toggle-focus-mode", label: t("native:menu.toggleFocusMode"), shortcut: "Ctrl+Alt+F" },
-    { value: "toggle-fullscreen", label: t("native:menu.toggleFullscreen"), shortcut: "F11" },
-    { value: "toggle-search", label: t("native:menu.search"), shortcut: "Ctrl+Shift+F" },
-    { value: "toggle-terminal", label: t("native:menu.toggleTerminal"), shortcut: "Ctrl+Shift+T" },
-  ];
+    { value: "toggle-sidebar", label: t("native:menu.toggleSidebar") },
+    { value: "toggle-git-panel", label: t("native:menu.toggleGitPanel") },
+    { value: "toggle-focus-mode", label: t("native:menu.toggleFocusMode") },
+    { value: "toggle-fullscreen", label: t("native:menu.toggleFullscreen") },
+    { value: "toggle-search", label: t("native:menu.search") },
+    { value: "toggle-terminal", label: t("native:menu.toggleTerminal") },
+    { value: "previous-conversation", label: t("native:menu.previousConversation") },
+    { value: "next-conversation", label: t("native:menu.nextConversation") },
+    { value: "previous-open-project", label: t("native:menu.previousOpenProject") },
+    { value: "next-open-project", label: t("native:menu.nextOpenProject") },
+    { value: "close-conversation", label: t("native:menu.closeConversation") },
+  ].map((option) => ({
+    ...option,
+    shortcut: formatShortcutBinding(
+      getEffectiveShortcutBinding(option.value as ShortcutActionId, shortcutOverrides),
+    ),
+  }));
 
   function handleAppMenuAction(value: string) {
     switch (value) {
@@ -85,32 +101,7 @@ export function CustomWindowFrame({ frameState }: CustomWindowFrameProps) {
   }
 
   function handleViewAction(value: string) {
-    switch (value) {
-      case "toggle-sidebar":
-        useUiStore.getState().toggleSidebar();
-        return;
-      case "toggle-git-panel":
-        useUiStore.getState().toggleGitPanel();
-        return;
-      case "toggle-focus-mode":
-        useUiStore.getState().toggleFocusMode();
-        return;
-      case "toggle-fullscreen":
-        void toggleWindowFullscreen();
-        return;
-      case "toggle-search":
-        useUiStore.getState().openCommandPalette({ variant: "search", initialQuery: "?" });
-        return;
-      case "toggle-terminal": {
-        const workspaceId = useWorkspaceStore.getState().activeWorkspaceId;
-        if (workspaceId) {
-          void useTerminalStore.getState().cycleLayoutMode(workspaceId);
-        }
-        return;
-      }
-      default:
-        return;
-    }
+    void executeShortcutAction(value as ShortcutActionId);
   }
 
   return (
@@ -119,8 +110,12 @@ export function CustomWindowFrame({ frameState }: CustomWindowFrameProps) {
         <div
           className="linux-window-chrome"
           onMouseDown={handleDragMouseDown}
-          onDoubleClick={handleDragDoubleClick}
         >
+          {centerTitle ? (
+            <div className="linux-window-chrome-title" aria-hidden="true">
+              {centerTitle}
+            </div>
+          ) : null}
           <div className="linux-window-chrome-menus no-drag">
             <Dropdown
               options={panesMenuOptions}

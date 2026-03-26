@@ -24,7 +24,8 @@ const DEFAULT_PANEL_SIZE = 32;
 const DEFAULT_COLS = 120;
 const DEFAULT_ROWS = 36;
 
-const LAYOUT_MODE_STORAGE_KEY = (wsId: string) => `panes:layoutMode:${wsId}`;
+const LAYOUT_MODE_STORAGE_KEY = (wsId: string) => `supacodex:layoutMode:${wsId}`;
+const PANEL_SIZE_STORAGE_KEY = (wsId: string) => `supacodex:terminalPanelSize:${wsId}`;
 
 function clampPanelSize(size: number): number {
   return Math.max(15, Math.min(72, size));
@@ -34,6 +35,23 @@ function readStoredLayoutMode(workspaceId: string): LayoutMode {
   const v = localStorage.getItem(LAYOUT_MODE_STORAGE_KEY(workspaceId));
   if (v === "terminal" || v === "split" || v === "editor") return v;
   return "chat";
+}
+
+function readStoredPanelSize(workspaceId: string): number {
+  const raw = localStorage.getItem(PANEL_SIZE_STORAGE_KEY(workspaceId));
+  const value = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  if (!Number.isFinite(value)) {
+    return DEFAULT_PANEL_SIZE;
+  }
+  return clampPanelSize(value);
+}
+
+function persistPanelSize(workspaceId: string, size: number): void {
+  try {
+    localStorage.setItem(PANEL_SIZE_STORAGE_KEY(workspaceId), String(clampPanelSize(size)));
+  } catch {
+    // Ignore persistence failures.
+  }
 }
 
 // ── Split tree helpers ──────────────────────────────────────────────
@@ -622,7 +640,7 @@ function joinPath(basePath: string, childPath: string): string {
 
 function resolveWorktreeBaseDir(repoPath: string, baseDir?: string | null): string {
   if (!baseDir || baseDir.trim() === "") {
-    return `${repoPath.replace(/\/+$/, "")}/.panes/worktrees`;
+    return `${repoPath.replace(/\/+$/, "")}/.supacodex/worktrees`;
   }
   return isAbsolutePath(baseDir) ? baseDir : joinPath(repoPath, baseDir);
 }
@@ -656,14 +674,14 @@ function inferWorktreeConfig(group: TerminalGroup): WorkspaceStartupWorktreeConf
         .split("/")
         .slice(0, -2)
         .join("/")
-    : ".panes/worktrees";
+    : ".supacodex/worktrees";
 
   return {
     enabled: true,
     repoMode: "fixed_repo",
     repoPath: first.repoPath,
     baseDir,
-    branchPrefix: first.branch.split("/").slice(0, -2).join("/") || "panes/preset",
+    branchPrefix: first.branch.split("/").slice(0, -2).join("/") || "supacodex/preset",
   };
 }
 
@@ -753,6 +771,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
 
   prepareWorkspaceActivation: async (workspaceId) => {
     const fallbackMode = readStoredLayoutMode(workspaceId);
+    const fallbackPanelSize = readStoredPanelSize(workspaceId);
     try {
       const preset = await ipc.getWorkspaceStartupPreset(workspaceId);
       const targetMode = preset?.defaultView ?? fallbackMode;
@@ -773,7 +792,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
                 : current.isOpen,
             panelSize: hasLiveSessions
               ? current.panelSize
-              : clampPanelSize(preset?.splitPanelSize ?? current.panelSize),
+              : clampPanelSize(preset?.splitPanelSize ?? fallbackPanelSize),
             loading: false,
             error: undefined,
           }),
@@ -1032,7 +1051,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
       const worktreesByLogicalSessionId: Record<string, WorktreeSessionInfo | null> = {};
       if (resolvedWorktreeConfig && worktreeRepoPath) {
         const runId = crypto.randomUUID().slice(0, 8);
-        const branchPrefix = resolvedWorktreeConfig.branchPrefix?.trim() || "panes/preset";
+        const branchPrefix = resolvedWorktreeConfig.branchPrefix?.trim() || "supacodex/preset";
         const createdWorktrees: WorktreeSessionInfo[] = [];
         let worktreeSetupFailed = false;
 
@@ -1190,6 +1209,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
         : null;
 
     localStorage.setItem(LAYOUT_MODE_STORAGE_KEY(workspaceId), preset.defaultView);
+    persistPanelSize(workspaceId, preset.splitPanelSize ?? DEFAULT_PANEL_SIZE);
     set((state) => ({
       workspaces: mergeWorkspaceState(state.workspaces, workspaceId, {
         isOpen: true,
@@ -1350,6 +1370,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
         }
       }
       localStorage.setItem(LAYOUT_MODE_STORAGE_KEY(workspaceId), preset.defaultView);
+      persistPanelSize(workspaceId, preset.splitPanelSize ?? workspace.panelSize);
       set((state) => ({
         workspaces: mergeWorkspaceState(state.workspaces, workspaceId, {
           isOpen: shouldBootstrapTerminal,
@@ -1472,6 +1493,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
 
   setPanelSize: (workspaceId, size) => {
     const clamped = clampPanelSize(size);
+    persistPanelSize(workspaceId, clamped);
     set((state) => ({
       workspaces: mergeWorkspaceState(state.workspaces, workspaceId, {
         panelSize: clamped,
@@ -1905,7 +1927,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
       // Phase 1: Create worktrees sequentially if configured (git locks prevent parallelism)
       const worktreeRunId = effectiveWorktreeConfig && worktreeRepoPath ? crypto.randomUUID().slice(0, 8) : null;
       if (effectiveWorktreeConfig && worktreeRepoPath && worktreeRunId) {
-        const branchPrefix = effectiveWorktreeConfig.branchPrefix?.trim() || "panes/preset";
+        const branchPrefix = effectiveWorktreeConfig.branchPrefix?.trim() || "supacodex/preset";
         for (let i = 0; i < harnesses.length; i++) {
           const logicalSessionId = harnesses[i]?.harnessId
             ? `${harnesses[i].harnessId}-${i + 1}`

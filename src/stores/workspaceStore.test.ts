@@ -262,7 +262,7 @@ describe("workspaceStore.loadWorkspaces", () => {
     vi.clearAllMocks();
     const storage = {
       getItem: vi.fn((key: string) => {
-        if (key === "panes:lastActiveWorkspaceId") {
+        if (key === "supacodex:lastActiveWorkspaceId") {
           return "ws-mount";
         }
         return null;
@@ -290,9 +290,9 @@ describe("workspaceStore.loadWorkspaces", () => {
   });
 
   it("falls back from a transient AppImage workspace to the next valid workspace", async () => {
-    const transientWorkspace = makeWorkspace("ws-mount", "/tmp/.mount_Panes123/usr");
+    const transientWorkspace = makeWorkspace("ws-mount", "/tmp/.mount_SupaCodex123/usr");
     const validWorkspace = makeWorkspace("ws-home", "/home/panes");
-    const repo = makeRepo("repo-home", validWorkspace.id, "/home/panes/repo");
+    const repo = makeRepo("repo-home", validWorkspace.id, "/home/supacodex/repo");
 
     mockIpc.listWorkspaces.mockResolvedValue([transientWorkspace, validWorkspace]);
     mockIpc.getRepos.mockResolvedValue([repo]);

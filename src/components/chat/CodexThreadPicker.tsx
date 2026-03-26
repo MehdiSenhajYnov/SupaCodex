@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   ArrowRightCircle,
@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { ipc } from "../../lib/ipc";
+import { useAnchoredPopoverPosition } from "../shared/anchoredPopoverPosition";
 import type { CodexRemoteThread } from "../../types";
 
 interface CodexThreadPickerProps {
@@ -18,10 +19,12 @@ interface CodexThreadPickerProps {
   workspaceId?: string | null;
   modelId?: string | null;
   canManageActiveThread?: boolean;
+  canOpenInCli?: boolean;
   onFork: () => Promise<void>;
   onRollback: (numTurns: number) => Promise<void>;
   onCompact: () => Promise<void>;
   onAttachRemoteThread: (engineThreadId: string) => Promise<void>;
+  onOpenInCli?: () => Promise<void>;
 }
 
 type RemoteFilterMode = "active" | "archived";
@@ -57,10 +60,12 @@ export function CodexThreadPicker({
   workspaceId,
   modelId,
   canManageActiveThread = false,
+  canOpenInCli = false,
   onFork,
   onRollback,
   onCompact,
   onAttachRemoteThread,
+  onOpenInCli,
 }: CodexThreadPickerProps) {
   const { t } = useTranslation("chat");
   const [open, setOpen] = useState(false);
@@ -75,20 +80,13 @@ export function CodexThreadPicker({
   const [remoteFilter, setRemoteFilter] = useState<RemoteFilterMode>("active");
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState({ bottom: 0, left: 0 });
-
-  useLayoutEffect(() => {
-    if (!open || !triggerRef.current) {
-      return;
-    }
-
-    const rect = triggerRef.current.getBoundingClientRect();
-    const left = Math.max(8, Math.min(rect.left, window.innerWidth - 520));
-    setPos({
-      bottom: window.innerHeight - rect.top + 6,
-      left,
-    });
-  }, [open]);
+  const pos = useAnchoredPopoverPosition({
+    open,
+    triggerRef,
+    popoverRef,
+    preferredDirection: "top",
+    align: "center",
+  });
 
   useEffect(() => {
     if (!open) {
@@ -223,6 +221,23 @@ export function CodexThreadPicker({
     }
   }
 
+  async function handleOpenInCli() {
+    if (!onOpenInCli) {
+      return;
+    }
+
+    setBusyAction("open-cli");
+    setError(null);
+    try {
+      await onOpenInCli();
+      setOpen(false);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError));
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
   async function handleAttachRemoteThread(thread: CodexRemoteThread) {
     setBusyAction(`attach:${thread.engineThreadId}`);
     setError(null);
@@ -261,7 +276,7 @@ export function CodexThreadPicker({
             style={{
               position: "fixed",
               zIndex: 1300,
-              bottom: pos.bottom,
+              top: pos.top,
               left: pos.left,
               width: "min(500px, calc(100vw - 16px))",
             }}
@@ -563,6 +578,32 @@ export function CodexThreadPicker({
                   {busyAction === "compact"
                     ? t("threadPicker.working")
                     : t("threadPicker.compactAction")}
+                </button>
+              </div>
+
+              <div
+                style={{
+                  display: "grid",
+                  gap: 8,
+                  padding: 10,
+                  borderRadius: 10,
+                  background: "var(--bg-2)",
+                  border: "1px solid var(--border)",
+                  opacity: canOpenInCli ? 1 : 0.72,
+                }}
+              >
+                <div className="codex-config-label">Open in CLI</div>
+                <div className="codex-config-note">
+                  Resume the active GUI-backed Codex thread in an integrated terminal using the correct `CODEX_HOME`.
+                </div>
+                <button
+                  type="button"
+                  className="chat-toolbar-btn chat-toolbar-btn-active"
+                  onClick={() => void handleOpenInCli()}
+                  disabled={busyAction !== null || !canOpenInCli || !onOpenInCli}
+                >
+                  <ArrowRightCircle size={12} />
+                  {busyAction === "open-cli" ? t("threadPicker.working") : "Open in CLI"}
                 </button>
               </div>
             </div>

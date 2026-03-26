@@ -1,5 +1,5 @@
 /* ──────────────────────────────────────────────────
-   Panes Landing Page — style.css
+   SupaCodex Landing Page — style.css
    ────────────────────────────────────────────────── */
 
 /* ── Design Tokens ── */
@@ -2140,13 +2140,13 @@ button:focus-visible {
   font-weight: 600;
 }
 
-/* ── Manifesto Visual: Three Panes ── */
+/* ── Manifesto Visual: Three SupaCodex ── */
 .manifesto-visual {
   width: 100%;
   max-width: 900px;
 }
 
-.m-panes-row {
+.m-supacodex-row {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 20px;
@@ -2566,7 +2566,7 @@ button:focus-visible {
 
   .manifesto { padding: 60px 0; }
   .manifesto-inner { gap: 32px; }
-  .m-panes-row { grid-template-columns: 1fr; max-width: 320px; margin: 0 auto; }
+  .m-supacodex-row { grid-template-columns: 1fr; max-width: 320px; margin: 0 auto; }
 
   .cta { padding: 80px 0; }
   .cta-actions { flex-direction: column; align-items: center; }

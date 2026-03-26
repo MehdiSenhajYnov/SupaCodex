@@ -1,32 +1,32 @@
 {
   "greeting": {
-    "title": "Welcome to Panes",
+    "title": "Welcome to SupaCodex",
     "subtitle": "Your local cockpit for AI-assisted coding.",
     "cta": "Get started"
   },
   "workflow": {
     "title": "How do you prefer to work?",
-    "subtitle": "Pick the workflow Panes should optimize first. You can reopen onboarding later and switch.",
+    "subtitle": "Pick the workflow SupaCodex should optimize first. You can reopen onboarding later and switch.",
     "options": {
       "cli": {
         "title": "CLI Agents",
-        "description": "Browse the agent CLIs Panes already supports, install the ones you want, and then choose the workspace where you want to start."
+        "description": "Browse the agent CLIs SupaCodex already supports, install the ones you want, and then choose the workspace where you want to start."
       },
       "chat": {
         "title": "Chat with Codex / Claude",
-        "description": "Choose Codex, Claude, or both. Panes will verify what is ready, help install what is missing, and then send you to a workspace."
+        "description": "Choose Codex, Claude, or both. SupaCodex will verify what is ready, help install what is missing, and then send you to a workspace."
       }
     }
   },
   "cliProviders": {
     "title": "Pick your CLI agents",
     "subtitle": "See which providers are already available on this machine and install any missing ones before opening your first workspace.",
-    "helper": "Launch is intentionally skipped here. The onboarding ends after you confirm a workspace, then Panes takes you to the harness panel.",
+    "helper": "Launch is intentionally skipped here. The onboarding ends after you confirm a workspace, then SupaCodex takes you to the harness panel.",
     "scanning": "Scanning available providers..."
   },
   "chatEngines": {
     "title": "Pick your chat harnesses",
-    "subtitle": "Choose which harnesses you want ready inside Panes chat.",
+    "subtitle": "Choose which harnesses you want ready inside SupaCodex chat.",
     "helper": "You can select Codex, Claude, or both. If you pick both, the next step checks both runtimes before you continue.",
     "options": {
       "codex": {
@@ -39,14 +39,14 @@
   },
   "chatReadiness": {
     "title": "Verify chat readiness",
-    "subtitle": "Panes is checking the selected engines, plus the dependencies they actually need for chat.",
+    "subtitle": "SupaCodex is checking the selected engines, plus the dependencies they actually need for chat.",
     "helper": "Warnings about future auth setup are informational in this version. The goal here is to get the runtime installed and a workspace selected.",
     "loading": "Checking selected engines...",
     "readyHint": "Everything selected for chat is ready. Continue to choose the workspace you want to use first.",
     "authDeferred": "Codex still needs account sign-in, but that does not block onboarding in this version. Finish onboarding now and complete Codex auth afterward.",
-    "nodeInstallAvailable": "Node.js is missing. Panes can install it automatically so the selected chat engines can run.",
+    "nodeInstallAvailable": "Node.js is missing. SupaCodex can install it automatically so the selected chat engines can run.",
     "nodeInstallManual": "Node.js is missing. Install Node.js 20+ manually, then refresh the readiness check.",
-    "codexInstallAvailable": "Codex CLI is missing. Panes can install it automatically for the Codex chat engine.",
+    "codexInstallAvailable": "Codex CLI is missing. SupaCodex can install it automatically for the Codex chat engine.",
     "codexInstallManual": "Codex CLI is missing. Install it manually, then refresh the readiness check.",
     "deps": {
       "node": "Node.js"
@@ -66,7 +66,7 @@
   },
   "workspace": {
     "title": "Confirm your first workspace",
-    "subtitle": "Choose the workspace Panes should open after onboarding. Even if one is already active, confirm it here explicitly.",
+    "subtitle": "Choose the workspace SupaCodex should open after onboarding. Even if one is already active, confirm it here explicitly.",
     "helper": "Select an existing workspace or open a new folder. Onboarding completes only after this confirmation.",
     "empty": "No workspaces are available yet. Open a folder to continue.",
     "current": "Current workspace"

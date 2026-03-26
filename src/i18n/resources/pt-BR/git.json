@@ -27,7 +27,7 @@
     "refreshed": "Atualizado",
     "softResetCompleted": "Soft reset concluído",
     "undoLastCommit": "Desfazer último commit",
-    "undoLastCommitMessage": "Isso desfaz o commit mais recente e mantém todas as alterações dele staged. Esta ação não pode ser desfeita pelo Panes.",
+    "undoLastCommitMessage": "Isso desfaz o commit mais recente e mantém todas as alterações dele staged. Esta ação não pode ser desfeita pelo SupaCodex.",
     "softReset": "Soft reset",
     "pull": "Pull",
     "push": "Push"

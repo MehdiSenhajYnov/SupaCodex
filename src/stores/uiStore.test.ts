@@ -3,8 +3,8 @@ import { COMMAND_PALETTE_DEFAULT_LAUNCH } from "../lib/commandPalette";
 
 type UiStoreModule = typeof import("./uiStore");
 
-function createStorageStub() {
-  const storage = new Map<string, string>();
+function createStorageStub(initial: Record<string, string> = {}) {
+  const storage = new Map<string, string>(Object.entries(initial));
   return {
     getItem: vi.fn((key: string) => storage.get(key) ?? null),
     setItem: vi.fn((key: string, value: string) => {
@@ -28,7 +28,6 @@ describe("uiStore focus mode", () => {
     ({ useUiStore } = await import("./uiStore"));
     useUiStore.setState({
       showSidebar: true,
-      sidebarPinned: true,
       showGitPanel: true,
       focusMode: false,
       focusModeSnapshot: null,
@@ -138,5 +137,50 @@ describe("uiStore focus mode", () => {
       commandPaletteOpen: false,
       commandPaletteLaunch: COMMAND_PALETTE_DEFAULT_LAUNCH,
     });
+  });
+});
+
+describe("uiStore shell persistence", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("restores the persisted shell state on startup", async () => {
+    vi.resetModules();
+    vi.stubGlobal("localStorage", createStorageStub({
+      "supacodex:uiShell:v1": JSON.stringify({
+        version: 1,
+        showSidebar: false,
+        showGitPanel: true,
+        activeView: "harnesses",
+      }),
+    }));
+
+    const { useUiStore } = await import("./uiStore");
+
+    expect(useUiStore.getState()).toMatchObject({
+      showSidebar: false,
+      showGitPanel: true,
+      activeView: "harnesses",
+    });
+  });
+
+  it("persists explicit shell toggles outside focus mode", async () => {
+    vi.resetModules();
+    const localStorageStub = createStorageStub();
+    vi.stubGlobal("localStorage", localStorageStub);
+
+    const { useUiStore } = await import("./uiStore");
+    useUiStore.getState().toggleSidebar();
+
+    expect(localStorageStub.setItem).toHaveBeenCalledWith(
+      "supacodex:uiShell:v1",
+      JSON.stringify({
+        version: 1,
+        showSidebar: false,
+        showGitPanel: true,
+        activeView: "chat",
+      }),
+    );
   });
 });

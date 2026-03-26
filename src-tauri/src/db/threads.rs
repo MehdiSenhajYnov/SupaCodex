@@ -448,7 +448,7 @@ mod tests {
     use super::*;
 
     fn test_db() -> Database {
-        let path = std::env::temp_dir().join(format!("panes-threads-{}.db", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("supacodex-threads-{}.db", Uuid::new_v4()));
         let db = Database {
             path,
             pool: Arc::new(ConnectionPool {
@@ -461,7 +461,7 @@ mod tests {
     }
 
     fn test_thread(db: &Database, title: &str) -> ThreadDto {
-        let root = std::env::temp_dir().join(format!("panes-workspace-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("supacodex-workspace-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("failed to create temp workspace root");
         let workspace =
             workspaces::upsert_workspace(db, root.to_string_lossy().as_ref(), Some(1)).unwrap();

@@ -336,7 +336,8 @@ mod tests {
             .into_iter()
             .map(|key| (key, std::env::var_os(key)))
             .collect();
-        let root = std::env::temp_dir().join(format!("panes-keep-awake-home-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("supacodex-keep-awake-home-{}", Uuid::new_v4()));
         let local_app_data = root.join("AppData").join("Local");
         let roaming_app_data = root.join("AppData").join("Roaming");
         fs::create_dir_all(&local_app_data).expect("failed to create temp local app data");

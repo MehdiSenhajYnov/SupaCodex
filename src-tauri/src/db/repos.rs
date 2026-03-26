@@ -304,7 +304,7 @@ mod tests {
     use super::*;
 
     fn test_db() -> Database {
-        let path = std::env::temp_dir().join(format!("panes-repos-{}.db", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("supacodex-repos-{}.db", Uuid::new_v4()));
         let db = Database {
             path,
             pool: Arc::new(ConnectionPool {
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn reconcile_workspace_repos_hides_stale_rows_and_preserves_repo_metadata() {
         let db = test_db();
-        let root = std::env::temp_dir().join(format!("panes-workspace-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("supacodex-workspace-{}", Uuid::new_v4()));
         let keep_path = root.join("keep");
         let stale_path = root.join("stale");
 

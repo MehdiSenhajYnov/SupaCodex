@@ -23,7 +23,7 @@ import {
   getHarnessInstallCommand,
   getHarnessTileAction,
 } from "../../lib/harnessInstallActions";
-import { handleDragDoubleClick, handleDragMouseDown } from "../../lib/windowDrag";
+import { handleDragMouseDown } from "../../lib/windowDrag";
 import { getHarnessIcon } from "../shared/HarnessLogos";
 import type { HarnessInfo } from "../../types";
 
@@ -192,7 +192,6 @@ export function HarnessPanel() {
             <div
               className="hp-header-top"
               onMouseDown={handleDragMouseDown}
-              onDoubleClick={handleDragDoubleClick}
             >
               <button type="button" className="wsp-back" onClick={goBack} title={t("workspace:actions.back")}>
                 <ArrowLeft size={14} />

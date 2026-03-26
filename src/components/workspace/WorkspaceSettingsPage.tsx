@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { ipc } from "../../lib/ipc";
 import { formatShortDate } from "../../lib/formatters";
-import { handleDragDoubleClick, handleDragMouseDown } from "../../lib/windowDrag";
+import { handleDragMouseDown } from "../../lib/windowDrag";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { useUiStore } from "../../stores/uiStore";
 import { toast } from "../../stores/toastStore";
@@ -214,7 +214,6 @@ export function WorkspaceSettingsPage() {
           <div
             className="wsp-header"
             onMouseDown={handleDragMouseDown}
-            onDoubleClick={handleDragDoubleClick}
           >
             <button type="button" className="wsp-back" onClick={goBack} title={t("actions.back")}>
               <ArrowLeft size={14} />

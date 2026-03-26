@@ -150,7 +150,7 @@ export function GitWorktreesView({ repo, onError }: Props) {
   }, [worktrees, filterQuery]);
 
   const autoWorktreePath = createBranch.trim()
-    ? `${repo.path}/.panes/worktrees/${createBranch.trim().replace(/[/\\]/g, "-")}/`
+    ? `${repo.path}/.supacodex/worktrees/${createBranch.trim().replace(/[/\\]/g, "-")}/`
     : "";
 
   function openActionMenu(worktree: GitWorktree, e: React.MouseEvent<HTMLButtonElement>) {

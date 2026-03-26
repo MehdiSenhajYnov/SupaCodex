@@ -1,49 +1,126 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import type { LucideIcon } from "lucide-react";
 
-export interface SlashCommand {
+export interface ChatComposerMenuItem {
   id: string;
   name: string;
   description: string;
   icon: LucideIcon;
-  codexOnly?: boolean;
+  badge?: string;
   disabled?: boolean;
 }
 
-interface ChatSlashMenuProps {
+interface CaretAnchorPosition {
+  top: number;
+  left: number;
+  width: number;
+}
+
+interface ChatComposerMenuProps {
   visible: boolean;
-  query: string;
-  commands: SlashCommand[];
-  anchorRef: React.RefObject<HTMLElement | null>;
+  queryKey: string;
+  items: ChatComposerMenuItem[];
+  anchorRef: RefObject<HTMLTextAreaElement | null>;
+  caretIndex: number;
   activeIndex: number;
-  onSelect: (commandId: string) => void;
+  onSelect: (itemId: string) => void;
   onDismiss: () => void;
   onActiveChange: (index: number) => void;
 }
 
-export function ChatSlashMenu({
+const TEXTAREA_MIRROR_STYLE_KEYS = [
+  "borderBottomWidth",
+  "borderLeftWidth",
+  "borderRightWidth",
+  "borderTopWidth",
+  "boxSizing",
+  "fontFamily",
+  "fontFeatureSettings",
+  "fontKerning",
+  "fontSize",
+  "fontStretch",
+  "fontStyle",
+  "fontVariant",
+  "fontWeight",
+  "letterSpacing",
+  "lineHeight",
+  "paddingBottom",
+  "paddingLeft",
+  "paddingRight",
+  "paddingTop",
+  "tabSize",
+  "textIndent",
+  "textRendering",
+  "textTransform",
+  "whiteSpace",
+  "wordBreak",
+  "wordSpacing",
+  "overflowWrap",
+] as const;
+
+function measureTextareaCaretPosition(
+  textarea: HTMLTextAreaElement,
+  caretIndex: number,
+): CaretAnchorPosition {
+  const computed = window.getComputedStyle(textarea);
+  const mirror = document.createElement("div");
+  for (const key of TEXTAREA_MIRROR_STYLE_KEYS) {
+    mirror.style[key] = computed[key];
+  }
+  mirror.style.position = "absolute";
+  mirror.style.visibility = "hidden";
+  mirror.style.pointerEvents = "none";
+  mirror.style.top = "0";
+  mirror.style.left = "-9999px";
+  mirror.style.whiteSpace = "pre-wrap";
+  mirror.style.wordWrap = "break-word";
+  mirror.style.overflow = "hidden";
+  mirror.style.width = `${textarea.clientWidth}px`;
+  mirror.textContent = textarea.value.slice(0, caretIndex);
+
+  if (textarea.value.charAt(caretIndex - 1) === "\n") {
+    mirror.textContent += "\u200b";
+  }
+
+  const marker = document.createElement("span");
+  marker.textContent = textarea.value.slice(caretIndex) || "\u200b";
+  mirror.appendChild(marker);
+  document.body.appendChild(mirror);
+
+  const textareaRect = textarea.getBoundingClientRect();
+  const top = textareaRect.top + marker.offsetTop - textarea.scrollTop;
+  const left = textareaRect.left + marker.offsetLeft - textarea.scrollLeft;
+  const width = Math.min(360, Math.max(240, textareaRect.width));
+
+  document.body.removeChild(mirror);
+  return { top, left, width };
+}
+
+export function ChatComposerMenu({
   visible,
-  query,
-  commands,
+  queryKey,
+  items,
   anchorRef,
+  caretIndex,
   activeIndex,
   onSelect,
   onDismiss,
   onActiveChange,
-}: ChatSlashMenuProps) {
+}: ChatComposerMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ bottom: 0, left: 0, width: 0 });
 
   useLayoutEffect(() => {
     if (!visible || !anchorRef.current) return;
-    const rect = anchorRef.current.getBoundingClientRect();
+    const anchor = measureTextareaCaretPosition(anchorRef.current, caretIndex);
+    const width = Math.min(anchor.width, window.innerWidth - 16);
     setPos({
-      bottom: window.innerHeight - rect.top + 6,
-      left: rect.left,
-      width: Math.min(340, rect.width),
+      bottom: window.innerHeight - anchor.top + 10,
+      left: Math.max(8, Math.min(anchor.left, window.innerWidth - width - 8)),
+      width,
     });
-  }, [visible, anchorRef, query]);
+  }, [anchorRef, caretIndex, queryKey, visible]);
 
   // Close on outside click
   useEffect(() => {
@@ -62,12 +139,12 @@ export function ChatSlashMenu({
   useEffect(() => {
     if (!visible) return;
     const activeEl = menuRef.current?.querySelector(
-      `[data-slash-index="${activeIndex}"]`,
+      `[data-composer-index="${activeIndex}"]`,
     );
     activeEl?.scrollIntoView({ block: "nearest" });
   }, [activeIndex, visible]);
 
-  if (!visible || commands.length === 0) return null;
+  if (!visible || items.length === 0) return null;
 
   return createPortal(
     <div
@@ -81,30 +158,30 @@ export function ChatSlashMenu({
         width: pos.width,
       }}
     >
-      {commands.map((cmd, i) => {
-        const Icon = cmd.icon;
+      {items.map((item, i) => {
+        const Icon = item.icon;
         const isActive = i === activeIndex;
         return (
           <button
-            key={cmd.id}
+            key={item.id}
             type="button"
-            data-slash-index={i}
-            className={`slash-menu-item${isActive ? " slash-menu-item-active" : ""}${cmd.disabled ? " slash-menu-item-disabled" : ""}`}
+            data-composer-index={i}
+            className={`slash-menu-item${isActive ? " slash-menu-item-active" : ""}${item.disabled ? " slash-menu-item-disabled" : ""}`}
             onPointerEnter={() => onActiveChange(i)}
             onClick={() => {
-              if (!cmd.disabled) onSelect(cmd.id);
+              if (!item.disabled) onSelect(item.id);
             }}
-            disabled={cmd.disabled}
+            disabled={item.disabled}
           >
             <span className="slash-menu-item-icon">
               <Icon size={14} />
             </span>
             <span className="slash-menu-item-text">
-              <span className="slash-menu-item-name">{cmd.name[0].toUpperCase() + cmd.name.slice(1)}</span>
-              <span className="slash-menu-item-desc">{cmd.description}</span>
+              <span className="slash-menu-item-name">{item.name}</span>
+              <span className="slash-menu-item-desc">{item.description}</span>
             </span>
-            {cmd.codexOnly && (
-              <span className="slash-menu-item-badge">Codex</span>
+            {item.badge && (
+              <span className="slash-menu-item-badge">{item.badge}</span>
             )}
           </button>
         );

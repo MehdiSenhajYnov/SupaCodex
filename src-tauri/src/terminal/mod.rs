@@ -1383,7 +1383,9 @@ fn build_terminal_env_config_for(is_windows: bool, inputs: TerminalEnvInputs) ->
         Some(value) => Some(value.to_string()),
     };
     let colorterm = inputs.colorterm.or_else(|| Some("truecolor".to_string()));
-    let term_program = inputs.term_program.or_else(|| Some("Panes".to_string()));
+    let term_program = inputs
+        .term_program
+        .or_else(|| Some("SupaCodex".to_string()));
     let term_program_version = inputs
         .term_program_version
         .or_else(|| Some(env!("CARGO_PKG_VERSION").to_string()));
@@ -1525,8 +1527,8 @@ fn apply_terminal_env(cmd: &mut CommandBuilder, config: &TerminalEnvConfig) {
     if let Some(value) = config.snapshot.term_program_version.as_deref() {
         cmd.env("TERM_PROGRAM_VERSION", value);
     }
-    cmd.env("PANES_TERM_PROGRAM", "Panes");
-    cmd.env("PANES_TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    cmd.env("SUPACODEX_TERM_PROGRAM", "SupaCodex");
+    cmd.env("SUPACODEX_TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
     if let Some(value) = config.snapshot.home.as_deref() {
         cmd.env("HOME", value);
     }
@@ -1601,10 +1603,10 @@ fn apply_notification_env(
         return;
     };
 
-    cmd.env("PANES_WORKSPACE_ID", &notification_env.workspace_id);
-    cmd.env("PANES_SESSION_ID", &notification_env.session_id);
-    cmd.env("PANES_NOTIFY_ADDR", &notification_env.ingress_addr);
-    cmd.env("PANES_NOTIFY_TOKEN", &notification_env.ingress_token);
+    cmd.env("SUPACODEX_WORKSPACE_ID", &notification_env.workspace_id);
+    cmd.env("SUPACODEX_SESSION_ID", &notification_env.session_id);
+    cmd.env("SUPACODEX_NOTIFY_ADDR", &notification_env.ingress_addr);
+    cmd.env("SUPACODEX_NOTIFY_TOKEN", &notification_env.ingress_token);
 }
 
 fn ensure_dir_exists(label: &str, path: Option<&str>) {
@@ -2193,7 +2195,7 @@ mod tests {
                 .as_deref()
                 .map(normalize_path)
                 .as_deref(),
-            Some("C:/Users/panes/AppData/Local")
+            Some("C:/Users/supacodex/AppData/Local")
         );
         assert_eq!(
             config
@@ -2202,7 +2204,7 @@ mod tests {
                 .as_deref()
                 .map(normalize_path)
                 .as_deref(),
-            Some("C:/Users/panes/AppData/Local")
+            Some("C:/Users/supacodex/AppData/Local")
         );
         assert_eq!(
             config
@@ -2210,7 +2212,7 @@ mod tests {
                 .as_deref()
                 .map(normalize_path)
                 .as_deref(),
-            Some("C:/Users/panes/AppData/Roaming")
+            Some("C:/Users/supacodex/AppData/Roaming")
         );
         assert_eq!(
             config
@@ -2219,11 +2221,11 @@ mod tests {
                 .as_deref()
                 .map(normalize_path)
                 .as_deref(),
-            Some("C:/Users/panes/AppData/Roaming")
+            Some("C:/Users/supacodex/AppData/Roaming")
         );
         assert_eq!(
             config.temp.as_deref().map(normalize_path).as_deref(),
-            Some("C:/Users/panes/AppData/Local/Temp")
+            Some("C:/Users/supacodex/AppData/Local/Temp")
         );
         assert_eq!(
             config
@@ -2232,11 +2234,11 @@ mod tests {
                 .as_deref()
                 .map(normalize_path)
                 .as_deref(),
-            Some("C:/Users/panes/AppData/Local/Temp")
+            Some("C:/Users/supacodex/AppData/Local/Temp")
         );
         assert_eq!(
             config.tmp.as_deref().map(normalize_path).as_deref(),
-            Some("C:/Users/panes/AppData/Local/Temp")
+            Some("C:/Users/supacodex/AppData/Local/Temp")
         );
         assert_eq!(
             config
@@ -2245,7 +2247,7 @@ mod tests {
                 .as_deref()
                 .map(normalize_path)
                 .as_deref(),
-            Some("C:/Users/panes/AppData/Local/Temp")
+            Some("C:/Users/supacodex/AppData/Local/Temp")
         );
         assert!(config.snapshot.xdg_config_home.is_none());
         assert!(config.snapshot.xdg_data_home.is_none());
@@ -2258,7 +2260,7 @@ mod tests {
                 .as_deref()
                 .map(normalize_path)
                 .as_deref(),
-            Some("C:/Users/panes/AppData/Local/Temp")
+            Some("C:/Users/supacodex/AppData/Local/Temp")
         );
         assert!(config.snapshot.lang.is_none());
         assert!(config.snapshot.lc_all.is_none());
@@ -2305,7 +2307,7 @@ mod tests {
                 .as_deref()
                 .map(normalize_path)
                 .as_deref(),
-            Some("C:/Users/panes/AppData/Local")
+            Some("C:/Users/supacodex/AppData/Local")
         );
         assert_eq!(
             config
@@ -2313,7 +2315,7 @@ mod tests {
                 .as_deref()
                 .map(normalize_path)
                 .as_deref(),
-            Some("C:/Users/panes/AppData/Roaming")
+            Some("C:/Users/supacodex/AppData/Roaming")
         );
     }
 
@@ -2379,19 +2381,19 @@ mod tests {
         assert_eq!(config.snapshot.home.as_deref(), Some("/home/panes"));
         assert_eq!(
             config.snapshot.xdg_config_home.as_deref(),
-            Some("/home/panes/.config")
+            Some("/home/supacodex/.config")
         );
         assert_eq!(
             config.snapshot.xdg_data_home.as_deref(),
-            Some("/home/panes/.local/share")
+            Some("/home/supacodex/.local/share")
         );
         assert_eq!(
             config.snapshot.xdg_cache_home.as_deref(),
-            Some("/home/panes/.cache")
+            Some("/home/supacodex/.cache")
         );
         assert_eq!(
             config.snapshot.xdg_state_home.as_deref(),
-            Some("/home/panes/.local/state")
+            Some("/home/supacodex/.local/state")
         );
         assert_eq!(config.snapshot.lang.as_deref(), Some("en_US.UTF-8"));
         assert_eq!(config.snapshot.lc_ctype.as_deref(), Some("en_US.UTF-8"));
@@ -2451,7 +2453,7 @@ mod tests {
                 .as_deref()
                 .map(normalize_path)
                 .as_deref(),
-            Some("C:/Users/panes/AppData/Local")
+            Some("C:/Users/supacodex/AppData/Local")
         );
     }
 }

@@ -7,10 +7,10 @@ import type {
   OnboardingWorkflowPreference,
 } from "../types";
 
-export const LEGACY_SETUP_COMPLETED_KEY = "panes.setup.completed.v2";
-export const ONBOARDING_COMPLETED_KEY = "panes.onboarding.completed.v1";
-export const ONBOARDING_WORKFLOW_KEY = "panes.onboarding.workflow.v1";
-export const ONBOARDING_CHAT_ENGINES_KEY = "panes.onboarding.chatEngines.v1";
+export const LEGACY_SETUP_COMPLETED_KEY = "supacodex.setup.completed.v2";
+export const ONBOARDING_COMPLETED_KEY = "supacodex.onboarding.completed.v1";
+export const ONBOARDING_WORKFLOW_KEY = "supacodex.onboarding.workflow.v1";
+export const ONBOARDING_CHAT_ENGINES_KEY = "supacodex.onboarding.chatEngines.v1";
 
 const CHAT_ENGINE_ORDER: OnboardingChatEngineId[] = ["codex", "claude"];
 

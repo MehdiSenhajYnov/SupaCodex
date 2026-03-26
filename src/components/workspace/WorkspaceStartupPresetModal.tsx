@@ -1339,8 +1339,8 @@ export function WorkspaceStartupPresetModal({
                                             repoMode: currentGroup.worktree?.repoMode ?? "active_repo",
                                             repoPath: currentGroup.worktree?.repoPath ?? null,
                                             baseBranch: currentGroup.worktree?.baseBranch ?? null,
-                                            baseDir: currentGroup.worktree?.baseDir ?? ".panes/worktrees",
-                                            branchPrefix: currentGroup.worktree?.branchPrefix ?? "panes/preset",
+                                            baseDir: currentGroup.worktree?.baseDir ?? ".supacodex/worktrees",
+                                            branchPrefix: currentGroup.worktree?.branchPrefix ?? "supacodex/preset",
                                           }
                                         : null,
                                     }))
@@ -1425,7 +1425,7 @@ export function WorkspaceStartupPresetModal({
                                           },
                                         }))
                                       }
-                                      placeholder=".panes/worktrees"
+                                      placeholder=".supacodex/worktrees"
                                     />
                                   </label>
                                   <label className="workspace-preset-field">
@@ -1443,7 +1443,7 @@ export function WorkspaceStartupPresetModal({
                                           },
                                         }))
                                       }
-                                      placeholder="panes/preset"
+                                      placeholder="supacodex/preset"
                                     />
                                   </label>
                                 </>
@@ -1453,7 +1453,7 @@ export function WorkspaceStartupPresetModal({
 
                           <div className="workspace-preset-subsection">
                             <div className="workspace-preset-subsection-header">
-                              <h5>{t("startup.modal.panes")}</h5>
+                              <h5>{t("startup.modal.supacodex")}</h5>
                             </div>
                             <div className="workspace-preset-sessions">
                               {group.sessions.map((session, index) => (

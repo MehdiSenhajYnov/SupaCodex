@@ -273,7 +273,7 @@ function WorkflowCard({
           ? "1px solid var(--border-accent)"
           : "1px solid var(--border)",
         background: active
-          ? "rgba(255, 107, 107, 0.04)"
+          ? "rgba(139, 92, 246, 0.04)"
           : "var(--bg-2)",
         display: "flex",
         flexDirection: "column" as const,
@@ -335,7 +335,7 @@ function ChatEngineCard({
           ? "1px solid var(--border-accent)"
           : "1px solid var(--border)",
         background: selected
-          ? "rgba(255, 107, 107, 0.04)"
+          ? "rgba(139, 92, 246, 0.04)"
           : "var(--bg-2)",
         animation: "ob-card-cascade 200ms var(--ease-out) both",
         animationDelay: `${index * 40}ms`,
@@ -664,7 +664,7 @@ function WorkspaceRow({
           ? "1px solid var(--border-accent)"
           : "1px solid var(--border)",
         background: selected
-          ? "rgba(255, 107, 107, 0.04)"
+          ? "rgba(139, 92, 246, 0.04)"
           : "var(--bg-2)",
       }}
     >
@@ -1010,7 +1010,7 @@ export function OnboardingWizard() {
                 maxWidth: 480,
               }}
             >
-              {/* Panes logo */}
+              {/* SupaCodex logo */}
               <div
                 style={{
                   marginBottom: 32,
@@ -1021,7 +1021,7 @@ export function OnboardingWizard() {
                   <rect x="10" y="36" width="94" height="94" stroke="white" strokeWidth="6" />
                   <rect x="36" y="10" width="94" height="94" stroke="white" strokeWidth="6" />
                   <rect x="23" y="23" width="94" height="94" stroke="white" strokeWidth="6" />
-                  <rect x="50" y="50" width="40" height="40" fill="#FF6B6B" />
+                  <rect x="50" y="50" width="40" height="40" fill="#8B5CF6" />
                 </svg>
               </div>
 

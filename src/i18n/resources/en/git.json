@@ -27,7 +27,7 @@
     "refreshed": "Refreshed",
     "softResetCompleted": "Soft reset completed",
     "undoLastCommit": "Undo last commit",
-    "undoLastCommitMessage": "This will undo the latest commit and keep all its changes staged. This cannot be undone from Panes.",
+    "undoLastCommitMessage": "This will undo the latest commit and keep all its changes staged. This cannot be undone from SupaCodex.",
     "softReset": "Soft reset",
     "pull": "Pull",
     "push": "Push"

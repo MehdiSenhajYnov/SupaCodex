@@ -166,8 +166,8 @@ describe("terminalStore.createMultiSessionGroup", () => {
         repoMode: "fixed_repo",
         repoPath: "/repo",
         baseBranch: "main",
-        baseDir: "/repo/.panes/worktrees",
-        branchPrefix: "panes",
+        baseDir: "/repo/.supacodex/worktrees",
+        branchPrefix: "supacodex",
       },
       120,
       36,
@@ -178,13 +178,13 @@ describe("terminalStore.createMultiSessionGroup", () => {
 
     const first = mockIpc.addGitWorktree.mock.calls[0];
     const second = mockIpc.addGitWorktree.mock.calls[1];
-    const runId = /^panes\/([^/]+)\/codex-1$/.exec(first[2] as string)?.[1];
+    const runId = /^supacodex\/([^/]+)\/codex-1$/.exec(first[2] as string)?.[1];
 
     expect(runId).toBeTruthy();
-    expect(first[1]).toBe(`/repo/.panes/worktrees/${runId}/codex-1`);
-    expect(second[1]).toBe(`/repo/.panes/worktrees/${runId}/codex-2`);
-    expect(first[2]).toBe(`panes/${runId}/codex-1`);
-    expect(second[2]).toBe(`panes/${runId}/codex-2`);
+    expect(first[1]).toBe(`/repo/.supacodex/worktrees/${runId}/codex-1`);
+    expect(second[1]).toBe(`/repo/.supacodex/worktrees/${runId}/codex-2`);
+    expect(first[2]).toBe(`supacodex/${runId}/codex-1`);
+    expect(second[2]).toBe(`supacodex/${runId}/codex-2`);
   });
 
   it("throws and stores an error when worktree cleanup fails", async () => {
@@ -196,33 +196,33 @@ describe("terminalStore.createMultiSessionGroup", () => {
       useTerminalStore.getState().removeGroupWorktrees("ws-1", [
         {
           repoPath: "/repo",
-          worktreePath: "/repo/.panes/worktrees/r1/agent-1",
-          branch: "panes/r1/agent-1",
+          worktreePath: "/repo/.supacodex/worktrees/r1/agent-1",
+          branch: "supacodex/r1/agent-1",
         },
         {
           repoPath: "/repo",
-          worktreePath: "/repo/.panes/worktrees/r1/agent-2",
-          branch: "panes/r1/agent-2",
+          worktreePath: "/repo/.supacodex/worktrees/r1/agent-2",
+          branch: "supacodex/r1/agent-2",
         },
       ]),
     ).rejects.toThrow("Failed to remove 1 worktree(s)");
 
     const workspace = useTerminalStore.getState().workspaces["ws-1"];
-    expect(workspace?.error).toContain("panes/r1/agent-2");
+    expect(workspace?.error).toContain("supacodex/r1/agent-2");
     expect(mockIpc.removeGitWorktree).toHaveBeenNthCalledWith(
       1,
       "/repo",
-      "/repo/.panes/worktrees/r1/agent-1",
+      "/repo/.supacodex/worktrees/r1/agent-1",
       true,
-      "panes/r1/agent-1",
+      "supacodex/r1/agent-1",
       true,
     );
     expect(mockIpc.removeGitWorktree).toHaveBeenNthCalledWith(
       2,
       "/repo",
-      "/repo/.panes/worktrees/r1/agent-2",
+      "/repo/.supacodex/worktrees/r1/agent-2",
       true,
-      "panes/r1/agent-2",
+      "supacodex/r1/agent-2",
       true,
     );
   });
@@ -251,8 +251,8 @@ describe("terminalStore.createMultiSessionGroup", () => {
                   launchHarnessOnCreate: true,
                   worktree: {
                     repoPath: "/repo",
-                    worktreePath: "/repo/.panes/worktrees/r1/agent-1",
-                    branch: "panes/r1/agent-1",
+                    worktreePath: "/repo/.supacodex/worktrees/r1/agent-1",
+                    branch: "supacodex/r1/agent-1",
                   },
                 },
               },
@@ -298,8 +298,8 @@ describe("terminalStore.createMultiSessionGroup", () => {
         repoMode: "fixed_repo",
         repoPath: "/repo",
         baseBranch: "main",
-        baseDir: "/repo/.panes/worktrees",
-        branchPrefix: "panes",
+        baseDir: "/repo/.supacodex/worktrees",
+        branchPrefix: "supacodex",
       },
       120,
       36,
@@ -309,7 +309,7 @@ describe("terminalStore.createMultiSessionGroup", () => {
     const workspace = useTerminalStore.getState().workspaces["ws-1"];
     expect(workspace?.error).toContain("create failed");
     expect(workspace?.error).toContain("Cleanup failed for 1 worktree(s)");
-    expect(workspace?.error).toContain("panes/");
+    expect(workspace?.error).toContain("supacodex/");
   });
 
   it("syncs a saved startup preset without mutating the live layout", () => {
@@ -659,7 +659,7 @@ describe("terminalStore.createMultiSessionGroup", () => {
 
   it("uses the remembered active repo for active_repo startup worktrees", async () => {
     mockLocalStorage.getItem.mockImplementation((key: string) =>
-      key === "panes:lastActiveRepoByWorkspace"
+      key === "supacodex:lastActiveRepoByWorkspace"
         ? JSON.stringify({ "ws-1": "repo-2" })
         : null,
     );
@@ -696,8 +696,8 @@ describe("terminalStore.createMultiSessionGroup", () => {
               repoMode: "active_repo",
               repoPath: null,
               baseBranch: "main",
-              baseDir: ".panes/worktrees",
-              branchPrefix: "panes/preset",
+              baseDir: ".supacodex/worktrees",
+              branchPrefix: "supacodex/preset",
             },
             sessions: [{ id: "pane-1", cwd: ".", cwdBase: "workspace" }],
             root: { type: "leaf", sessionId: "pane-1" },
@@ -711,7 +711,7 @@ describe("terminalStore.createMultiSessionGroup", () => {
     expect(applied).toBe(true);
     expect(mockIpc.addGitWorktree).toHaveBeenCalledTimes(1);
     expect(mockIpc.addGitWorktree.mock.calls[0]?.[0]).toBe(repo2.path);
-    expect(mockIpc.addGitWorktree.mock.calls[0]?.[1]).toContain(`${repo2.path}/.panes/worktrees/`);
+    expect(mockIpc.addGitWorktree.mock.calls[0]?.[1]).toContain(`${repo2.path}/.supacodex/worktrees/`);
   });
 
   it("launches saved harness commands even when harness scanning is still in flight", async () => {

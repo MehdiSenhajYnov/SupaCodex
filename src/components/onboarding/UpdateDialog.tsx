@@ -9,7 +9,7 @@ import {
   AlertCircle,
   Check,
 } from "lucide-react";
-import { useUpdateStore } from "../../stores/updateStore";
+import { UPDATES_ENABLED, useUpdateStore } from "../../stores/updateStore";
 
 interface UpdateDialogProps {
   open: boolean;
@@ -25,11 +25,11 @@ export function UpdateDialog({ open, onClose }: UpdateDialogProps) {
   const canClose = CLOSEABLE_STATES.has(status);
 
   useEffect(() => {
-    if (open && (status === "idle" || status === "error")) {
+    if (UPDATES_ENABLED && open && (status === "idle" || status === "error")) {
       resetToIdle();
       void checkForUpdate();
     }
-  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [checkForUpdate, open, resetToIdle, status]);
 
   useEffect(() => {
     if (!open) return;
@@ -74,7 +74,11 @@ export function UpdateDialog({ open, onClose }: UpdateDialogProps) {
           />
         )}
         {status === "idle" && (
-          <IdleState onClose={onClose} onCheck={() => void checkForUpdate()} />
+          <IdleState
+            onClose={onClose}
+            onCheck={() => void checkForUpdate()}
+            updatesEnabled={UPDATES_ENABLED}
+          />
         )}
       </div>
     </div>,
@@ -195,9 +199,11 @@ function ErrorState({
 function IdleState({
   onClose,
   onCheck,
+  updatesEnabled,
 }: {
   onClose: () => void;
   onCheck: () => void;
+  updatesEnabled: boolean;
 }) {
   const { t } = useTranslation(["app", "common"]);
   const [ver, setVer] = useState<string | null>(null);
@@ -213,15 +219,19 @@ function IdleState({
       <h3 className="confirm-dialog-title">
         {ver ? t("app:updates.idleTitleWithVersion", { version: ver }) : t("app:updates.idleTitle")}
       </h3>
-      <p className="confirm-dialog-message">{t("app:updates.idleMessage")}</p>
+      <p className="confirm-dialog-message">
+        {updatesEnabled ? t("app:updates.idleMessage") : t("app:updates.disabledMessage")}
+      </p>
       <div className="confirm-dialog-actions">
         <button type="button" className="btn btn-ghost confirm-dialog-btn-cancel" onClick={onClose}>
           {t("common:actions.close")}
         </button>
-        <button type="button" className="update-dlg-btn-accent" onClick={onCheck}>
-          <RefreshCw size={13} />
-          {t("app:updates.checkAgain")}
-        </button>
+        {updatesEnabled && (
+          <button type="button" className="update-dlg-btn-accent" onClick={onCheck}>
+            <RefreshCw size={13} />
+            {t("app:updates.checkAgain")}
+          </button>
+        )}
       </div>
     </>
   );

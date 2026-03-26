@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState, useCallback, useLayoutEffect } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Check, ChevronDown, ChevronRight } from "lucide-react";
+import { useAnchoredPopoverPosition } from "./anchoredPopoverPosition";
 
 export interface DropdownOption {
   value: string;
@@ -25,12 +26,7 @@ interface DropdownProps {
   triggerStyle?: CSSProperties;
   selectedLabel?: string;
   selectedIcon?: ReactNode;
-}
-
-interface MenuPosition {
-  top: number;
-  left: number;
-  direction: "bottom" | "top";
+  preferredDirection?: "top" | "bottom";
 }
 
 interface SubmenuPosition {
@@ -48,12 +44,12 @@ export function Dropdown({
   triggerStyle,
   selectedLabel: selectedLabelOverride,
   selectedIcon,
+  preferredDirection = "bottom",
 }: DropdownProps) {
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const submenuRef = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState<MenuPosition>({ top: 0, left: 0, direction: "bottom" });
   const [activeGroup, setActiveGroup] = useState<number | null>(null);
   const [submenuPos, setSubmenuPos] = useState<SubmenuPosition>({ top: 0, left: 0 });
   const groupLeaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -65,30 +61,21 @@ export function Dropdown({
   const selectedOption = allOptions.find((o) => o.value === value);
   const selectedLabel = selectedLabelOverride ?? selectedOption?.label ?? value;
   const activeIcon = selectedIcon ?? selectedOption?.icon;
-
-  const totalItems = options.length + (groups?.length ?? 0);
-  const hasGroups = groups && groups.length > 0;
+  const hasGroups = (groups?.length ?? 0) > 0;
+  const pos = useAnchoredPopoverPosition({
+    open,
+    triggerRef,
+    popoverRef: menuRef,
+    preferredDirection,
+    align: "start",
+    gap: 4,
+  });
 
   const toggle = useCallback(() => {
     if (disabled) return;
     setOpen((prev) => !prev);
     setActiveGroup(null);
   }, [disabled]);
-
-  useLayoutEffect(() => {
-    if (!open || !triggerRef.current) return;
-
-    const rect = triggerRef.current.getBoundingClientRect();
-    const estimatedMenuHeight = totalItems * 32 + 8 + (hasGroups ? 9 : 0);
-    const spaceBelow = window.innerHeight - rect.bottom;
-    const goUp = spaceBelow < estimatedMenuHeight && rect.top > spaceBelow;
-
-    setPos({
-      top: goUp ? rect.top - 4 : rect.bottom + 4,
-      left: rect.left,
-      direction: goUp ? "top" : "bottom",
-    });
-  }, [open, totalItems, hasGroups]);
 
   useEffect(() => {
     if (!open) return;
@@ -191,10 +178,8 @@ export function Dropdown({
           className="dropdown-menu"
           style={{
             position: "fixed",
+            top: pos.top,
             left: pos.left,
-            ...(pos.direction === "bottom"
-              ? { top: pos.top }
-              : { bottom: window.innerHeight - pos.top }),
           }}
         >
           {options.map((option) => {
@@ -224,7 +209,7 @@ export function Dropdown({
           {hasGroups && (
             <>
               <div className="dropdown-divider" />
-              {groups.map((group, i) => (
+              {groups?.map((group, i) => (
                 <button
                   key={group.label}
                   type="button"

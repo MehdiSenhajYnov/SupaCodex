@@ -342,13 +342,13 @@ fn poll_power_source_windows() -> Result<PowerSourceStatus, String> {
             public uint BatteryLifeTime;
             public uint BatteryFullLifeTime;
         }
-        public static class PanesPowerStatus {
+        public static class SupaCodexPowerStatus {
             [DllImport("kernel32.dll", SetLastError=true)]
             public static extern bool GetSystemPowerStatus(out SYSTEM_POWER_STATUS status);
         }
 '@
         $status = New-Object SYSTEM_POWER_STATUS
-        if ([PanesPowerStatus]::GetSystemPowerStatus([ref]$status)) {
+        if ([SupaCodexPowerStatus]::GetSystemPowerStatus([ref]$status)) {
             "$($status.ACLineStatus)|$($status.BatteryLifePercent)"
         } else {
             "error"
@@ -580,7 +580,7 @@ fn start_power_source_watcher(
     let thread_run_loop = run_loop.clone();
 
     let thread = thread::Builder::new()
-        .name("panes-macos-power-source".to_string())
+        .name("supacodex-macos-power-source".to_string())
         .spawn(move || {
             if let Err(error) = macos_power_source_watcher_main(thread_run_loop, event_tx, ready_tx)
             {

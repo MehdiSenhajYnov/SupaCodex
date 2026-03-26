@@ -1,8 +1,13 @@
-import type { ChatInputItem, CodexApp, CodexSkill } from "../../types";
+import type {
+  ChatInputItem,
+  CodexApp,
+  CodexPluginMarketplace,
+  CodexSkill,
+} from "../../types";
 
 const TOKEN_PATTERN = /\$([A-Za-z0-9._-]+)/g;
 
-function normalizeToken(value: string): string {
+export function normalizeCodexReferenceToken(value: string): string {
   return value
     .trim()
     .toLowerCase()
@@ -16,7 +21,7 @@ function buildSkillLookup(skills: CodexSkill[]): Map<string, CodexSkill> {
     if (!skill.enabled) {
       continue;
     }
-    lookup.set(normalizeToken(skill.name), skill);
+    lookup.set(normalizeCodexReferenceToken(skill.name), skill);
   }
   return lookup;
 }
@@ -27,8 +32,37 @@ function buildAppLookup(apps: CodexApp[]): Map<string, CodexApp> {
     if (!app.isEnabled || !app.isAccessible) {
       continue;
     }
-    lookup.set(normalizeToken(app.id), app);
-    lookup.set(normalizeToken(app.name), app);
+    lookup.set(normalizeCodexReferenceToken(app.id), app);
+    lookup.set(normalizeCodexReferenceToken(app.name), app);
+  }
+  return lookup;
+}
+
+function buildPluginLookup(
+  marketplaces: CodexPluginMarketplace[],
+): Map<string, { marketplaceName: string; pluginId: string; pluginName: string }> {
+  const lookup = new Map<
+    string,
+    { marketplaceName: string; pluginId: string; pluginName: string }
+  >();
+  for (const marketplace of marketplaces) {
+    const marketplaceName = marketplace.name.trim();
+    if (!marketplaceName) {
+      continue;
+    }
+    for (const plugin of marketplace.plugins) {
+      if (!plugin.enabled || !plugin.installed) {
+        continue;
+      }
+      const pluginId = plugin.id.trim();
+      const pluginName = plugin.name.trim();
+      if (!pluginId || !pluginName) {
+        continue;
+      }
+      const entry = { marketplaceName, pluginId, pluginName };
+      lookup.set(normalizeCodexReferenceToken(pluginId), entry);
+      lookup.set(normalizeCodexReferenceToken(pluginName), entry);
+    }
   }
   return lookup;
 }
@@ -49,9 +83,11 @@ export function buildCodexInputItems(
   message: string,
   skills: CodexSkill[],
   apps: CodexApp[],
+  pluginMarketplaces: CodexPluginMarketplace[] = [],
 ): ChatInputItem[] {
   const skillLookup = buildSkillLookup(skills);
   const appLookup = buildAppLookup(apps);
+  const pluginLookup = buildPluginLookup(pluginMarketplaces);
   const items: ChatInputItem[] = [];
   let lastIndex = 0;
 
@@ -59,10 +95,12 @@ export function buildCodexInputItems(
     const rawToken = match[0];
     const tokenName = match[1] ?? "";
     const matchIndex = match.index ?? 0;
-    const skill = skillLookup.get(normalizeToken(tokenName));
-    const app = skill ? null : appLookup.get(normalizeToken(tokenName));
+    const normalizedToken = normalizeCodexReferenceToken(tokenName);
+    const skill = skillLookup.get(normalizedToken);
+    const app = skill ? null : appLookup.get(normalizedToken);
+    const plugin = skill || app ? null : pluginLookup.get(normalizedToken);
 
-    if (!skill && !app) {
+    if (!skill && !app && !plugin) {
       continue;
     }
 
@@ -78,6 +116,12 @@ export function buildCodexInputItems(
         type: "mention",
         name: app.name,
         path: `app://${app.id}`,
+      });
+    } else if (plugin) {
+      items.push({
+        type: "mention",
+        name: plugin.pluginName,
+        path: `plugin://${plugin.pluginId}@${plugin.marketplaceName}`,
       });
     }
     lastIndex = matchIndex + rawToken.length;

@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Panes | The Agent Development Environment</title>
+  <title>SupaCodex | The Agent Development Environment</title>
   <meta name="description" content="Your agents write the code. You need a cockpit. Chat, terminal, git, and approvals in one native window. Engine-agnostic, open-source, built with Rust.">
-  <meta property="og:title" content="Panes | The Agent Development Environment">
+  <meta property="og:title" content="SupaCodex | The Agent Development Environment">
   <meta property="og:description" content="Your agents write the code. You need a cockpit. Chat, terminal, git, and approvals in one native window.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://panesade.com">
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="Panes | The Agent Development Environment">
+  <meta name="twitter:title" content="SupaCodex | The Agent Development Environment">
   <meta name="twitter:description" content="Your agents write the code. You need a cockpit. Chat, terminal, git, and approvals in one native window.">
   <link rel="alternate" hreflang="en" href="https://panesade.com/?lang=en">
   <link rel="alternate" hreflang="pt-BR" href="https://panesade.com/?lang=pt-BR">
@@ -32,8 +32,8 @@
   <nav class="nav" id="nav" aria-label="Main navigation">
     <div class="nav-inner container">
       <a href="#" class="nav-logo">
-        <img src="logo.svg?v=3" alt="Panes" class="nav-logo-img">
-        <span>Panes</span>
+        <img src="logo.svg?v=3" alt="SupaCodex" class="nav-logo-img">
+        <span>SupaCodex</span>
       </a>
       <div class="nav-links" id="nav-links">
         <a href="#integrations">Integrations</a>
@@ -51,7 +51,7 @@
           <button type="button" class="lang-switcher-btn" data-set-locale="en" role="radio" aria-checked="true" lang="en">EN</button>
           <button type="button" class="lang-switcher-btn" data-set-locale="pt-BR" role="radio" aria-checked="false" lang="pt-BR">PT-BR</button>
         </div>
-        <a href="https://github.com/wygoralves/panes/releases/latest" class="btn-download" id="nav-download">
+        <a href="https://github.com/wygoralves/supacodex/releases/latest" class="btn-download" id="nav-download">
           <svg class="os-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>
           <span>Download</span>
         </a>
@@ -75,7 +75,7 @@
       </p>
 
       <div class="hero-actions anim-hero" style="--d:5">
-        <a href="https://github.com/wygoralves/panes/releases/latest" class="btn-primary" id="hero-download">
+        <a href="https://github.com/wygoralves/supacodex/releases/latest" class="btn-primary" id="hero-download">
           <svg class="os-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>
           <span>Download for macOS</span>
         </a>
@@ -225,7 +225,7 @@
                   </div>
                   <div class="term-content">
                     <div class="term-line"><span class="term-prompt">~/panes</span> <span class="term-cmd">cargo check</span></div>
-                    <div class="term-line" style="color:var(--text-3);">&nbsp;&nbsp;&nbsp;Compiling panes-core</div>
+                    <div class="term-line" style="color:var(--text-3);">&nbsp;&nbsp;&nbsp;Compiling supacodex-core</div>
                     <div class="term-line"><span class="term-success">&nbsp;&nbsp;&nbsp;Finished</span> dev [unoptimized + debuginfo]</div>
                     <div class="term-line">&nbsp;</div>
                     <div class="term-line"><span class="term-prompt">~/panes</span> <span class="typing-cursor"></span></div>
@@ -722,7 +722,7 @@
       <div class="story-scene story-scene-flip reveal">
         <div class="story-text">
           <h2>Race agents side by side.</h2>
-          <p>Launch multiple CLI agents into split panes. Broadcast the same prompt to all of them at once. Optionally give each agent its own git worktree so they never collide.</p>
+          <p>Launch multiple CLI agents into split supacodex. Broadcast the same prompt to all of them at once. Optionally give each agent its own git worktree so they never collide.</p>
         </div>
         <div class="story-visual">
           <div class="vignette v-broadcast">
@@ -892,10 +892,10 @@
       <div class="manifesto-inner reveal">
         <div class="manifesto-rule"></div>
         <p class="manifesto-text">
-          IDEs were designed for writing code. But you barely write code anymore. You orchestrate, review, and approve. <strong>Panes is the cockpit for that workflow.</strong>
+          IDEs were designed for writing code. But you barely write code anymore. You orchestrate, review, and approve. <strong>SupaCodex is the cockpit for that workflow.</strong>
         </p>
         <div class="manifesto-visual">
-          <div class="m-panes-row">
+          <div class="m-supacodex-row">
 
             <div class="m-pane">
               <div class="m-pane-card m-pane-chat">
@@ -941,7 +941,7 @@
         <h2 class="cta-title">Ready to start?</h2>
         <p class="cta-subtitle">Download, open a folder, start chatting.<br>Free and open-source.</p>
         <div class="cta-actions">
-          <a href="https://github.com/wygoralves/panes/releases/latest" class="btn-primary" id="cta-download">
+          <a href="https://github.com/wygoralves/supacodex/releases/latest" class="btn-primary" id="cta-download">
             <svg class="os-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>
             <span>Download for macOS</span>
           </a>
@@ -957,10 +957,10 @@
     <div class="container">
       <div class="footer-row">
         <div class="footer-brand-name">
-          <img src="logo.svg?v=3" alt="Panes">
-          <span>Panes</span>
+          <img src="logo.svg?v=3" alt="SupaCodex">
+          <span>SupaCodex</span>
         </div>
-        <span class="footer-copy">&copy; 2026 Panes. MIT License.</span>
+        <span class="footer-copy">&copy; 2026 SupaCodex. MIT License.</span>
         <div class="footer-links">
           <a href="https://github.com/wygoralves/panes" target="_blank" rel="noopener">GitHub</a>
           <a href="https://twitter.com/panesagent" target="_blank" rel="noopener">Twitter</a>
@@ -1038,8 +1038,8 @@
       revealObserver.observe(el);
     });
 
-    if (window.panesLandingI18n && typeof window.panesLandingI18n.init === 'function') {
-      window.panesLandingI18n.init();
+    if (window.supacodexLandingI18n && typeof window.supacodexLandingI18n.init === 'function') {
+      window.supacodexLandingI18n.init();
     }
 
     // Mark mockup as booted after initial animations (~2s) so view-switching is instant

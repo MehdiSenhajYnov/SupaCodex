@@ -11,6 +11,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    codex_profiles::{
+        codex_profile_id_from_metadata, runtime_profile_by_id, runtime_profile_from_config,
+    },
+    config::app_config::AppConfig,
     db,
     engines::{
         approval_response_route_for_engine, normalize_approval_response_for_engine,
@@ -215,46 +219,50 @@ where
         .map_err(err_to_string)
 }
 
-#[tauri::command]
-pub async fn send_message(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    thread_id: String,
-    message: String,
-    model_id: Option<String>,
-    reasoning_effort: Option<String>,
-    attachments: Option<Vec<ChatAttachmentPayload>>,
-    input_items: Option<Vec<ChatInputItemPayload>>,
-    plan_mode: Option<bool>,
-    client_turn_id: Option<String>,
-) -> Result<String, String> {
-    if state.turns.get(&thread_id).await.is_some() {
-        return Err(
-            "A turn is already running for this thread. Cancel it before sending another message."
-                .to_string(),
-        );
+async fn ensure_codex_profile_for_thread(
+    state: &AppState,
+    thread: &ThreadDto,
+) -> Result<(), String> {
+    if thread.engine_id != "codex" {
+        return Ok(());
     }
 
+    let config = tokio::task::spawn_blocking(AppConfig::load_or_create)
+        .await
+        .map_err(err_to_string)?
+        .map_err(err_to_string)?;
+    let profile = codex_profile_id_from_metadata(thread.engine_metadata.as_ref())
+        .as_deref()
+        .and_then(|profile_id| runtime_profile_by_id(&config, profile_id))
+        .unwrap_or_else(|| runtime_profile_from_config(&config));
+    state
+        .engines
+        .set_codex_profile(profile)
+        .await
+        .map_err(err_to_string)
+}
+
+struct PreparedThreadExecution {
+    thread: ThreadDto,
+    engine_thread_id: String,
+    effective_model_id: String,
+    reasoning_effort: Option<String>,
+}
+
+async fn prepare_thread_execution(
+    state: &AppState,
+    thread_id: &str,
+    model_id: Option<&str>,
+    reasoning_effort: Option<&str>,
+) -> Result<PreparedThreadExecution, String> {
     let db = state.db.clone();
     let mut thread = run_db(db.clone(), {
-        let thread_id = thread_id.clone();
+        let thread_id = thread_id.to_string();
         move |db| db::threads::get_thread(db, &thread_id)
     })
     .await?
     .ok_or_else(|| format!("thread not found: {thread_id}"))?;
-    let requested_model_id = model_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let attachments = normalize_attachments(attachments)?;
-    let input_items = normalize_input_items(message.as_str(), input_items)?;
-    let plan_mode = plan_mode.unwrap_or(false);
-    let turn_input = TurnInput {
-        message: message.clone(),
-        attachments: attachments.clone(),
-        plan_mode,
-        input_items: input_items.clone(),
-    };
+    let requested_model_id = model_id.map(str::trim).filter(|value| !value.is_empty());
     let current_turn_model_id = thread_last_model_id(thread.engine_metadata.as_ref())
         .unwrap_or_else(|| thread.model_id.clone());
     let model_switch_requested = requested_model_id
@@ -289,7 +297,7 @@ pub async fn send_message(
     .await?;
 
     let workspace_root = workspace.root_path.clone();
-    let requested_reasoning_effort = normalize_reasoning_effort_value(reasoning_effort.as_deref());
+    let requested_reasoning_effort = normalize_reasoning_effort_value(reasoning_effort);
     let stored_reasoning_effort = thread_reasoning_effort(thread.engine_metadata.as_ref());
     let configured_reasoning_effort = requested_reasoning_effort
         .clone()
@@ -355,7 +363,7 @@ pub async fn send_message(
         codex_external_sandbox_active,
     ) {
         return Err(
-            "Codex read-only and workspace-write sandbox overrides are unavailable while Panes is using external sandbox mode. Clear the override or restore local Codex sandboxing first.".to_string(),
+            "Codex read-only and workspace-write sandbox overrides are unavailable while SupaCodex is using external sandbox mode. Clear the override or restore local Codex sandboxing first.".to_string(),
         );
     }
 
@@ -404,6 +412,125 @@ pub async fn send_message(
         thread.engine_metadata = Some(metadata);
     }
 
+    let writable_roots = match &scope {
+        ThreadScope::Repo { repo_path } => vec![repo_path.clone()],
+        ThreadScope::Workspace {
+            writable_roots,
+            root_path,
+        } => {
+            if writable_roots.is_empty() {
+                vec![root_path.clone()]
+            } else {
+                writable_roots.clone()
+            }
+        }
+    };
+
+    let allow_network =
+        if thread.engine_id == "codex" && sandbox_mode.eq_ignore_ascii_case("danger-full-access") {
+            true
+        } else {
+            thread_allow_network_override(thread.engine_metadata.as_ref())
+                .unwrap_or_else(|| allow_network_for_trust_level(&trust_level))
+        };
+    let personality = if thread.engine_id == "codex"
+        && model_supports_personality(state, &thread.engine_id, &effective_model_id).await
+    {
+        thread_personality(thread.engine_metadata.as_ref())
+    } else {
+        None
+    };
+
+    let approval_policy_override = thread_approval_policy_override_value(
+        thread.engine_id.as_str(),
+        thread.engine_metadata.as_ref(),
+    )?;
+
+    let sandbox = SandboxPolicy {
+        writable_roots,
+        allow_network,
+        approval_policy: Some(approval_policy_override.unwrap_or_else(|| {
+            Value::String(
+                approval_policy_for_engine_and_trust_level(thread.engine_id.as_str(), &trust_level)
+                    .to_string(),
+            )
+        })),
+        reasoning_effort: reasoning_effort.clone(),
+        sandbox_mode: Some(sandbox_mode),
+        service_tier: thread_service_tier(thread.engine_metadata.as_ref()),
+        personality,
+        output_schema: thread_output_schema(thread.engine_metadata.as_ref()),
+    };
+
+    ensure_codex_profile_for_thread(state, &thread).await?;
+
+    let engine_thread_id = state
+        .engines
+        .ensure_engine_thread(&thread, Some(effective_model_id.as_str()), scope, sandbox)
+        .await
+        .map_err(err_to_string)?;
+
+    if thread.engine_thread_id.as_deref() != Some(&engine_thread_id) {
+        run_db(db, {
+            let thread_id = thread.id.clone();
+            let engine_thread_id = engine_thread_id.clone();
+            move |db| db::threads::set_engine_thread_id(db, &thread_id, &engine_thread_id)
+        })
+        .await?;
+        thread.engine_thread_id = Some(engine_thread_id.clone());
+    }
+
+    Ok(PreparedThreadExecution {
+        thread,
+        engine_thread_id,
+        effective_model_id,
+        reasoning_effort,
+    })
+}
+
+#[tauri::command]
+pub async fn send_message(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    message: String,
+    model_id: Option<String>,
+    reasoning_effort: Option<String>,
+    attachments: Option<Vec<ChatAttachmentPayload>>,
+    input_items: Option<Vec<ChatInputItemPayload>>,
+    plan_mode: Option<bool>,
+    client_turn_id: Option<String>,
+) -> Result<String, String> {
+    if state.turns.get(&thread_id).await.is_some() {
+        return Err(
+            "A turn is already running for this thread. Cancel it before sending another message."
+                .to_string(),
+        );
+    }
+
+    let attachments = normalize_attachments(attachments)?;
+    let input_items = normalize_input_items(message.as_str(), input_items)?;
+    let plan_mode = plan_mode.unwrap_or(false);
+    let turn_input = TurnInput {
+        message: message.clone(),
+        attachments: attachments.clone(),
+        plan_mode,
+        input_items: input_items.clone(),
+    };
+    let PreparedThreadExecution {
+        thread,
+        engine_thread_id,
+        effective_model_id,
+        reasoning_effort,
+    } = prepare_thread_execution(
+        state.inner(),
+        &thread_id,
+        model_id.as_deref(),
+        reasoning_effort.as_deref(),
+    )
+    .await?;
+    let db = state.db.clone();
+
     let assistant_message = run_db(db.clone(), {
         let thread_id = thread.id.clone();
         let message = message.clone();
@@ -443,72 +570,6 @@ pub async fn send_message(
     })
     .await?;
 
-    let writable_roots = match &scope {
-        ThreadScope::Repo { repo_path } => vec![repo_path.clone()],
-        ThreadScope::Workspace {
-            writable_roots,
-            root_path,
-        } => {
-            if writable_roots.is_empty() {
-                vec![root_path.clone()]
-            } else {
-                writable_roots.clone()
-            }
-        }
-    };
-
-    let allow_network =
-        if thread.engine_id == "codex" && sandbox_mode.eq_ignore_ascii_case("danger-full-access") {
-            true
-        } else {
-            thread_allow_network_override(thread.engine_metadata.as_ref())
-                .unwrap_or_else(|| allow_network_for_trust_level(&trust_level))
-        };
-    let personality = if thread.engine_id == "codex"
-        && model_supports_personality(state.inner(), &thread.engine_id, &effective_model_id).await
-    {
-        thread_personality(thread.engine_metadata.as_ref())
-    } else {
-        None
-    };
-
-    let approval_policy_override = thread_approval_policy_override_value(
-        thread.engine_id.as_str(),
-        thread.engine_metadata.as_ref(),
-    )?;
-
-    let sandbox = SandboxPolicy {
-        writable_roots,
-        allow_network,
-        approval_policy: Some(approval_policy_override.unwrap_or_else(|| {
-            Value::String(
-                approval_policy_for_engine_and_trust_level(thread.engine_id.as_str(), &trust_level)
-                    .to_string(),
-            )
-        })),
-        reasoning_effort,
-        sandbox_mode: Some(sandbox_mode),
-        service_tier: thread_service_tier(thread.engine_metadata.as_ref()),
-        personality,
-        output_schema: thread_output_schema(thread.engine_metadata.as_ref()),
-    };
-
-    let engine_thread_id = state
-        .engines
-        .ensure_engine_thread(&thread, Some(effective_model_id.as_str()), scope, sandbox)
-        .await
-        .map_err(err_to_string)?;
-
-    if thread.engine_thread_id.as_deref() != Some(&engine_thread_id) {
-        run_db(db.clone(), {
-            let thread_id = thread.id.clone();
-            let engine_thread_id = engine_thread_id.clone();
-            move |db| db::threads::set_engine_thread_id(db, &thread_id, &engine_thread_id)
-        })
-        .await?;
-        thread.engine_thread_id = Some(engine_thread_id.clone());
-    }
-
     let cancellation = CancellationToken::new();
     if !state
         .turns
@@ -537,6 +598,118 @@ pub async fn send_message(
             assistant_message_id,
             initial_turn_model_id,
             turn_input_for_task,
+            client_turn_id,
+            cancellation,
+        )
+        .await;
+    });
+
+    Ok(assistant_message.id)
+}
+
+#[tauri::command]
+pub async fn run_codex_shell_command(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    command: String,
+    client_turn_id: Option<String>,
+) -> Result<String, String> {
+    let command = command.trim();
+    if command.is_empty() {
+        return Err("Shell command cannot be empty.".to_string());
+    }
+
+    let db = state.db.clone();
+    let thread = run_db(db.clone(), {
+        let thread_id = thread_id.clone();
+        move |db| db::threads::get_thread(db, &thread_id)
+    })
+    .await?
+    .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+
+    if thread.engine_id != "codex" {
+        return Err("Shell commands are only available for Codex threads.".to_string());
+    }
+
+    if state.turns.get(&thread_id).await.is_some() {
+        let engine_thread_id = thread.engine_thread_id.clone().ok_or_else(|| {
+            "Codex shell commands require an initialized server-backed thread.".to_string()
+        })?;
+        ensure_codex_profile_for_thread(state.inner(), &thread).await?;
+        state
+            .engines
+            .run_active_codex_shell_command(&engine_thread_id, command)
+            .await
+            .map_err(err_to_string)?;
+        return Ok(thread.id);
+    }
+
+    let PreparedThreadExecution {
+        thread,
+        engine_thread_id,
+        effective_model_id,
+        reasoning_effort,
+    } = prepare_thread_execution(state.inner(), &thread_id, None, None).await?;
+
+    let assistant_message = run_db(db.clone(), {
+        let thread_id = thread.id.clone();
+        let command_text = format!("!{command}");
+        let engine_id = thread.engine_id.clone();
+        let model_id = effective_model_id.clone();
+        let reasoning_effort = reasoning_effort.clone();
+        move |db| {
+            let user_blocks = build_user_blocks(&command_text, &[], &[], false, false);
+            db::messages::insert_user_message(
+                db,
+                &thread_id,
+                &command_text,
+                Some(serde_json::to_value(&user_blocks)?),
+                Some(engine_id.as_str()),
+                Some(model_id.as_str()),
+                reasoning_effort.as_deref(),
+            )?;
+            let assistant_message = db::messages::insert_assistant_placeholder(
+                db,
+                &thread_id,
+                Some(engine_id.as_str()),
+                Some(model_id.as_str()),
+                reasoning_effort.as_deref(),
+            )?;
+            db::threads::update_thread_status(db, &thread_id, ThreadStatusDto::Streaming)?;
+            Ok(assistant_message)
+        }
+    })
+    .await?;
+
+    let cancellation = CancellationToken::new();
+    if !state
+        .turns
+        .try_register(&thread.id, cancellation.clone())
+        .await
+    {
+        return Err(
+            "A turn is already running for this thread. Cancel it before executing another shell command."
+                .to_string(),
+        );
+    }
+
+    let state_cloned = state.inner().clone();
+    let app_handle = app.clone();
+    let assistant_message_id = assistant_message.id.clone();
+    let thread_for_task = thread.clone();
+    let initial_turn_model_id = effective_model_id.clone();
+    let shell_command = command.to_string();
+
+    tokio::spawn(async move {
+        run_codex_shell_command_turn(
+            app_handle,
+            state_cloned,
+            thread_for_task,
+            engine_thread_id,
+            assistant_message_id,
+            initial_turn_model_id,
+            shell_command,
             client_turn_id,
             cancellation,
         )
@@ -577,6 +750,7 @@ pub async fn start_codex_review(
         .engine_thread_id
         .clone()
         .ok_or_else(|| "Codex review requires an initialized server-backed thread.".to_string())?;
+    ensure_codex_profile_for_thread(state.inner(), &source_thread).await?;
     let effective_delivery = delivery.unwrap_or(CodexReviewDeliveryPayload::Inline);
     let (target_payload, review_message, review_title) = normalize_codex_review_target(&target)?;
     let initial_turn_model_id = thread_last_model_id(source_thread.engine_metadata.as_ref())
@@ -764,6 +938,8 @@ pub async fn steer_message(
         }
     })
     .await?;
+
+    ensure_codex_profile_for_thread(state.inner(), &thread).await?;
 
     if let Err(error) = state
         .engines
@@ -1733,6 +1909,479 @@ async fn run_turn(
 
     let _ =
         maybe_update_thread_title(&state, &thread, &engine_thread_id, &turn_input.message).await;
+
+    let latest_thread = run_db(state.db.clone(), {
+        let thread_id = thread.id.clone();
+        move |db| db::threads::get_thread(db, &thread_id)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        log::warn!("failed to load thread before final thread-updated emit: {error}");
+        None
+    });
+
+    let (thread_updated_event, final_thread) = build_final_thread_event(latest_thread, &thread);
+    let _ = app.emit("thread-updated", thread_updated_event);
+    if let Some(final_thread) = final_thread.as_ref() {
+        emit_chat_turn_finished(&app, final_thread, &message_status, &blocks);
+    }
+
+    state.turns.finish(&thread.id).await;
+}
+
+async fn run_codex_shell_command_turn(
+    app: tauri::AppHandle,
+    state: AppState,
+    thread: crate::models::ThreadDto,
+    engine_thread_id: String,
+    assistant_message_id: String,
+    initial_turn_model_id: String,
+    shell_command: String,
+    client_turn_id: Option<String>,
+    cancellation: CancellationToken,
+) {
+    let max_output_chars = state.config.debug.max_action_output_chars;
+    let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(128);
+
+    let engines = state.engines.clone();
+    let engine_thread_for_engine = engine_thread_id.clone();
+    let shell_command_for_engine = shell_command.clone();
+    let cancellation_for_engine = cancellation.clone();
+
+    let engine_task = tokio::spawn(async move {
+        engines
+            .send_codex_shell_command(
+                &engine_thread_for_engine,
+                &shell_command_for_engine,
+                event_tx,
+                cancellation_for_engine,
+            )
+            .await
+    });
+
+    let mut blocks: Vec<ContentBlock> = Vec::new();
+    let mut action_index: HashMap<String, usize> = HashMap::new();
+    let mut approval_index: HashMap<String, usize> = HashMap::new();
+    let mut message_status = MessageStatusDto::Streaming;
+    let mut thread_status = ThreadStatusDto::Streaming;
+    let mut turn_model_id = initial_turn_model_id;
+    let mut token_usage: Option<(u64, u64)> = None;
+    let mut blocks_dirty = false;
+    let mut message_state_dirty = false;
+    let mut thread_status_dirty = false;
+    let mut turn_model_dirty = false;
+    let mut last_persist_at = Instant::now();
+    let mut last_blocks_persist_at = Instant::now();
+    let mut last_persisted_thread_status = thread_status.clone();
+    let stream_event_topic = format!("stream-event-{}", thread.id);
+    let approval_event_topic = format!("approval-request-{}", thread.id);
+    let mut pending_event: Option<EngineEvent> = None;
+
+    let initial_turn_started_event = EngineEvent::TurnStarted { client_turn_id };
+    let initial_progress = process_stream_event(
+        &app,
+        &state,
+        &thread,
+        &assistant_message_id,
+        &stream_event_topic,
+        &approval_event_topic,
+        &initial_turn_started_event,
+        &mut blocks,
+        &mut action_index,
+        &mut approval_index,
+        max_output_chars,
+    )
+    .await;
+    let initial_force_persist = apply_stream_progress(
+        initial_progress,
+        &mut message_status,
+        &mut thread_status,
+        &mut turn_model_id,
+        &mut token_usage,
+        &mut blocks_dirty,
+        &mut message_state_dirty,
+        &mut thread_status_dirty,
+        &mut turn_model_dirty,
+    );
+    flush_stream_state(
+        &state,
+        &thread,
+        &assistant_message_id,
+        &blocks,
+        &message_status,
+        &thread_status,
+        &turn_model_id,
+        &mut blocks_dirty,
+        &mut message_state_dirty,
+        &mut thread_status_dirty,
+        &mut turn_model_dirty,
+        &mut last_persisted_thread_status,
+        &mut last_persist_at,
+        &mut last_blocks_persist_at,
+        initial_force_persist,
+    )
+    .await;
+
+    loop {
+        let incoming_event = if pending_event.is_some() {
+            match tokio::time::timeout(STREAM_EVENT_COALESCE_IDLE_FLUSH_INTERVAL, event_rx.recv())
+                .await
+            {
+                Ok(event) => event,
+                Err(_) => {
+                    if let Some(event) = pending_event.take() {
+                        let progress = process_stream_event(
+                            &app,
+                            &state,
+                            &thread,
+                            &assistant_message_id,
+                            &stream_event_topic,
+                            &approval_event_topic,
+                            &event,
+                            &mut blocks,
+                            &mut action_index,
+                            &mut approval_index,
+                            max_output_chars,
+                        )
+                        .await;
+                        let force_persist = apply_stream_progress(
+                            progress,
+                            &mut message_status,
+                            &mut thread_status,
+                            &mut turn_model_id,
+                            &mut token_usage,
+                            &mut blocks_dirty,
+                            &mut message_state_dirty,
+                            &mut thread_status_dirty,
+                            &mut turn_model_dirty,
+                        );
+                        flush_stream_state(
+                            &state,
+                            &thread,
+                            &assistant_message_id,
+                            &blocks,
+                            &message_status,
+                            &thread_status,
+                            &turn_model_id,
+                            &mut blocks_dirty,
+                            &mut message_state_dirty,
+                            &mut thread_status_dirty,
+                            &mut turn_model_dirty,
+                            &mut last_persisted_thread_status,
+                            &mut last_persist_at,
+                            &mut last_blocks_persist_at,
+                            force_persist,
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            event_rx.recv().await
+        };
+
+        let Some(incoming_event) = incoming_event else {
+            break;
+        };
+
+        let mut current_event = incoming_event;
+
+        loop {
+            if let Some(previous_event) = pending_event.take() {
+                match try_coalesce_stream_events(previous_event, current_event) {
+                    Ok(merged_event) => {
+                        if coalesced_event_content_len(&merged_event)
+                            >= STREAM_EVENT_COALESCE_MAX_CHARS
+                        {
+                            let progress = process_stream_event(
+                                &app,
+                                &state,
+                                &thread,
+                                &assistant_message_id,
+                                &stream_event_topic,
+                                &approval_event_topic,
+                                &merged_event,
+                                &mut blocks,
+                                &mut action_index,
+                                &mut approval_index,
+                                max_output_chars,
+                            )
+                            .await;
+                            let force_persist = apply_stream_progress(
+                                progress,
+                                &mut message_status,
+                                &mut thread_status,
+                                &mut turn_model_id,
+                                &mut token_usage,
+                                &mut blocks_dirty,
+                                &mut message_state_dirty,
+                                &mut thread_status_dirty,
+                                &mut turn_model_dirty,
+                            );
+                            flush_stream_state(
+                                &state,
+                                &thread,
+                                &assistant_message_id,
+                                &blocks,
+                                &message_status,
+                                &thread_status,
+                                &turn_model_id,
+                                &mut blocks_dirty,
+                                &mut message_state_dirty,
+                                &mut thread_status_dirty,
+                                &mut turn_model_dirty,
+                                &mut last_persisted_thread_status,
+                                &mut last_persist_at,
+                                &mut last_blocks_persist_at,
+                                force_persist,
+                            )
+                            .await;
+                        } else {
+                            pending_event = Some(merged_event);
+                        }
+                        break;
+                    }
+                    Err((unmerged_previous_event, unmerged_current_event)) => {
+                        let progress = process_stream_event(
+                            &app,
+                            &state,
+                            &thread,
+                            &assistant_message_id,
+                            &stream_event_topic,
+                            &approval_event_topic,
+                            &unmerged_previous_event,
+                            &mut blocks,
+                            &mut action_index,
+                            &mut approval_index,
+                            max_output_chars,
+                        )
+                        .await;
+                        let force_persist = apply_stream_progress(
+                            progress,
+                            &mut message_status,
+                            &mut thread_status,
+                            &mut turn_model_id,
+                            &mut token_usage,
+                            &mut blocks_dirty,
+                            &mut message_state_dirty,
+                            &mut thread_status_dirty,
+                            &mut turn_model_dirty,
+                        );
+                        flush_stream_state(
+                            &state,
+                            &thread,
+                            &assistant_message_id,
+                            &blocks,
+                            &message_status,
+                            &thread_status,
+                            &turn_model_id,
+                            &mut blocks_dirty,
+                            &mut message_state_dirty,
+                            &mut thread_status_dirty,
+                            &mut turn_model_dirty,
+                            &mut last_persisted_thread_status,
+                            &mut last_persist_at,
+                            &mut last_blocks_persist_at,
+                            force_persist,
+                        )
+                        .await;
+                        current_event = unmerged_current_event;
+                    }
+                }
+            } else if is_coalescable_stream_event(&current_event) {
+                pending_event = Some(current_event);
+                break;
+            } else {
+                let progress = process_stream_event(
+                    &app,
+                    &state,
+                    &thread,
+                    &assistant_message_id,
+                    &stream_event_topic,
+                    &approval_event_topic,
+                    &current_event,
+                    &mut blocks,
+                    &mut action_index,
+                    &mut approval_index,
+                    max_output_chars,
+                )
+                .await;
+                let force_persist = apply_stream_progress(
+                    progress,
+                    &mut message_status,
+                    &mut thread_status,
+                    &mut turn_model_id,
+                    &mut token_usage,
+                    &mut blocks_dirty,
+                    &mut message_state_dirty,
+                    &mut thread_status_dirty,
+                    &mut turn_model_dirty,
+                );
+                flush_stream_state(
+                    &state,
+                    &thread,
+                    &assistant_message_id,
+                    &blocks,
+                    &message_status,
+                    &thread_status,
+                    &turn_model_id,
+                    &mut blocks_dirty,
+                    &mut message_state_dirty,
+                    &mut thread_status_dirty,
+                    &mut turn_model_dirty,
+                    &mut last_persisted_thread_status,
+                    &mut last_persist_at,
+                    &mut last_blocks_persist_at,
+                    force_persist,
+                )
+                .await;
+                break;
+            }
+        }
+    }
+
+    if let Some(event) = pending_event.take() {
+        let progress = process_stream_event(
+            &app,
+            &state,
+            &thread,
+            &assistant_message_id,
+            &stream_event_topic,
+            &approval_event_topic,
+            &event,
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            max_output_chars,
+        )
+        .await;
+        let force_persist = apply_stream_progress(
+            progress,
+            &mut message_status,
+            &mut thread_status,
+            &mut turn_model_id,
+            &mut token_usage,
+            &mut blocks_dirty,
+            &mut message_state_dirty,
+            &mut thread_status_dirty,
+            &mut turn_model_dirty,
+        );
+        flush_stream_state(
+            &state,
+            &thread,
+            &assistant_message_id,
+            &blocks,
+            &message_status,
+            &thread_status,
+            &turn_model_id,
+            &mut blocks_dirty,
+            &mut message_state_dirty,
+            &mut thread_status_dirty,
+            &mut turn_model_dirty,
+            &mut last_persisted_thread_status,
+            &mut last_persist_at,
+            &mut last_blocks_persist_at,
+            force_persist,
+        )
+        .await;
+    }
+
+    match engine_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            blocks.push(ContentBlock::Error {
+                message: format!("Engine error: {error}"),
+            });
+            blocks_dirty = true;
+            if message_status != MessageStatusDto::Error {
+                message_status = MessageStatusDto::Error;
+                message_state_dirty = true;
+            }
+            if thread_status != ThreadStatusDto::Error {
+                thread_status = ThreadStatusDto::Error;
+                thread_status_dirty = true;
+            }
+            let _ = app.emit(
+                &stream_event_topic,
+                EngineEvent::Error {
+                    message: format!("{error}"),
+                    recoverable: false,
+                },
+            );
+        }
+        Err(error) => {
+            blocks.push(ContentBlock::Error {
+                message: format!("Engine task join error: {error}"),
+            });
+            blocks_dirty = true;
+            if message_status != MessageStatusDto::Error {
+                message_status = MessageStatusDto::Error;
+                message_state_dirty = true;
+            }
+            if thread_status != ThreadStatusDto::Error {
+                thread_status = ThreadStatusDto::Error;
+                thread_status_dirty = true;
+            }
+        }
+    }
+
+    if cancellation.is_cancelled() && matches!(message_status, MessageStatusDto::Streaming) {
+        message_status = MessageStatusDto::Interrupted;
+        message_state_dirty = true;
+        thread_status = ThreadStatusDto::Idle;
+        thread_status_dirty = true;
+    }
+
+    flush_stream_state(
+        &state,
+        &thread,
+        &assistant_message_id,
+        &blocks,
+        &message_status,
+        &thread_status,
+        &turn_model_id,
+        &mut blocks_dirty,
+        &mut message_state_dirty,
+        &mut thread_status_dirty,
+        &mut turn_model_dirty,
+        &mut last_persisted_thread_status,
+        &mut last_persist_at,
+        &mut last_blocks_persist_at,
+        true,
+    )
+    .await;
+
+    if let Err(error) = run_db(state.db.clone(), {
+        let assistant_message_id = assistant_message_id.clone();
+        let message_status = message_status.clone();
+        let token_usage = token_usage;
+        move |db| {
+            db::messages::complete_assistant_message(
+                db,
+                &assistant_message_id,
+                message_status,
+                token_usage,
+                Some(turn_model_id.as_str()),
+            )
+        }
+    })
+    .await
+    {
+        log::warn!("failed to complete assistant message: {error}");
+    }
+
+    if matches!(message_status, MessageStatusDto::Completed) {
+        if let Err(error) = run_db(state.db.clone(), {
+            let thread_id = thread.id.clone();
+            let token_usage = token_usage;
+            move |db| db::threads::bump_message_counters(db, &thread_id, token_usage)
+        })
+        .await
+        {
+            log::warn!("failed to bump thread counters: {error}");
+        }
+    }
 
     let latest_thread = run_db(state.db.clone(), {
         let thread_id = thread.id.clone();
@@ -3744,7 +4393,7 @@ mod tests {
     use uuid::Uuid;
 
     fn test_app_state() -> AppState {
-        let root = std::env::temp_dir().join(format!("panes-chat-cmd-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("supacodex-chat-cmd-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("failed to create temp root");
         let db = crate::db::Database::open(root.join("workspaces.db"))
             .expect("failed to create test database");
@@ -3764,7 +4413,7 @@ mod tests {
 
     fn test_thread(state: &AppState, engine_id: &str, model_id: &str) -> ThreadDto {
         let workspace_root =
-            std::env::temp_dir().join(format!("panes-chat-workspace-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("supacodex-chat-workspace-{}", Uuid::new_v4()));
         fs::create_dir_all(&workspace_root).expect("failed to create workspace root");
         let workspace = db::workspaces::upsert_workspace(
             &state.db,

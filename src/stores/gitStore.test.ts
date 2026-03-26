@@ -98,7 +98,7 @@ describe("gitStore", () => {
     mockIpc.applyGitStash.mockResolvedValue(undefined);
     mockIpc.popGitStash.mockResolvedValue(undefined);
     mockIpc.addGitWorktree.mockResolvedValue({
-      path: "/repo/.panes/worktrees/feature",
+      path: "/repo/.supacodex/worktrees/feature",
       headSha: null,
       branch: "feature",
       isMain: false,
@@ -210,7 +210,7 @@ describe("gitStore", () => {
 
   it("falls back to the main repo after removing the active worktree", async () => {
     const mainRepoPath = "/repo-main";
-    const worktreePath = "/repo-main/.panes/worktrees/feature";
+    const worktreePath = "/repo-main/.supacodex/worktrees/feature";
     const remainingWorktrees: GitWorktree[] = [
       {
         path: mainRepoPath,

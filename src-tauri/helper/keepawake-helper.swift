@@ -1,8 +1,8 @@
-// PanesKeepAwakeHelper — privileged daemon that toggles system-wide sleep
+// SupaCodexKeepAwakeHelper — privileged daemon that toggles system-wide sleep
 // prevention via IOPMSetSystemPowerSetting("SleepDisabled", ...).
 //
 // Runs as root via launchd (registered through SMAppService). Listens on a
-// Unix domain socket for JSON commands from the main Panes app.
+// Unix domain socket for JSON commands from the main SupaCodex app.
 //
 // Protocol (newline-delimited JSON):
 //   → {"action":"preventSleep"}   ← {"ok":true}
@@ -31,7 +31,7 @@ func IOPMSetSystemPowerSetting(_ key: CFString, _ value: CFTypeRef) -> Int32
 func IOPMCopySystemPowerSettings() -> Unmanaged<CFDictionary>?
 
 private let kSleepDisabledKey = "SleepDisabled" as CFString
-private let socketPath = "/var/run/com.panes.app.keepawake.sock"
+private let socketPath = "/var/run/com.supacodex.app.keepawake.sock"
 
 // MARK: - Sleep control
 
@@ -58,7 +58,7 @@ func removeStaleSocket() {
 func createListenSocket() -> Int32 {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else {
-        NSLog("PanesKeepAwakeHelper: failed to create socket: \(errno)")
+        NSLog("SupaCodexKeepAwakeHelper: failed to create socket: \(errno)")
         return -1
     }
 
@@ -66,7 +66,7 @@ func createListenSocket() -> Int32 {
     addr.sun_family = sa_family_t(AF_UNIX)
     let pathBytes = socketPath.utf8CString
     guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else {
-        NSLog("PanesKeepAwakeHelper: socket path too long")
+        NSLog("SupaCodexKeepAwakeHelper: socket path too long")
         close(fd)
         return -1
     }
@@ -83,7 +83,7 @@ func createListenSocket() -> Int32 {
         }
     }
     guard bindResult == 0 else {
-        NSLog("PanesKeepAwakeHelper: failed to bind socket: \(errno)")
+        NSLog("SupaCodexKeepAwakeHelper: failed to bind socket: \(errno)")
         close(fd)
         return -1
     }
@@ -94,7 +94,7 @@ func createListenSocket() -> Int32 {
     var consoleUid: uid_t = 0
     var consoleGid: gid_t = 0
     guard let _ = SCDynamicStoreCopyConsoleUser(nil, &consoleUid, &consoleGid) else {
-        NSLog("PanesKeepAwakeHelper: no console user found, refusing to create socket")
+        NSLog("SupaCodexKeepAwakeHelper: no console user found, refusing to create socket")
         close(fd)
         unlink(socketPath)
         return -1
@@ -103,7 +103,7 @@ func createListenSocket() -> Int32 {
     chmod(socketPath, 0o600)
 
     guard listen(fd, 2) == 0 else {
-        NSLog("PanesKeepAwakeHelper: failed to listen on socket: \(errno)")
+        NSLog("SupaCodexKeepAwakeHelper: failed to listen on socket: \(errno)")
         close(fd)
         return -1
     }
@@ -121,7 +121,7 @@ func handleConnection(_ clientFd: Int32) {
         var consoleUid: uid_t = 0
         if let _ = SCDynamicStoreCopyConsoleUser(nil, &consoleUid, nil),
            peerUid != consoleUid && peerUid != 0 {
-            NSLog("PanesKeepAwakeHelper: rejected connection from uid \(peerUid) (console uid \(consoleUid))")
+            NSLog("SupaCodexKeepAwakeHelper: rejected connection from uid \(peerUid) (console uid \(consoleUid))")
             return
         }
     }
@@ -171,14 +171,14 @@ private var listenFd: Int32 = -1
 
 func installSignalHandlers() {
     signal(SIGTERM) { _ in
-        NSLog("PanesKeepAwakeHelper: received SIGTERM, restoring sleep")
+        NSLog("SupaCodexKeepAwakeHelper: received SIGTERM, restoring sleep")
         _ = allowSleep()
         if listenFd >= 0 { close(listenFd) }
         unlink(socketPath)
         exit(0)
     }
     signal(SIGINT) { _ in
-        NSLog("PanesKeepAwakeHelper: received SIGINT, restoring sleep")
+        NSLog("SupaCodexKeepAwakeHelper: received SIGINT, restoring sleep")
         _ = allowSleep()
         if listenFd >= 0 { close(listenFd) }
         unlink(socketPath)
@@ -189,33 +189,33 @@ func installSignalHandlers() {
 // MARK: - Entry point
 
 @main
-enum PanesKeepAwakeHelper {
+enum SupaCodexKeepAwakeHelper {
     static func main() {
         installSignalHandlers()
 
         // Crash recovery: clear any stale SleepDisabled from a prior run.
         if isSleepDisabled() {
-            NSLog("PanesKeepAwakeHelper: clearing stale SleepDisabled on startup")
+            NSLog("SupaCodexKeepAwakeHelper: clearing stale SleepDisabled on startup")
             _ = allowSleep()
         }
 
         removeStaleSocket()
         listenFd = createListenSocket()
         guard listenFd >= 0 else {
-            NSLog("PanesKeepAwakeHelper: exiting — could not create listen socket")
+            NSLog("SupaCodexKeepAwakeHelper: exiting — could not create listen socket")
             Foundation.exit(1)
         }
 
-        NSLog("PanesKeepAwakeHelper: listening on \(socketPath)")
+        NSLog("SupaCodexKeepAwakeHelper: listening on \(socketPath)")
 
         // Accept loop — single-threaded, one connection at a time.
-        // The Panes app sends short commands and reads the response immediately,
+        // The SupaCodex app sends short commands and reads the response immediately,
         // so blocking accept is fine.
         while true {
             let clientFd = accept(listenFd, nil, nil)
             guard clientFd >= 0 else {
                 if errno == EINTR { continue }
-                NSLog("PanesKeepAwakeHelper: accept failed: \(errno)")
+                NSLog("SupaCodexKeepAwakeHelper: accept failed: \(errno)")
                 break
             }
             handleConnection(clientFd)

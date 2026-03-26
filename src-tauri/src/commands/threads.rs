@@ -1,12 +1,18 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Value};
 use tauri::State;
 
 use crate::{
+    codex_profiles::{
+        codex_profile_id_from_metadata, runtime_profile_by_id, runtime_profile_from_config,
+        set_codex_profile_id,
+    },
+    config::app_config::AppConfig,
     db,
     engines::validate_engine_sandbox_mode,
     engines::CodexRemoteThreadSummary,
     engines::SandboxPolicy,
+    engines::ThreadTranscriptMessage,
     models::{
         CodexRemoteThreadDto, CodexRemoteThreadPageDto, RepoDto, ThreadDto, ThreadStatusDto,
         TrustLevelDto,
@@ -24,6 +30,29 @@ where
     tokio::task::spawn_blocking(move || operation(&db))
         .await
         .map_err(|error| error.to_string())?
+        .map_err(err_to_string)
+}
+
+async fn ensure_codex_profile_for_thread(
+    state: &AppState,
+    thread: &ThreadDto,
+) -> Result<(), String> {
+    if thread.engine_id != "codex" {
+        return Ok(());
+    }
+
+    let config = tokio::task::spawn_blocking(AppConfig::load_or_create)
+        .await
+        .map_err(err_to_string)?
+        .map_err(err_to_string)?;
+    let profile = codex_profile_id_from_metadata(thread.engine_metadata.as_ref())
+        .as_deref()
+        .and_then(|profile_id| runtime_profile_by_id(&config, profile_id))
+        .unwrap_or_else(|| runtime_profile_from_config(&config));
+    state
+        .engines
+        .set_codex_profile(profile)
+        .await
         .map_err(err_to_string)
 }
 
@@ -124,18 +153,15 @@ pub async fn attach_codex_remote_thread(
 ) -> Result<ThreadDto, String> {
     let normalized_model_id =
         validate_model_for_engine(state.inner(), "codex", model_id.trim()).await?;
+    let active_profile_id = state.engines.active_codex_profile().await.id;
     let db = state.db.clone();
-    let (workspace_root, repos, existing_local_thread) = run_db(db.clone(), {
+    let (workspace_root, repos) = run_db(db.clone(), {
         let workspace_id = workspace_id.clone();
-        let engine_thread_id = engine_thread_id.clone();
         move |db| {
             let workspace = db::workspaces::find_workspace_by_id(db, &workspace_id)?
                 .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))?;
             let repos = db::repos::get_repos(db, &workspace_id)?;
-            let existing =
-                db::threads::find_thread_by_engine_thread_id(db, "codex", &engine_thread_id)?
-                    .filter(|thread| thread.workspace_id == workspace_id);
-            Ok((workspace.root_path, repos, existing))
+            Ok((workspace.root_path, repos))
         }
     })
     .await?;
@@ -155,15 +181,22 @@ pub async fn attach_codex_remote_thread(
     }
     let repo_id = resolve_codex_remote_thread_repo_id(&workspace_root, &repos, &remote_thread.cwd)?;
     let title = build_codex_remote_thread_title(&remote_thread);
-    let metadata = build_codex_remote_thread_metadata(&remote_thread, &normalized_model_id);
+    let metadata = build_codex_remote_thread_metadata(
+        &remote_thread,
+        &normalized_model_id,
+        &active_profile_id,
+    );
 
-    if let Some(existing) = existing_local_thread {
-        return run_db(db, move |db| {
+    run_db(db, move |db| {
+        if let Some(existing) =
+            db::threads::find_thread_by_engine_thread_id(db, "codex", &engine_thread_id)?
+                .filter(|thread| thread.workspace_id == workspace_id)
+        {
             let thread = match db::threads::restore_thread(db, &existing.id) {
                 Ok(restored) => restored,
                 Err(_) => existing,
             };
-            db::threads::update_thread_runtime_snapshot(
+            return db::threads::update_thread_runtime_snapshot(
                 db,
                 &thread.id,
                 Some(&title),
@@ -173,12 +206,9 @@ pub async fn attach_codex_remote_thread(
                     false,
                 ),
                 Some(&metadata),
-            )
-        })
-        .await;
-    }
+            );
+        }
 
-    run_db(db, move |db| {
         let created = db::threads::create_thread(
             db,
             &workspace_id,
@@ -357,7 +387,11 @@ fn short_thread_label(engine_thread_id: &str) -> String {
     engine_thread_id.chars().take(8).collect()
 }
 
-fn build_codex_remote_thread_metadata(thread: &CodexRemoteThreadSummary, model_id: &str) -> Value {
+fn build_codex_remote_thread_metadata(
+    thread: &CodexRemoteThreadSummary,
+    model_id: &str,
+    profile_id: &str,
+) -> Value {
     let mut metadata = merge_codex_runtime_metadata(
         None,
         Some(thread.status_type.as_str()),
@@ -370,6 +404,7 @@ fn build_codex_remote_thread_metadata(thread: &CodexRemoteThreadSummary, model_i
     if let Some(object) = metadata.as_object_mut() {
         object.insert("lastModelId".to_string(), json!(model_id));
         object.insert("codexTranscriptImported".to_string(), json!(false));
+        object.insert("codexProfileId".to_string(), json!(profile_id));
         object.insert(
             "codexModelProvider".to_string(),
             json!(thread.model_provider),
@@ -399,7 +434,13 @@ pub async fn create_thread(
     model_id: String,
     title: String,
 ) -> Result<ThreadDto, String> {
-    run_db(state.db.clone(), move |db| {
+    let active_profile_id = if engine_id == "codex" {
+        Some(state.engines.active_codex_profile().await.id)
+    } else {
+        None
+    };
+    let db = state.db.clone();
+    let created = run_db(db.clone(), move |db| {
         db::threads::create_thread(
             db,
             &workspace_id,
@@ -409,7 +450,24 @@ pub async fn create_thread(
             &title,
         )
     })
-    .await
+    .await?;
+
+    if let Some(profile_id) = active_profile_id {
+        let updated = run_db(db, {
+            let thread_id = created.id.clone();
+            move |db| {
+                let mut metadata = created.engine_metadata.clone().unwrap_or_else(|| json!({}));
+                set_codex_profile_id(&mut metadata, &profile_id);
+                db::threads::update_engine_metadata(db, &thread_id, &metadata)?;
+                db::threads::get_thread(db, &thread_id)?
+                    .ok_or_else(|| anyhow::anyhow!("thread not found after metadata update"))
+            }
+        })
+        .await?;
+        return Ok(updated);
+    }
+
+    Ok(created)
 }
 
 #[tauri::command]
@@ -626,6 +684,8 @@ pub async fn archive_thread(state: State<'_, AppState>, thread_id: String) -> Re
         .await?
         .ok_or_else(|| format!("thread not found: {thread_id}"))?;
 
+        ensure_codex_profile_for_thread(state.inner(), &thread).await?;
+
         if let Err(error) = state.engines.interrupt(&thread).await {
             log::warn!("failed to interrupt thread before archive: {error}");
         }
@@ -663,6 +723,8 @@ pub async fn restore_thread(
     .await?
     .ok_or_else(|| format!("thread not found: {thread_id}"))?;
 
+    ensure_codex_profile_for_thread(state.inner(), &thread).await?;
+
     state
         .engines
         .unarchive_thread(&thread)
@@ -691,9 +753,11 @@ pub async fn sync_thread_from_engine(
         return Ok(thread);
     }
 
+    ensure_codex_profile_for_thread(state.inner(), &thread).await?;
+
     let Some(snapshot) = state
         .engines
-        .read_thread_sync_snapshot(&thread)
+        .read_codex_thread_transcript_snapshot(&thread)
         .await
         .map_err(err_to_string)?
     else {
@@ -701,33 +765,58 @@ pub async fn sync_thread_from_engine(
     };
 
     let has_local_turn = state.turns.get(&thread_id).await.is_some();
-    let metadata = merge_codex_runtime_metadata(
-        thread.engine_metadata.clone(),
-        snapshot.raw_status.as_deref(),
-        &snapshot.active_flags,
-        snapshot.preview.as_deref(),
-        false,
-        None,
+    let metadata = mark_codex_thread_transcript_imported(
+        thread.engine_metadata.as_ref(),
+        snapshot.sync.raw_status.as_deref(),
+        &snapshot.sync.active_flags,
+        snapshot.sync.preview.as_deref(),
+        snapshot.created_at,
+        snapshot.updated_at,
     );
     let next_status = map_codex_thread_status_to_local(
-        snapshot.raw_status.as_deref(),
-        &snapshot.active_flags,
+        snapshot.sync.raw_status.as_deref(),
+        &snapshot.sync.active_flags,
         has_local_turn,
+    );
+    let imported_messages = build_imported_thread_messages(
+        &snapshot.messages,
+        snapshot.created_at,
+        snapshot.updated_at,
     );
 
     run_db(db, {
         let thread_id = thread_id.clone();
-        let title = snapshot.title.clone();
+        let title = snapshot.sync.title.clone();
         let metadata = metadata.clone();
         let next_status = next_status.clone();
+        let imported_messages = imported_messages.clone();
+        let model_id = thread.model_id.clone();
         move |db| {
-            db::threads::update_thread_runtime_snapshot(
+            let refreshed = db::threads::update_thread_runtime_snapshot(
                 db,
                 &thread_id,
                 title.as_deref(),
                 next_status,
                 Some(&metadata),
-            )
+            )?;
+            if !imported_messages.is_empty() {
+                db::messages::replace_thread_messages(
+                    db,
+                    &thread_id,
+                    &imported_messages,
+                    Some("codex"),
+                    Some(model_id.as_str()),
+                    None,
+                )?;
+                db::threads::refresh_thread_message_stats(db, &thread_id)?;
+            }
+            if imported_messages.is_empty() {
+                return Ok(refreshed);
+            }
+
+            db::threads::get_thread(db, &thread_id)?.ok_or_else(|| {
+                anyhow::anyhow!("thread not found after transcript import: {thread_id}")
+            })
         }
     })
     .await
@@ -753,6 +842,9 @@ pub async fn fork_codex_thread(
     if thread.engine_id != "codex" {
         return Err("native fork is only available for Codex threads".to_string());
     }
+
+    ensure_codex_profile_for_thread(state.inner(), &thread).await?;
+
     let engine_thread_id = thread
         .engine_thread_id
         .clone()
@@ -803,6 +895,9 @@ pub async fn rollback_codex_thread(
     if thread.engine_id != "codex" {
         return Err("native rollback is only available for Codex threads".to_string());
     }
+
+    ensure_codex_profile_for_thread(state.inner(), &thread).await?;
+
     let engine_thread_id = thread
         .engine_thread_id
         .clone()
@@ -878,6 +973,9 @@ pub async fn compact_codex_thread(
     if thread.engine_id != "codex" {
         return Err("native compact is only available for Codex threads".to_string());
     }
+
+    ensure_codex_profile_for_thread(state.inner(), &thread).await?;
+
     let engine_thread_id = thread
         .engine_thread_id
         .clone()
@@ -956,7 +1054,7 @@ async fn set_thread_execution_policy_inner(
         )
     {
         return Err(
-            "Codex read-only and workspace-write sandbox overrides are unavailable while Panes is using external sandbox mode."
+            "Codex read-only and workspace-write sandbox overrides are unavailable while SupaCodex is using external sandbox mode."
                 .to_string(),
         );
     }
@@ -1271,6 +1369,97 @@ fn merge_codex_runtime_metadata(
     metadata
 }
 
+fn mark_codex_thread_transcript_imported(
+    existing: Option<&Value>,
+    raw_status: Option<&str>,
+    active_flags: &[String],
+    preview: Option<&str>,
+    created_at: Option<i64>,
+    updated_at: Option<i64>,
+) -> Value {
+    let mut metadata = merge_codex_runtime_metadata(
+        existing.cloned(),
+        raw_status,
+        active_flags,
+        preview,
+        false,
+        None,
+    );
+
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("codexTranscriptImported".to_string(), json!(true));
+        if let Some(created_at) = created_at {
+            object.insert(
+                "codexRemoteCreatedAt".to_string(),
+                json!(codex_remote_thread_timestamp_to_rfc3339(created_at)),
+            );
+        }
+        if let Some(updated_at) = updated_at {
+            object.insert(
+                "codexRemoteUpdatedAt".to_string(),
+                json!(codex_remote_thread_timestamp_to_rfc3339(updated_at)),
+            );
+        }
+    }
+
+    metadata
+}
+
+fn build_imported_thread_messages(
+    messages: &[ThreadTranscriptMessage],
+    created_at: Option<i64>,
+    updated_at: Option<i64>,
+) -> Vec<db::messages::ImportedThreadMessage> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    let now_ms = Utc::now().timestamp_millis();
+    let start_ms = normalize_codex_timestamp_millis(created_at).unwrap_or(now_ms);
+    let end_ms = normalize_codex_timestamp_millis(updated_at).unwrap_or(start_ms);
+    let final_end_ms = end_ms.max(start_ms);
+    let step_ms = if messages.len() <= 1 {
+        0
+    } else {
+        ((final_end_ms - start_ms).max(0) / (messages.len() as i64 - 1)).max(1)
+    };
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let timestamp_ms = if messages.len() == 1 {
+                final_end_ms
+            } else if index + 1 == messages.len() {
+                final_end_ms
+            } else {
+                start_ms + step_ms.saturating_mul(index as i64)
+            };
+
+            db::messages::ImportedThreadMessage {
+                role: message.role.as_str().to_string(),
+                text: message.content.clone(),
+                created_at: timestamp_millis_to_rfc3339(timestamp_ms),
+            }
+        })
+        .collect()
+}
+
+fn normalize_codex_timestamp_millis(timestamp: Option<i64>) -> Option<i64> {
+    let value = timestamp?;
+    Some(if value < 10_000_000_000 {
+        value.saturating_mul(1000)
+    } else {
+        value
+    })
+}
+
+fn timestamp_millis_to_rfc3339(timestamp_ms: i64) -> String {
+    DateTime::from_timestamp_millis(timestamp_ms)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
 async fn build_codex_branch_context(
     state: &AppState,
     thread: &ThreadDto,
@@ -1321,7 +1510,7 @@ async fn build_codex_branch_context(
         codex_external_sandbox_active,
     ) {
         return Err(
-            "Codex read-only and workspace-write sandbox overrides are unavailable while Panes is using external sandbox mode. Clear the override or restore local Codex sandboxing first.".to_string(),
+            "Codex read-only and workspace-write sandbox overrides are unavailable while SupaCodex is using external sandbox mode. Clear the override or restore local Codex sandboxing first.".to_string(),
         );
     }
 
@@ -2028,7 +2217,7 @@ mod tests {
     use uuid::Uuid;
 
     fn test_app_state() -> AppState {
-        let root = std::env::temp_dir().join(format!("panes-threads-cmd-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("supacodex-threads-cmd-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("failed to create temp root");
         let db = crate::db::Database::open(root.join("workspaces.db"))
             .expect("failed to create test database");
@@ -2048,7 +2237,7 @@ mod tests {
 
     fn test_thread(state: &AppState, engine_id: &str, model_id: &str) -> ThreadDto {
         let workspace_root =
-            std::env::temp_dir().join(format!("panes-threads-workspace-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("supacodex-threads-workspace-{}", Uuid::new_v4()));
         fs::create_dir_all(&workspace_root).expect("failed to create workspace root");
         let workspace = crate::db::workspaces::upsert_workspace(
             &state.db,
@@ -2321,10 +2510,11 @@ mod tests {
             archived: true,
         };
 
-        let metadata = build_codex_remote_thread_metadata(&summary, "gpt-5.4");
+        let metadata = build_codex_remote_thread_metadata(&summary, "gpt-5.4", "default");
 
         assert_eq!(metadata.get("lastModelId"), Some(&json!("gpt-5.4")));
         assert_eq!(metadata.get("codexTranscriptImported"), Some(&json!(false)));
+        assert_eq!(metadata.get("codexProfileId"), Some(&json!("default")));
         assert_eq!(metadata.get("codexModelProvider"), Some(&json!("openai")));
         assert_eq!(metadata.get("codexSourceKind"), Some(&json!("appServer")));
         assert_eq!(metadata.get("codexRemoteArchived"), Some(&json!(true)));

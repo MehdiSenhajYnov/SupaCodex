@@ -1,10 +1,10 @@
-// PanesHelperRegistrar — thin utility that registers/unregisters the
+// SupaCodexHelperRegistrar — thin utility that registers/unregisters the
 // privileged helper daemon via SMAppService (macOS 13+) and reports status.
 //
 // Usage:
-//   PanesHelperRegistrar --status     → {"status":"..."}
-//   PanesHelperRegistrar --register   → {"status":"..."}
-//   PanesHelperRegistrar --unregister → {"status":"..."}
+//   SupaCodexHelperRegistrar --status     → {"status":"..."}
+//   SupaCodexHelperRegistrar --register   → {"status":"..."}
+//   SupaCodexHelperRegistrar --unregister → {"status":"..."}
 //
 // The status string maps SMAppService.Status:
 //   .notRegistered    → "notRegistered"
@@ -15,7 +15,7 @@
 import Foundation
 import ServiceManagement
 
-private let plistName = "com.panes.app.helper.keepawake.plist"
+private let plistName = "com.supacodex.app.helper.keepawake.plist"
 
 func statusString(_ status: SMAppService.Status) -> String {
     switch status {

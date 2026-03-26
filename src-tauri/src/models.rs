@@ -30,6 +30,58 @@ pub struct WorkspaceGitSelectionStatusDto {
     pub configured: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexProfileDto {
+    pub id: String,
+    pub name: String,
+    pub codex_home: String,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexProfilesStateDto {
+    pub active_profile_id: String,
+    pub profiles: Vec<CodexProfileDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexDetectedProjectProfileDto {
+    pub profile_id: String,
+    pub profile_name: String,
+    pub thread_count: i64,
+    pub last_activity_at: String,
+    pub latest_thread_title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexDetectedThreadDto {
+    pub engine_thread_id: String,
+    pub title: String,
+    pub preview: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub profile_id: String,
+    pub profile_name: String,
+    pub model_provider: String,
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexDetectedProjectDto {
+    pub path: String,
+    pub name: String,
+    pub thread_count: i64,
+    pub last_activity_at: String,
+    pub workspace_id: Option<String>,
+    pub profiles: Vec<CodexDetectedProjectProfileDto>,
+    pub threads: Vec<CodexDetectedThreadDto>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustLevelDto {

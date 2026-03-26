@@ -1,5 +1,5 @@
 {
-  "title": "Panes",
+  "title": "SupaCodex",
   "updates": {
     "checkingTitle": "Checking for updates",
     "checkingMessage": "This should only take a moment.",
@@ -12,9 +12,10 @@
     "restartingTitle": "Restarting...",
     "failedTitle": "Update failed",
     "failedMessage": "An unexpected error occurred.",
-    "idleTitle": "Panes",
-    "idleTitleWithVersion": "Panes v{{version}}",
+    "idleTitle": "SupaCodex",
+    "idleTitleWithVersion": "SupaCodex v{{version}}",
     "idleMessage": "You're on the latest version.",
+    "disabledMessage": "Updates are disabled until this fork is connected to its own release channel.",
     "checkAgain": "Check again"
   },
   "shared": {
@@ -27,12 +28,20 @@
     "close": "Close window"
   },
   "sidebar": {
-    "pin": "Pin sidebar",
-    "unpin": "Unpin sidebar",
     "newThread": "New thread",
     "newThreadTitle": "New Thread",
     "agents": "Agents",
+    "openProjects": "Open Projects",
+    "closeOpenProject": "Close open project",
+    "showOpenProjects": "Show open projects",
+    "hideOpenProjects": "Hide open projects",
     "projects": "Projects",
+    "showProjectLibrary": "Show project library",
+    "hideProjectLibrary": "Hide project library",
+    "showSidebarPanel": "Show sidebar",
+    "hideSidebarPanel": "Hide sidebar",
+    "showGitPanel": "Show git panel",
+    "hideGitPanel": "Hide git panel",
     "openProject": "Open project",
     "noProjects": "No projects yet.",
     "openFolder": "Open a folder to get started.",
@@ -41,22 +50,23 @@
     "untitledThread": "Untitled thread",
     "archiveThread": "Archive thread",
     "showMore": "Show {{count}} more",
+    "showLess": "Show less",
     "archived": "Archived",
     "restoreWorkspace": "Restore workspace",
     "restoreThread": "Restore thread",
     "nothingArchived": "Nothing archived.",
     "settings": "Settings",
     "engineSetup": "Get started",
-    "checkUpdates": "Check for updates",
+    "checkUpdates": "Updates",
     "preferences": "Preferences",
     "keepAwake": "Keep Awake",
-    "keepAwakeDescription": "Help keep the computer awake while Panes is open",
+    "keepAwakeDescription": "Help keep the computer awake while SupaCodex is open",
     "keepAwakeUnsupported": "Not supported on this device",
     "keepAwakeInactive": "Enabled, but not currently active",
     "keepAwakeLimited": "Enabled, but lid-close protection is not active",
     "keepAwakePowerSettings": "Power Settings",
     "terminalNotifications": "Agent notifications",
-    "terminalNotificationsDescription": "Desktop alerts for chat replies and Panes terminal activity",
+    "terminalNotificationsDescription": "Desktop alerts for chat replies and SupaCodex terminal activity",
     "terminalNotificationsReady": "Chat can be enabled now. Install terminal hooks when you want CLI alerts too",
     "terminalNotificationsEnabledChat": "Chat reply alerts are on",
     "terminalNotificationsEnabledTerminal": "Terminal agent alerts are on",
@@ -70,6 +80,107 @@
     "archiveThreadTitle": "Archive thread",
     "archiveThreadMessage": "Archive thread \"{{name}}\"? It will be hidden from this project list.",
     "archive": "Archive"
+  },
+  "shortcutSettings": {
+    "title": "Keyboard shortcuts",
+    "description": "Keep navigation predictable, keep the common actions close, and change the bindings when they do not fit your workflow.",
+    "close": "Close keyboard shortcuts",
+    "introTitle": "Changes apply immediately",
+    "introDescription": "Click any shortcut pill to record a new binding. If the binding is already in use, the previous action is disabled automatically so the result stays unambiguous.",
+    "recordingTitle": "Recording shortcut for {{action}}",
+    "recordingHint": "Press the keys now. Press Esc to cancel without changing anything.",
+    "recording": "Press keys...",
+    "unassigned": "Unassigned",
+    "resetAction": "Reset",
+    "clearAction": "Disable",
+    "resetAll": "Reset all",
+    "footer": "Use simple, repeatable bindings for navigation. Keep frequently used actions easy to reach and reserve unusual combos for secondary actions.",
+    "conflictsResolved": "Conflicting shortcuts were disabled for: {{actions}}.",
+    "status": {
+      "default": "Default",
+      "custom": "Custom",
+      "disabled": "Disabled"
+    },
+    "groups": {
+      "navigation": {
+        "label": "Navigation",
+        "description": "Move between open conversations and open projects without leaving the keyboard."
+      },
+      "panels": {
+        "label": "Panels",
+        "description": "Control the layout shell, visibility, and fullscreen behavior."
+      },
+      "search": {
+        "label": "Search and palette",
+        "description": "Jump into workspace search, the command palette, files, and thread switchers."
+      }
+    },
+    "actions": {
+      "previous-conversation": {
+        "label": "Previous conversation tab",
+        "description": "Select the previous open conversation in the current project."
+      },
+      "next-conversation": {
+        "label": "Next conversation tab",
+        "description": "Select the next open conversation in the current project."
+      },
+      "previous-open-project": {
+        "label": "Previous open project",
+        "description": "Switch to the previous project in the working set."
+      },
+      "next-open-project": {
+        "label": "Next open project",
+        "description": "Switch to the next project in the working set."
+      },
+      "close-conversation": {
+        "label": "Close conversation tab",
+        "description": "Close the active conversation tab without archiving the thread."
+      },
+      "new-thread": {
+        "label": "New conversation",
+        "description": "Create a fresh conversation in the active project."
+      },
+      "toggle-sidebar": {
+        "label": "Toggle left sidebar",
+        "description": "Show or hide the project sidebar."
+      },
+      "toggle-git-panel": {
+        "label": "Toggle right panel",
+        "description": "Show or hide the Git panel on the right."
+      },
+      "toggle-focus-mode": {
+        "label": "Toggle focus mode",
+        "description": "Collapse secondary chrome for a more focused writing layout."
+      },
+      "toggle-terminal": {
+        "label": "Cycle terminal layout",
+        "description": "Switch between chat, split, and terminal-focused layouts."
+      },
+      "toggle-editor": {
+        "label": "Toggle editor layout",
+        "description": "Enter or leave the file editor layout for the active project."
+      },
+      "toggle-fullscreen": {
+        "label": "Toggle fullscreen",
+        "description": "Enter or leave the native fullscreen window mode."
+      },
+      "toggle-search": {
+        "label": "Search workspace",
+        "description": "Open the search-focused command palette for the current workspace."
+      },
+      "toggle-command-palette": {
+        "label": "Command palette",
+        "description": "Open or close the main command palette."
+      },
+      "open-command-palette-files": {
+        "label": "File switcher",
+        "description": "Open the file-focused command palette."
+      },
+      "open-command-palette-threads": {
+        "label": "Conversation switcher",
+        "description": "Open the conversation-focused command palette."
+      }
+    }
   },
   "commandPalette": {
     "placeholder": "Search commands, threads, workspaces, or files...",
@@ -345,8 +456,8 @@
     "loading": "Detecting installed harnesses...",
     "footerHint": "Installed harnesses appear as quick-launch options in your terminal + button",
     "descriptions": {
-      "codex": "OpenAI's coding agent CLI, integrated natively with Panes chat and terminal workflows",
-      "claude-code": "Anthropic's coding CLI, integrated natively with Panes for repo-aware and terminal-driven workflows",
+      "codex": "OpenAI's coding agent CLI, integrated natively with SupaCodex chat and terminal workflows",
+      "claude-code": "Anthropic's coding CLI, integrated natively with SupaCodex for repo-aware and terminal-driven workflows",
       "gemini-cli": "Google's coding agent CLI for code generation, repo tasks, and terminal workflows",
       "kiro": "AWS's coding CLI focused on structured, agent-style development workflows",
       "opencode": "Open-source coding assistant for chat, edits, and terminal workflows",
@@ -399,26 +510,26 @@
   },
   "notificationSettings": {
     "title": "Agent notifications",
-    "description": "Control chat reply alerts and terminal agent alerts separately. Terminal tools need one-time setup before Panes can surface their notifications.",
+    "description": "Control chat reply alerts and terminal agent alerts separately. Terminal tools need one-time setup before SupaCodex can surface their notifications.",
     "descriptionShort": "Desktop alerts for chat replies and terminal agents.",
     "chatSectionTitle": "Chat",
     "terminalSectionTitle": "Terminal",
     "chatCard": {
       "title": "Chat reply notifications",
-      "description": "Show a desktop notification when a Panes chat thread finishes in the background.",
+      "description": "Show a desktop notification when a SupaCodex chat thread finishes in the background.",
       "descriptionShort": "Notify when a chat thread finishes in the background.",
-      "detail": "No extra setup required. Panes can notify for chat replies immediately."
+      "detail": "No extra setup required. SupaCodex can notify for chat replies immediately."
     },
     "terminalCard": {
       "title": "Terminal agent notifications",
-      "description": "Show desktop notifications for Panes terminal activity, including OSC alerts and optional Claude Code or Codex integrations.",
+      "description": "Show desktop notifications for SupaCodex terminal activity, including OSC alerts and optional Claude Code or Codex integrations.",
       "descriptionShort": "Notify for terminal activity. OSC works immediately; Claude and Codex need one-time setup.",
       "ready": "Terminal integrations are installed. You can turn terminal alerts on whenever you want.",
       "setupRequired": "Install at least one terminal integration below before enabling terminal alerts."
     },
     "workflowTitle": "How this works",
-    "workflowDescription": "OSC notifications work immediately in Panes terminals. Claude Code and Codex need a one-time config install, and those commands only deliver alerts from terminals launched by Panes.",
-    "workflowShort": "OSC works immediately. Claude and Codex hooks are written to your config and only fire from terminals launched by Panes.",
+    "workflowDescription": "OSC notifications work immediately in SupaCodex terminals. Claude Code and Codex need a one-time config install, and those commands only deliver alerts from terminals launched by SupaCodex.",
+    "workflowShort": "OSC works immediately. Claude and Codex hooks are written to your config and only fire from terminals launched by SupaCodex.",
     "setupRequired": "Install at least one terminal integration before turning terminal alerts on.",
     "integrationsLabel": "Integrations",
     "sound": {
@@ -436,7 +547,7 @@
     "installing": "Installing...",
     "statusReady": "Notifications are active",
     "statusOff": "All notifications are off",
-    "footerNote": "Chat notifications are controlled entirely in Panes. Terminal integrations stay installed until you replace them in Claude or Codex config.",
+    "footerNote": "Chat notifications are controlled entirely in SupaCodex. Terminal integrations stay installed until you replace them in Claude or Codex config.",
     "status": {
       "installed": "Installed",
       "notInstalled": "Not installed",
@@ -445,13 +556,13 @@
     "integrations": {
       "claude": {
         "title": "Claude Code",
-        "description": "Merge Panes hook commands into your Claude user settings",
-        "detail": "Adds Panes lifecycle hooks without removing your existing Claude hooks."
+        "description": "Merge SupaCodex hook commands into your Claude user settings",
+        "detail": "Adds SupaCodex lifecycle hooks without removing your existing Claude hooks."
       },
       "codex": {
         "title": "Codex CLI",
-        "description": "Write Panes notify config into your Codex user config",
-        "detail": "Sets Codex's notify command so completed turns can reach Panes."
+        "description": "Write SupaCodex notify config into your Codex user config",
+        "detail": "Sets Codex's notify command so completed turns can reach SupaCodex."
       }
     },
     "toasts": {
@@ -474,7 +585,7 @@
   "powerModal": {
     "title": "Power Management",
     "keepAwake": "Keep Awake",
-    "keepAwakeDescription": "Prevent idle system sleep while Panes is open",
+    "keepAwakeDescription": "Prevent idle system sleep while SupaCodex is open",
     "displaySection": "Display",
     "preventDisplaySleep": "Prevent display sleep",
     "preventDisplaySleepDescription": "Keep the screen on",

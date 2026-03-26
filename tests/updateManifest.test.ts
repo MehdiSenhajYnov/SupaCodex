@@ -14,27 +14,27 @@ describe("resolveUpdaterAssetPairs", () => {
   it("maps one universal macOS updater asset to both darwin targets", () => {
     const resolved = resolveUpdaterAssetPairs([
       {
-        name: "Panes.app.tar.gz",
-        browser_download_url: "https://example.com/Panes.app.tar.gz",
+        name: "SupaCodex.app.tar.gz",
+        browser_download_url: "https://example.com/SupaCodex.app.tar.gz",
       },
       {
-        name: "Panes.app.tar.gz.sig",
-        browser_download_url: "https://example.com/Panes.app.tar.gz.sig",
+        name: "SupaCodex.app.tar.gz.sig",
+        browser_download_url: "https://example.com/SupaCodex.app.tar.gz.sig",
       },
     ]);
 
     expect(
       buildStaticReleasePlatforms(resolved, {
-        "Panes.app.tar.gz.sig": "mac-signature",
+        "SupaCodex.app.tar.gz.sig": "mac-signature",
       }),
     ).toEqual({
       "darwin-aarch64": {
         signature: "mac-signature",
-        url: "https://example.com/Panes.app.tar.gz",
+        url: "https://example.com/SupaCodex.app.tar.gz",
       },
       "darwin-x86_64": {
         signature: "mac-signature",
-        url: "https://example.com/Panes.app.tar.gz",
+        url: "https://example.com/SupaCodex.app.tar.gz",
       },
     });
   });
@@ -42,27 +42,27 @@ describe("resolveUpdaterAssetPairs", () => {
   it("maps AppImage to bundle-specific and compatibility Linux targets", () => {
     const resolved = resolveUpdaterAssetPairs([
       {
-        name: "Panes.AppImage",
-        browser_download_url: "https://example.com/Panes.AppImage",
+        name: "SupaCodex.AppImage",
+        browser_download_url: "https://example.com/SupaCodex.AppImage",
       },
       {
-        name: "Panes.AppImage.sig",
-        browser_download_url: "https://example.com/Panes.AppImage.sig",
+        name: "SupaCodex.AppImage.sig",
+        browser_download_url: "https://example.com/SupaCodex.AppImage.sig",
       },
     ]);
 
     expect(
       buildStaticReleasePlatforms(resolved, {
-        "Panes.AppImage.sig": "linux-signature",
+        "SupaCodex.AppImage.sig": "linux-signature",
       }),
     ).toEqual({
       "linux-x86_64-appimage": {
         signature: "linux-signature",
-        url: "https://example.com/Panes.AppImage",
+        url: "https://example.com/SupaCodex.AppImage",
       },
       "linux-x86_64": {
         signature: "linux-signature",
-        url: "https://example.com/Panes.AppImage",
+        url: "https://example.com/SupaCodex.AppImage",
       },
     });
   });
@@ -70,23 +70,23 @@ describe("resolveUpdaterAssetPairs", () => {
   it("maps Debian updater bundles to linux-x86_64-deb", () => {
     const resolved = resolveUpdaterAssetPairs([
       {
-        name: "Panes_0.42.0_amd64.deb",
-        browser_download_url: "https://example.com/Panes_0.42.0_amd64.deb",
+        name: "SupaCodex_0.42.0_amd64.deb",
+        browser_download_url: "https://example.com/SupaCodex_0.42.0_amd64.deb",
       },
       {
-        name: "Panes_0.42.0_amd64.deb.sig",
-        browser_download_url: "https://example.com/Panes_0.42.0_amd64.deb.sig",
+        name: "SupaCodex_0.42.0_amd64.deb.sig",
+        browser_download_url: "https://example.com/SupaCodex_0.42.0_amd64.deb.sig",
       },
     ]);
 
     expect(
       buildStaticReleasePlatforms(resolved, {
-        "Panes_0.42.0_amd64.deb.sig": "deb-signature",
+        "SupaCodex_0.42.0_amd64.deb.sig": "deb-signature",
       }),
     ).toEqual({
       "linux-x86_64-deb": {
         signature: "deb-signature",
-        url: "https://example.com/Panes_0.42.0_amd64.deb",
+        url: "https://example.com/SupaCodex_0.42.0_amd64.deb",
       },
     });
   });
@@ -94,9 +94,9 @@ describe("resolveUpdaterAssetPairs", () => {
   it("fails when multiple macOS updater bundles are present", () => {
     expect(() =>
       resolveUpdaterAssetPairs([
-        { name: "Panes.app.tar.gz" },
-        { name: "Panes_x64.app.tar.gz" },
-        { name: "Panes.app.tar.gz.sig" },
+        { name: "SupaCodex.app.tar.gz" },
+        { name: "SupaCodex_x64.app.tar.gz" },
+        { name: "SupaCodex.app.tar.gz.sig" },
       ]),
     ).toThrow("Expected exactly one macOS updater bundle asset");
   });
@@ -105,8 +105,8 @@ describe("resolveUpdaterAssetPairs", () => {
     expect(() =>
       resolveUpdaterAssetPairs([
         {
-          name: "Panes.app.tar.gz",
-          browser_download_url: "https://example.com/Panes.app.tar.gz",
+          name: "SupaCodex.app.tar.gz",
+          browser_download_url: "https://example.com/SupaCodex.app.tar.gz",
         },
       ]),
     ).toThrow("Expected exactly one macOS updater bundle signature asset, found none.");
@@ -116,8 +116,8 @@ describe("resolveUpdaterAssetPairs", () => {
     expect(() =>
       resolveUpdaterAssetPairs([
         {
-          name: "Panes_0.42.0_amd64.deb",
-          browser_download_url: "https://example.com/Panes_0.42.0_amd64.deb",
+          name: "SupaCodex_0.42.0_amd64.deb",
+          browser_download_url: "https://example.com/SupaCodex_0.42.0_amd64.deb",
         },
       ]),
     ).toThrow("Expected exactly one Linux Debian updater bundle signature asset, found none.");
@@ -126,9 +126,9 @@ describe("resolveUpdaterAssetPairs", () => {
   it("fails when multiple Debian updater bundles are present", () => {
     expect(() =>
       resolveUpdaterAssetPairs([
-        { name: "Panes_0.42.0_amd64.deb" },
-        { name: "Panes_0.42.0_amd64_copy.deb" },
-        { name: "Panes_0.42.0_amd64.deb.sig" },
+        { name: "SupaCodex_0.42.0_amd64.deb" },
+        { name: "SupaCodex_0.42.0_amd64_copy.deb" },
+        { name: "SupaCodex_0.42.0_amd64.deb.sig" },
       ]),
     ).toThrow("Expected exactly one Linux Debian updater bundle asset");
   });
@@ -136,23 +136,23 @@ describe("resolveUpdaterAssetPairs", () => {
   it("maps one Windows updater asset to windows-x86_64", () => {
     const resolved = resolveUpdaterAssetPairs([
       {
-        name: "Panes_0.38.0_x64-setup.exe",
-        browser_download_url: "https://example.com/Panes_0.38.0_x64-setup.exe",
+        name: "SupaCodex_0.38.0_x64-setup.exe",
+        browser_download_url: "https://example.com/SupaCodex_0.38.0_x64-setup.exe",
       },
       {
-        name: "Panes_0.38.0_x64-setup.exe.sig",
-        browser_download_url: "https://example.com/Panes_0.38.0_x64-setup.exe.sig",
+        name: "SupaCodex_0.38.0_x64-setup.exe.sig",
+        browser_download_url: "https://example.com/SupaCodex_0.38.0_x64-setup.exe.sig",
       },
     ]);
 
     expect(
       buildStaticReleasePlatforms(resolved, {
-        "Panes_0.38.0_x64-setup.exe.sig": "windows-signature",
+        "SupaCodex_0.38.0_x64-setup.exe.sig": "windows-signature",
       }),
     ).toEqual({
       "windows-x86_64": {
         signature: "windows-signature",
-        url: "https://example.com/Panes_0.38.0_x64-setup.exe",
+        url: "https://example.com/SupaCodex_0.38.0_x64-setup.exe",
       },
     });
   });
@@ -178,19 +178,19 @@ describe("generate-update-manifest", () => {
             body: "Release notes",
             assets: [
               {
-                name: "Panes_0.38.0_x64-setup.exe",
-                browser_download_url: "https://example.com/Panes_0.38.0_x64-setup.exe",
+                name: "SupaCodex_0.38.0_x64-setup.exe",
+                browser_download_url: "https://example.com/SupaCodex_0.38.0_x64-setup.exe",
               },
               {
-                name: "Panes_0.38.0_x64-setup.exe.sig",
-                browser_download_url: "https://example.com/Panes_0.38.0_x64-setup.exe.sig",
+                name: "SupaCodex_0.38.0_x64-setup.exe.sig",
+                browser_download_url: "https://example.com/SupaCodex_0.38.0_x64-setup.exe.sig",
               },
             ],
           }),
         };
       }
 
-      if (url === "https://example.com/Panes_0.38.0_x64-setup.exe.sig") {
+      if (url === "https://example.com/SupaCodex_0.38.0_x64-setup.exe.sig") {
         return {
           ok: true,
           text: async () => "windows-signature\n",
@@ -214,7 +214,7 @@ describe("generate-update-manifest", () => {
       platforms: {
         "windows-x86_64": {
           signature: "windows-signature",
-          url: "https://example.com/Panes_0.38.0_x64-setup.exe",
+          url: "https://example.com/SupaCodex_0.38.0_x64-setup.exe",
         },
       },
     });
@@ -239,34 +239,34 @@ describe("generate-update-manifest", () => {
             body: "Linux release notes",
             assets: [
               {
-                name: "Panes.AppImage",
-                browser_download_url: "https://example.com/Panes.AppImage",
+                name: "SupaCodex.AppImage",
+                browser_download_url: "https://example.com/SupaCodex.AppImage",
               },
               {
-                name: "Panes.AppImage.sig",
-                browser_download_url: "https://example.com/Panes.AppImage.sig",
+                name: "SupaCodex.AppImage.sig",
+                browser_download_url: "https://example.com/SupaCodex.AppImage.sig",
               },
               {
-                name: "Panes_0.42.0_amd64.deb",
-                browser_download_url: "https://example.com/Panes_0.42.0_amd64.deb",
+                name: "SupaCodex_0.42.0_amd64.deb",
+                browser_download_url: "https://example.com/SupaCodex_0.42.0_amd64.deb",
               },
               {
-                name: "Panes_0.42.0_amd64.deb.sig",
-                browser_download_url: "https://example.com/Panes_0.42.0_amd64.deb.sig",
+                name: "SupaCodex_0.42.0_amd64.deb.sig",
+                browser_download_url: "https://example.com/SupaCodex_0.42.0_amd64.deb.sig",
               },
             ],
           }),
         };
       }
 
-      if (url === "https://example.com/Panes.AppImage.sig") {
+      if (url === "https://example.com/SupaCodex.AppImage.sig") {
         return {
           ok: true,
           text: async () => "linux-signature\n",
         };
       }
 
-      if (url === "https://example.com/Panes_0.42.0_amd64.deb.sig") {
+      if (url === "https://example.com/SupaCodex_0.42.0_amd64.deb.sig") {
         return {
           ok: true,
           text: async () => "deb-signature\n",
@@ -289,15 +289,15 @@ describe("generate-update-manifest", () => {
       platforms: {
         "linux-x86_64-appimage": {
           signature: "linux-signature",
-          url: "https://example.com/Panes.AppImage",
+          url: "https://example.com/SupaCodex.AppImage",
         },
         "linux-x86_64": {
           signature: "linux-signature",
-          url: "https://example.com/Panes.AppImage",
+          url: "https://example.com/SupaCodex.AppImage",
         },
         "linux-x86_64-deb": {
           signature: "deb-signature",
-          url: "https://example.com/Panes_0.42.0_amd64.deb",
+          url: "https://example.com/SupaCodex_0.42.0_amd64.deb",
         },
       },
     });
@@ -314,19 +314,19 @@ describe("generate-update-manifest", () => {
             body: "",
             assets: [
               {
-                name: "Panes.AppImage",
-                browser_download_url: "https://example.com/Panes.AppImage",
+                name: "SupaCodex.AppImage",
+                browser_download_url: "https://example.com/SupaCodex.AppImage",
               },
               {
-                name: "Panes.AppImage.sig",
-                browser_download_url: "https://example.com/Panes.AppImage.sig",
+                name: "SupaCodex.AppImage.sig",
+                browser_download_url: "https://example.com/SupaCodex.AppImage.sig",
               },
             ],
           }),
         };
       }
 
-      if (url === "https://example.com/Panes.AppImage.sig") {
+      if (url === "https://example.com/SupaCodex.AppImage.sig") {
         return {
           ok: true,
           text: async () => "linux-signature\n",
@@ -351,11 +351,11 @@ describe("generate-update-manifest", () => {
     expect(manifest.platforms).toEqual({
       "linux-x86_64-appimage": {
         signature: "linux-signature",
-        url: "https://example.com/Panes.AppImage",
+        url: "https://example.com/SupaCodex.AppImage",
       },
       "linux-x86_64": {
         signature: "linux-signature",
-        url: "https://example.com/Panes.AppImage",
+        url: "https://example.com/SupaCodex.AppImage",
       },
     });
     expect(writes).toHaveLength(1);

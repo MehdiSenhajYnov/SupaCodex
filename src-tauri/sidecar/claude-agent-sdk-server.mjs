@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Bridges the Claude Agent SDK to a stdio-based JSON-line protocol for Panes.
+// Bridges the Claude Agent SDK to a stdio-based JSON-line protocol for SupaCodex.
 
 import { readFile } from "node:fs/promises";
 import path from "node:path";
@@ -1297,7 +1297,7 @@ async function handleQuery(req) {
         if (streamEvent?.type === "content_block_stop") {
           // Clean up the index tracking. action_progress_updated is only emitted
           // if PreToolUse already registered the actionId; otherwise the tool
-          // hasn't started from Panes' perspective yet and the event is skipped.
+          // hasn't started from SupaCodex' perspective yet and the event is skipped.
           const toolUseId = context.streamToolUseIdsByIndex.get(streamEvent.index);
           if (typeof toolUseId === "string") {
             context.streamToolUseIdsByIndex.delete(streamEvent.index);

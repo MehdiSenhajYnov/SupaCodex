@@ -9,6 +9,8 @@ import type {
   ChatInputItem,
   CodexReviewDelivery,
   CodexReviewTarget,
+  CodexDetectedProject,
+  CodexProfilesState,
   CodexRemoteThreadPage,
   ContentBlock,
   CodexApp,
@@ -180,6 +182,18 @@ export const ipc = {
       engineThreadId,
       modelId,
     }),
+  getCodexProfiles: () => invoke<CodexProfilesState>("get_codex_profiles"),
+  saveCodexProfiles: (profiles: CodexProfilesState["profiles"], activeProfileId: string) =>
+    invoke<CodexProfilesState>("save_codex_profiles", {
+      profiles,
+      activeProfileId,
+    }),
+  setActiveCodexProfile: (profileId: string) =>
+    invoke<CodexProfilesState>("set_active_codex_profile", { profileId }),
+  listCodexDetectedProjects: () =>
+    invoke<CodexDetectedProject[]>("list_codex_detected_projects"),
+  buildCodexResumeCommandForThread: (threadId: string) =>
+    invoke<string | null>("build_codex_resume_command_for_thread", { threadId }),
   createThread: (
     workspaceId: string,
     repoId: string | null,
@@ -278,6 +292,16 @@ export const ipc = {
       attachments: attachments ?? null,
       inputItems: inputItems ?? null,
       planMode: planMode ?? null,
+      clientTurnId: clientTurnId ?? null,
+    }),
+  runCodexShellCommand: (
+    threadId: string,
+    command: string,
+    clientTurnId?: string | null,
+  ) =>
+    invoke<string>("run_codex_shell_command", {
+      threadId,
+      command,
       clientTurnId: clientTurnId ?? null,
     }),
   steerMessage: (

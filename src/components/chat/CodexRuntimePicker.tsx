@@ -1,7 +1,8 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDown, Monitor } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { useAnchoredPopoverPosition } from "../shared/anchoredPopoverPosition";
 import type {
   CodexMethodAvailability,
   CodexProtocolDiagnostics,
@@ -226,7 +227,13 @@ export function CodexRuntimePicker({
   const [scrollToSection, setScrollToSection] = useState<RuntimePickerSection>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState({ bottom: 0, left: 0 });
+  const pos = useAnchoredPopoverPosition({
+    open,
+    triggerRef,
+    popoverRef,
+    preferredDirection: "top",
+    align: "center",
+  });
   const externalAuthTokensUnsupported = diagnostics?.account?.authMode === "chatgptAuthTokens";
 
   const methodIssues = useMemo(
@@ -317,19 +324,6 @@ export function CodexRuntimePicker({
     }
   }, [open, scrollToSection]);
 
-  useLayoutEffect(() => {
-    if (!open || !triggerRef.current) {
-      return;
-    }
-
-    const rect = triggerRef.current.getBoundingClientRect();
-    const left = Math.max(8, Math.min(rect.left, window.innerWidth - 500));
-    setPos({
-      bottom: window.innerHeight - rect.top + 6,
-      left,
-    });
-  }, [open]);
-
   useEffect(() => {
     if (!open) {
       return;
@@ -389,7 +383,7 @@ export function CodexRuntimePicker({
             style={{
               position: "fixed",
               zIndex: 1300,
-              bottom: pos.bottom,
+              top: pos.top,
               left: pos.left,
               width: "min(480px, calc(100vw - 16px))",
               maxHeight: "min(72vh, 620px)",

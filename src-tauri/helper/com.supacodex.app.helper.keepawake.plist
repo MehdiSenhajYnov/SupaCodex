@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.panes.app.helper.keepawake</string>
+	<string>com.supacodex.app.helper.keepawake</string>
 	<key>Program</key>
-	<string>/Library/PrivilegedHelperTools/com.panes.app.helper.keepawake</string>
+	<string>/Library/PrivilegedHelperTools/com.supacodex.app.helper.keepawake</string>
 	<key>RunAtLoad</key>
 	<false/>
 	<key>KeepAlive</key>

@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="app-icon.svg" alt="Panes" width="128" height="128" />
+  <img src="app-icon.svg" alt="SupaCodex" width="128" height="128" />
 </p>
 
-<h1 align="center">Panes</h1>
+<h1 align="center">SupaCodex</h1>
 
 <p align="center">
   <a href="./README.md">English</a> &bull; <strong>Português (Brasil)</strong>
@@ -23,18 +23,20 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/wygoralves/panes/releases/latest"><img src="https://img.shields.io/github/v/release/wygoralves/panes?label=download&color=blue" alt="Latest Release" /></a>
+  <img src="https://img.shields.io/badge/fork-local%20dev-orange.svg" alt="Local fork" />
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" alt="Platform" />
   <img src="https://img.shields.io/badge/tauri-v2-blue?logo=tauri" alt="Tauri v2" />
-  <img src="https://img.shields.io/badge/auto--update-OTA-green.svg" alt="OTA Auto-Update" />
+  <img src="https://img.shields.io/badge/updates-disabled-lightgrey.svg" alt="Updates disabled" />
 </p>
 
 ---
 
-O Panes envolve uma UI desktop nativa em torno de agentes externos de coding, fluxos de git, terminal e edição leve de arquivos. Ele dá aos desenvolvedores um único lugar para conversar com agentes, inspecionar diffs, aprovar ações, gerenciar trabalho em múltiplos repos e manter um histórico auditável do que aconteceu.
+O SupaCodex envolve uma UI desktop nativa em torno de agentes externos de coding, fluxos de git, terminal e edição leve de arquivos. Ele dá aos desenvolvedores um único lugar para conversar com agentes, inspecionar diffs, aprovar ações, gerenciar trabalho em múltiplos repos e manter um histórico auditável do que aconteceu.
 
-O Panes não é uma IDE completa, mas inclui um editor multiaba embutido para revisão rápida e pequenas edições sem sair do app.
+O SupaCodex não é uma IDE completa, mas inclui um editor multiaba embutido para revisão rápida e pequenas edições sem sair do app.
+
+Este fork está configurado primeiro para desenvolvimento local. URLs de release, distribuição de pacotes e atualizações dentro do app ficam desativadas até você conectá-las à infraestrutura do seu próprio fork.
 
 ## Recursos
 
@@ -91,46 +93,46 @@ O Panes não é uma IDE completa, mas inclui um editor multiaba embutido para re
 brew install --cask wygoralves/tap/panes
 ```
 
-O Homebrew é o caminho principal de instalação do Panes pré-compilado no macOS. O release para macOS é um app universal, então o mesmo DMG funciona tanto em Apple Silicon quanto em Macs Intel. Depois disso, o updater do app cuida das próximas versões dentro do próprio app.
+O Homebrew é o caminho principal de instalação do SupaCodex pré-compilado no macOS. O release para macOS é um app universal, então o mesmo DMG funciona tanto em Apple Silicon quanto em Macs Intel. Depois disso, o updater do app cuida das próximas versões dentro do próprio app.
 
-O Panes ainda não é assinado nem notarizado pela Apple, então o Homebrew só reduz o atrito com o Gatekeeper; ele não elimina isso de vez. O tap aplica uma remoção best-effort da quarantine durante a instalação, mas o macOS ainda pode exigir confirmação manual na primeira abertura, dependendo da política da máquina. Se isso acontecer, use o fluxo "Abrir" pelo Finder ou baixe o DMG direto em [GitHub Releases](https://github.com/wygoralves/panes/releases/latest).
+O SupaCodex ainda não é assinado nem notarizado pela Apple, então o Homebrew só reduz o atrito com o Gatekeeper; ele não elimina isso de vez. O tap aplica uma remoção best-effort da quarantine durante a instalação, mas o macOS ainda pode exigir confirmação manual na primeira abertura, dependendo da política da máquina. Se isso acontecer, use o fluxo "Abrir" pelo Finder ou baixe o DMG direto em [GitHub Releases](https://github.com/wygoralves/supacodex/releases/latest).
 
 Quem mantém o release pode ver a configuração do tap e da automação em [docs/homebrew-distribution.md](./docs/homebrew-distribution.md).
 
 ### Instalar no Windows
 
-Baixe o instalador `*-setup.exe` mais recente em [GitHub Releases](https://github.com/wygoralves/panes/releases/latest) e execute-o. As próximas versões passam a chegar pelo updater embutido do Tauri.
+Baixe o instalador `*-setup.exe` mais recente em [GitHub Releases](https://github.com/wygoralves/supacodex/releases/latest) e execute-o. As próximas versões passam a chegar pelo updater embutido do Tauri.
 
 Neste release para Windows, o escopo validado cobre instalador, updater, inicialização do app e compatibilidade do runtime empacotado. Isso ainda não garante validação completa de ponta a ponta do Codex e do Claude dentro do fluxo de chat do app, então ainda pode haver arestas nessa parte.
 
 ### Instalar e Rodar a partir do código-fonte
 
 ```bash
-git clone https://github.com/wygoralves/panes.git
-cd panes
+git clone https://github.com/<seu-usuario>/supacodex.git
+cd SupaCodex
 pnpm install
 pnpm tauri:dev
 ```
 
 ### Notificações de Terminal do Codex
 
-O Panes pode mostrar notificações de terminal do Codex depois de uma instalação única em `Notificações de agentes` nas configurações do app. Isso grava um comando `notify = [...]` na configuração de usuário do Codex apontando de volta para o Panes.
+O SupaCodex pode mostrar notificações de terminal do Codex depois de uma instalação única em `Notificações de agentes` nas configurações do app. Isso grava um comando `notify = [...]` na configuração de usuário do Codex apontando de volta para o SupaCodex.
 
-Hoje o Codex envia um único payload JSON para o programa configurado em `notify`. `panes codex-notify` entende o payload atual `agent-turn-complete`, extrai a última mensagem do assistant e a roteia de volta para a sessão de terminal dona do evento para que o Panes mostre notificações no desktop e dentro do app.
+Hoje o Codex envia um único payload JSON para o programa configurado em `notify`. `supacodex codex-notify` entende o payload atual `agent-turn-complete`, extrai a última mensagem do assistant e a roteia de volta para a sessão de terminal dona do evento para que o SupaCodex mostre notificações no desktop e dentro do app.
 
-Isso só funciona dentro de terminais abertos pelo Panes, porque o comando instalado depende de `PANES_NOTIFY_ADDR`, `PANES_NOTIFY_TOKEN`, `PANES_WORKSPACE_ID` e `PANES_SESSION_ID`.
+Isso só funciona dentro de terminais abertos pelo SupaCodex, porque o comando instalado depende de `SUPACODEX_NOTIFY_ADDR`, `SUPACODEX_NOTIFY_TOKEN`, `SUPACODEX_WORKSPACE_ID` e `SUPACODEX_SESSION_ID`.
 
 ### Notificações de Terminal do Claude
 
-O Panes pode mostrar notificações de terminal do Claude depois de uma instalação única em `Notificações de agentes` nas configurações do app. Isso mescla comandos de hook gerenciados pelo Panes na configuração de usuário do Claude sem remover hooks existentes.
+O SupaCodex pode mostrar notificações de terminal do Claude depois de uma instalação única em `Notificações de agentes` nas configurações do app. Isso mescla comandos de hook gerenciados pelo SupaCodex na configuração de usuário do Claude sem remover hooks existentes.
 
-Hoje essa ponte de hooks trata os eventos `Notification`, `Stop`, `StopFailure`, `SessionStart` e `SessionEnd` do Claude, roteando tudo de volta para a sessão de terminal dona do evento para que o Panes mostre notificações no desktop e dentro do app e limpe estado antigo quando uma sessão do Claude começa ou termina.
+Hoje essa ponte de hooks trata os eventos `Notification`, `Stop`, `StopFailure`, `SessionStart` e `SessionEnd` do Claude, roteando tudo de volta para a sessão de terminal dona do evento para que o SupaCodex mostre notificações no desktop e dentro do app e limpe estado antigo quando uma sessão do Claude começa ou termina.
 
-Isso só funciona dentro de terminais abertos pelo Panes, porque o comando de hook instalado depende do ambiente da sessão de terminal do Panes.
+Isso só funciona dentro de terminais abertos pelo SupaCodex, porque o comando de hook instalado depende do ambiente da sessão de terminal do SupaCodex.
 
 ### Notificações Genéricas de Terminal via OSC
 
-O Panes também escuta sequências OSC comuns de notificação de desktop emitidas diretamente por programas rodando dentro de uma sessão de terminal do Panes. Elas funcionam sem nenhuma configuração de Claude ou Codex. Hoje o backend reconhece payloads de notificação `OSC 9`, `OSC 777;notify;...` e `OSC 99` antes de o replay do terminal ser gravado, então notificações ao vivo não disparam de novo quando a sessão do terminal é retomada.
+O SupaCodex também escuta sequências OSC comuns de notificação de desktop emitidas diretamente por programas rodando dentro de uma sessão de terminal do SupaCodex. Elas funcionam sem nenhuma configuração de Claude ou Codex. Hoje o backend reconhece payloads de notificação `OSC 9`, `OSC 777;notify;...` e `OSC 99` antes de o replay do terminal ser gravado, então notificações ao vivo não disparam de novo quando a sessão do terminal é retomada.
 
 Relatórios de progresso `OSC 9;4` são deixados intactos de propósito e não são tratados como notificações.
 
@@ -178,12 +180,12 @@ Artefatos de build podem crescer rápido durante o desenvolvimento com Tauri/Rus
 
 | Caminho | Finalidade |
 |---|---|
-| macOS / Linux: `~/.agent-workspace/config.toml` | Configuração do app |
-| macOS / Linux: `~/.agent-workspace/workspaces.db` | Banco SQLite |
-| macOS / Linux: `~/.agent-workspace/logs` | Diretório de logs |
-| Windows: `%LOCALAPPDATA%\Panes\config.toml` | Configuração do app |
-| Windows: `%LOCALAPPDATA%\Panes\workspaces.db` | Banco SQLite |
-| Windows: `%LOCALAPPDATA%\Panes\logs` | Diretório de logs |
+| macOS / Linux: `~/.supacodex/config.toml` | Configuração do app |
+| macOS / Linux: `~/.supacodex/workspaces.db` | Banco SQLite |
+| macOS / Linux: `~/.supacodex/logs` | Diretório de logs |
+| Windows: `%LOCALAPPDATA%\SupaCodex\config.toml` | Configuração do app |
+| Windows: `%LOCALAPPDATA%\SupaCodex\workspaces.db` | Banco SQLite |
+| Windows: `%LOCALAPPDATA%\SupaCodex\logs` | Diretório de logs |
 
 ### Localização
 
@@ -196,7 +198,7 @@ A copy visível para o usuário no frontend é localizada com `i18next`/`react-i
 
 ## Arquitetura
 
-O Panes usa um frontend React + Zustand rodando dentro de um shell Tauri, com um backend Rust responsável por persistência, orquestração de engines, operações de git, gerenciamento de terminal e acesso seguro ao filesystem.
+O SupaCodex usa um frontend React + Zustand rodando dentro de um shell Tauri, com um backend Rust responsável por persistência, orquestração de engines, operações de git, gerenciamento de terminal e acesso seguro ao filesystem.
 
 Atualmente o app expõe Codex e Claude como chat engines. O Codex se conecta a `codex app-server`; o Claude é ligado por meio do sidecar runtime incluído.
 

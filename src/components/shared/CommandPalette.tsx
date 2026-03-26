@@ -60,6 +60,7 @@ import { useFileStore } from "../../stores/fileStore";
 import { useHarnessStore } from "../../stores/harnessStore";
 import { canToggleKeepAwake, useKeepAwakeStore } from "../../stores/keepAwakeStore";
 import { useOnboardingStore } from "../../stores/onboardingStore";
+import { useProjectTabsStore } from "../../stores/projectTabsStore";
 import { toast } from "../../stores/toastStore";
 import type { FileTreeEntry, GitBranch, GitStash, HarnessInfo, Repo, SearchResult, Thread, Workspace } from "../../types";
 
@@ -682,7 +683,7 @@ export function getStaticCommands(
       try {
         const forked = await forkCodexThread(activeThreadId);
         if (forked) {
-          useThreadStore.getState().setActiveThread(forked.id);
+          await useProjectTabsStore.getState().switchToThread(forked);
           toast.success(t("commandPalette.toasts.codexForked"));
         }
       } catch (err) {
@@ -784,7 +785,7 @@ const STYLES = {
     position: "fixed" as const,
     inset: 0,
     zIndex: 10001,
-    background: "rgba(0, 0, 0, 0.55)",
+    background: "var(--overlay-backdrop)",
     backdropFilter: "blur(16px)",
     WebkitBackdropFilter: "blur(16px)",
     display: "flex",
@@ -799,10 +800,8 @@ const STYLES = {
     display: "grid",
     gridTemplateRows: "auto 1fr auto",
     borderRadius: "var(--radius-lg)",
-    background: "rgba(14, 14, 16, 0.95)",
-    boxShadow:
-      "0 0 0 1px rgba(255, 255, 255, 0.08), " +
-      "0 24px 68px rgba(0, 0, 0, 0.55)",
+    background: "var(--overlay-panel)",
+    boxShadow: "var(--shadow-floating)",
     animation: "slide-up 180ms cubic-bezier(0.16, 1, 0.3, 1) both",
   },
   inputRow: {
@@ -873,7 +872,7 @@ const STYLES = {
     width: "calc(100% - 12px)",
     border: "none",
     borderRadius: "var(--radius-sm)",
-    background: active ? "rgba(255, 255, 255, 0.07)" : "transparent",
+    background: active ? "var(--surface-4)" : "transparent",
     cursor: "pointer",
     textAlign: "left" as const,
     fontFamily: "inherit",
@@ -904,7 +903,7 @@ const STYLES = {
     fontSize: 10.5,
     color: "var(--text-3)",
     padding: "2px 6px",
-    background: "var(--bg-4)",
+    background: "var(--surface-3)",
     borderRadius: 4,
     fontFamily: "monospace",
     flexShrink: 0,
@@ -914,8 +913,8 @@ const STYLES = {
     fontSize: 10,
     padding: "1px 6px",
     borderRadius: 4,
-    background: "var(--bg-4)",
-    border: "1px solid var(--border)",
+    background: "var(--surface-3)",
+    border: "1px solid var(--border-soft)",
     color: "var(--text-3)",
     flexShrink: 0,
   },
@@ -1816,24 +1815,10 @@ export function CommandPalette({ open, onClose }: Props) {
         threadId: targetThread.id,
         messageId: result.messageId,
       });
-      if (targetThread.repoId) {
-        setActiveRepo(targetThread.repoId);
-      } else {
-        setActiveRepo(null, { remember: false });
-      }
-      setActiveThread(targetThread.id);
-      await bindChatThread(targetThread.id);
-      useUiStore.getState().setActiveView("chat");
+      await useProjectTabsStore.getState().switchToThread(targetThread);
       onClose();
     },
-    [
-      activeWorkspaceId,
-      bindChatThread,
-      onClose,
-      setActiveRepo,
-      setActiveThread,
-      setMessageFocusTarget,
-    ],
+    [activeWorkspaceId, onClose, setMessageFocusTarget],
   );
 
   const executeItem = useCallback(
@@ -1871,19 +1856,14 @@ export function CommandPalette({ open, onClose }: Props) {
         }
         case "thread": {
           const thread = item.entry;
-          if (thread.workspaceId !== activeWorkspaceId) {
-            await useWorkspaceStore.getState().setActiveWorkspace(thread.workspaceId);
-          }
           await useTerminalStore.getState().setLayoutMode(thread.workspaceId, "chat");
-          useThreadStore.getState().setActiveThread(thread.id);
-          await useChatStore.getState().setActiveThread(thread.id);
-          useUiStore.getState().setActiveView("chat");
+          await useProjectTabsStore.getState().switchToThread(thread);
           onClose();
           break;
         }
         case "workspace": {
           onClose();
-          await useWorkspaceStore.getState().setActiveWorkspace(item.entry.id);
+          await useProjectTabsStore.getState().switchToWorkspace(item.entry.id);
           break;
         }
         case "harness": {
@@ -2020,7 +2000,7 @@ export function CommandPalette({ open, onClose }: Props) {
       try {
         const rolled = await rollbackCodexThread(activeThreadId, numTurns);
         if (rolled) {
-          useThreadStore.getState().setActiveThread(rolled.id);
+          await useProjectTabsStore.getState().switchToThread(rolled);
           toast.success(t("commandPalette.toasts.codexRolledBack", { count: numTurns }));
         }
       } catch (err) {

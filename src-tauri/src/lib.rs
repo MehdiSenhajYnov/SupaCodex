@@ -1,3 +1,4 @@
+mod codex_profiles;
 mod commands;
 mod config;
 mod db;
@@ -23,6 +24,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use rusqlite::OptionalExtension;
 
+use codex_profiles::runtime_profile_from_config;
 use config::app_config::AppConfig;
 use db::Database;
 use engines::{CodexRuntimeEvent, EngineManager};
@@ -36,7 +38,9 @@ use power::KeepAwakeManager;
 use state::{AppState, TurnManager};
 #[cfg(target_os = "macos")]
 use tauri::menu::{AboutMetadata, MenuItem, PredefinedMenuItem, SubmenuBuilder};
-use tauri::{image::Image, menu::Menu, Emitter, Manager, RunEvent, WebviewWindowBuilder};
+use tauri::{
+    image::Image, menu::Menu, webview::Color, Emitter, Manager, RunEvent, WebviewWindowBuilder,
+};
 use terminal::TerminalManager;
 
 pub fn maybe_handle_cli_subcommand() -> anyhow::Result<bool> {
@@ -93,6 +97,14 @@ pub fn run() {
         file_tree_cache: Arc::new(FileTreeCache::new()),
     };
 
+    if let Err(error) = tauri::async_runtime::block_on(
+        app_state
+            .engines
+            .set_codex_profile(runtime_profile_from_config(app_state.config.as_ref())),
+    ) {
+        log::warn!("failed to apply Codex profile on startup: {error}");
+    }
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -121,6 +133,8 @@ pub fn run() {
             };
 
             let main_window = WebviewWindowBuilder::from_config(app.handle(), &main_window_config)?
+                .shadow(false)
+                .background_color(Color(0, 0, 0, 0))
                 .enable_clipboard_access()
                 .build()?;
             #[cfg(not(target_os = "linux"))]
@@ -186,6 +200,7 @@ pub fn run() {
             commands::power::get_helper_status,
             commands::power::register_keep_awake_helper,
             commands::chat::send_message,
+            commands::chat::run_codex_shell_command,
             commands::chat::start_codex_review,
             commands::chat::steer_message,
             commands::chat::cancel_turn,
@@ -257,6 +272,11 @@ pub fn run() {
             commands::app::set_notification_sound,
             commands::app::preview_notification_sound,
             commands::app::show_agent_notification,
+            commands::app::get_codex_profiles,
+            commands::app::save_codex_profiles,
+            commands::app::set_active_codex_profile,
+            commands::app::list_codex_detected_projects,
+            commands::app::build_codex_resume_command_for_thread,
             commands::files::list_dir,
             commands::files::read_file,
             commands::files::write_file,
@@ -666,13 +686,18 @@ async fn apply_codex_runtime_thread_update(
 
     let has_local_turn = state.turns.get(&thread.id).await.is_some();
     let next_status = map_codex_runtime_status_to_local(raw_status, active_flags, has_local_turn);
+    let (effective_sync_required, effective_sync_reason) = reconcile_codex_runtime_sync_state(
+        thread.engine_metadata.as_ref(),
+        sync_required,
+        sync_reason,
+    );
     let metadata = merge_codex_runtime_metadata(
         thread.engine_metadata.clone(),
         raw_status,
         active_flags,
         preview,
-        sync_required,
-        sync_reason,
+        effective_sync_required,
+        effective_sync_reason.as_deref(),
     );
 
     run_db(state.db.clone(), {
@@ -741,6 +766,38 @@ async fn restore_codex_runtime_thread(
     })
     .await
     .ok()
+}
+
+fn codex_transcript_import_pending(metadata: Option<&serde_json::Value>) -> bool {
+    metadata
+        .and_then(|value| value.get("codexTranscriptImported"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+}
+
+fn existing_codex_sync_reason(metadata: Option<&serde_json::Value>) -> Option<String> {
+    metadata
+        .and_then(|value| value.get("codexSyncReason"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn reconcile_codex_runtime_sync_state(
+    metadata: Option<&serde_json::Value>,
+    sync_required: Option<bool>,
+    sync_reason: Option<&str>,
+) -> (Option<bool>, Option<String>) {
+    if sync_required == Some(false) && codex_transcript_import_pending(metadata) {
+        return (
+            Some(true),
+            existing_codex_sync_reason(metadata)
+                .or_else(|| Some("remote_thread_attached".to_string())),
+        );
+    }
+
+    (sync_required, sync_reason.map(str::to_string))
 }
 
 fn merge_codex_runtime_metadata(
@@ -837,6 +894,42 @@ fn map_codex_runtime_status_to_local(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::reconcile_codex_runtime_sync_state;
+    use serde_json::json;
+
+    #[test]
+    fn reconcile_codex_runtime_sync_state_preserves_pending_transcript_sync() {
+        let metadata = json!({
+            "codexTranscriptImported": false,
+            "codexSyncRequired": true,
+            "codexSyncReason": "remote_thread_attached",
+        });
+
+        let (sync_required, sync_reason) =
+            reconcile_codex_runtime_sync_state(Some(&metadata), Some(false), None);
+
+        assert_eq!(sync_required, Some(true));
+        assert_eq!(sync_reason.as_deref(), Some("remote_thread_attached"));
+    }
+
+    #[test]
+    fn reconcile_codex_runtime_sync_state_allows_clearing_sync_after_import() {
+        let metadata = json!({
+            "codexTranscriptImported": true,
+            "codexSyncRequired": true,
+            "codexSyncReason": "remote_thread_attached",
+        });
+
+        let (sync_required, sync_reason) =
+            reconcile_codex_runtime_sync_state(Some(&metadata), Some(false), None);
+
+        assert_eq!(sync_required, Some(false));
+        assert_eq!(sync_reason, None);
+    }
+}
+
 async fn run_db<T, F>(db: crate::db::Database, operation: F) -> Result<T, String>
 where
     T: Send + 'static,
@@ -861,14 +954,14 @@ fn build_app_menu(handle: &tauri::AppHandle, locale: &str) -> tauri::Result<Menu
 
         let app_menu = SubmenuBuilder::new(handle, strings.app_menu)
             .about(Some(AboutMetadata {
-                name: Some("Panes".to_string()),
+                name: Some("SupaCodex".to_string()),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                authors: Some(vec!["Wygor Alves".to_string()]),
+                authors: Some(vec!["SupaCodex fork".to_string()]),
                 comments: Some(strings.about_comments.to_string()),
                 copyright: Some("Copyright © 2026 Wygor Alves".to_string()),
                 license: Some("MIT".to_string()),
-                website: Some("https://github.com/wygoralves/panes".to_string()),
-                website_label: Some("GitHub".to_string()),
+                website: None,
+                website_label: None,
                 icon: match Image::from_bytes(include_bytes!("../icons/128x128@2x.png")) {
                     Ok(img) => Some(img),
                     Err(e) => {

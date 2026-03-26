@@ -38,7 +38,7 @@ const EMPTY_DRAFTS: GitDraftsPayload = {
 };
 
 function draftStorageKey(workspaceId: string): string {
-  return `panes:git.drafts:${workspaceId}`;
+  return `supacodex:git.drafts:${workspaceId}`;
 }
 
 function loadDraftsFromStorage(workspaceId: string): GitDraftsPayload {

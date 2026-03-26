@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     engines::{
         claude_sidecar::ClaudeSidecarEngine,
-        codex::{CodexEngine, CodexForkedThread, CodexReviewStarted},
+        codex::{CodexEngine, CodexForkedThread, CodexReviewStarted, CodexRuntimeProfile},
     },
     models::{
         CodexAppDto, CodexSkillDto, EngineCapabilitiesDto, EngineHealthDto, EngineInfoDto,
@@ -261,6 +261,35 @@ pub struct ThreadSyncSnapshot {
     pub active_flags: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadTranscriptMessageRole {
+    User,
+    Assistant,
+}
+
+impl ThreadTranscriptMessageRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadTranscriptMessage {
+    pub role: ThreadTranscriptMessageRole,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexThreadTranscriptSnapshot {
+    pub sync: ThreadSyncSnapshot,
+    pub messages: Vec<ThreadTranscriptMessage>,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CodexRemoteThreadSummary {
     pub engine_thread_id: String,
@@ -359,6 +388,14 @@ impl EngineManager {
 
     pub fn set_resource_dir(&self, resource_dir: Option<PathBuf>) {
         self.claude.set_resource_dir(resource_dir);
+    }
+
+    pub async fn set_codex_profile(&self, profile: CodexRuntimeProfile) -> anyhow::Result<()> {
+        self.codex.set_profile(profile).await
+    }
+
+    pub async fn active_codex_profile(&self) -> CodexRuntimeProfile {
+        self.codex.active_profile().await
     }
 
     pub async fn list_engines(&self) -> anyhow::Result<Vec<EngineInfoDto>> {
@@ -562,6 +599,30 @@ impl EngineManager {
         }
     }
 
+    pub async fn send_codex_shell_command(
+        &self,
+        engine_thread_id: &str,
+        command: &str,
+        event_tx: mpsc::Sender<EngineEvent>,
+        cancellation: CancellationToken,
+    ) -> anyhow::Result<()> {
+        self.codex
+            .send_shell_command(engine_thread_id, command, event_tx, cancellation)
+            .await
+            .context("codex shell command failed")
+    }
+
+    pub async fn run_active_codex_shell_command(
+        &self,
+        engine_thread_id: &str,
+        command: &str,
+    ) -> anyhow::Result<()> {
+        self.codex
+            .run_active_shell_command(engine_thread_id, command)
+            .await
+            .context("codex active shell command failed")
+    }
+
     pub async fn steer_message(
         &self,
         thread: &ThreadDto,
@@ -682,6 +743,25 @@ impl EngineManager {
             "codex" => self
                 .codex
                 .read_thread_sync_snapshot(engine_thread_id)
+                .await
+                .map(Some),
+            "claude" => Ok(None),
+            _ => anyhow::bail!("unsupported engine_id {}", thread.engine_id),
+        }
+    }
+
+    pub async fn read_codex_thread_transcript_snapshot(
+        &self,
+        thread: &ThreadDto,
+    ) -> anyhow::Result<Option<CodexThreadTranscriptSnapshot>> {
+        let Some(engine_thread_id) = thread.engine_thread_id.as_deref() else {
+            return Ok(None);
+        };
+
+        match thread.engine_id.as_str() {
+            "codex" => self
+                .codex
+                .read_thread_transcript_snapshot(engine_thread_id)
                 .await
                 .map(Some),
             "claude" => Ok(None),

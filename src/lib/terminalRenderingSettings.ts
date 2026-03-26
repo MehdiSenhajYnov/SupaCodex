@@ -1,5 +1,5 @@
 const TERMINAL_ACCELERATED_RENDERING_EVENT =
-  "panes:terminal-accelerated-rendering-changed";
+  "supacodex:terminal-accelerated-rendering-changed";
 
 let terminalAcceleratedRenderingPreferenceVersion = 0;
 

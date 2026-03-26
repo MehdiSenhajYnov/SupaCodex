@@ -13,6 +13,13 @@ use crate::models::{
 
 use super::Database;
 
+#[derive(Debug, Clone)]
+pub struct ImportedThreadMessage {
+    pub role: String,
+    pub text: String,
+    pub created_at: String,
+}
+
 pub fn insert_user_message(
     db: &Database,
     thread_id: &str,
@@ -60,6 +67,53 @@ pub fn delete_message(db: &Database, message_id: &str) -> anyhow::Result<()> {
     conn.execute("DELETE FROM messages WHERE id = ?1", params![message_id])
         .context("failed to delete message")?;
     Ok(())
+}
+
+pub fn replace_thread_messages(
+    db: &Database,
+    thread_id: &str,
+    messages: &[ImportedThreadMessage],
+    turn_engine_id: Option<&str>,
+    turn_model_id: Option<&str>,
+    turn_reasoning_effort: Option<&str>,
+) -> anyhow::Result<Vec<MessageDto>> {
+    let mut conn = db.connect()?;
+    let tx = conn
+        .transaction()
+        .context("failed to start thread transcript import transaction")?;
+
+    tx.execute(
+        "DELETE FROM messages WHERE thread_id = ?1",
+        params![thread_id],
+    )
+    .context("failed to clear existing thread messages")?;
+
+    for message in messages {
+        let blocks = serde_json::json!([{ "type": "text", "content": message.text }]);
+        tx.execute(
+            "INSERT INTO messages (
+                id, thread_id, role, content, blocks_json, schema_version, status,
+                turn_engine_id, turn_model_id, turn_reasoning_effort, created_at
+            ) VALUES (?1, ?2, ?3, NULL, ?4, 1, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                Uuid::new_v4().to_string(),
+                thread_id,
+                message.role,
+                blocks.to_string(),
+                MessageStatusDto::Completed.as_str(),
+                turn_engine_id,
+                turn_model_id,
+                turn_reasoning_effort,
+                message.created_at,
+            ],
+        )
+        .context("failed to import thread transcript message")?;
+    }
+
+    tx.commit()
+        .context("failed to commit thread transcript import transaction")?;
+
+    get_thread_messages(db, thread_id)
 }
 
 pub fn clone_thread_messages(
@@ -1032,7 +1086,7 @@ mod tests {
     use super::*;
 
     fn test_db() -> Database {
-        let path = std::env::temp_dir().join(format!("panes-messages-{}.db", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("supacodex-messages-{}.db", Uuid::new_v4()));
         let db = Database {
             path,
             pool: Arc::new(ConnectionPool {
@@ -1045,7 +1099,7 @@ mod tests {
     }
 
     fn test_workspace(db: &Database) -> String {
-        let root = std::env::temp_dir().join(format!("panes-workspace-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("supacodex-workspace-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("failed to create temp workspace root");
         let workspace =
             workspaces::upsert_workspace(db, root.to_string_lossy().as_ref(), Some(1)).unwrap();

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useTranslation } from "react-i18next";
@@ -11,8 +11,6 @@ import {
   Archive,
   RotateCcw,
   Settings,
-  Pin,
-  PinOff,
   Terminal,
   Check,
   Rocket,
@@ -20,8 +18,15 @@ import {
   PillBottle,
   BellRing,
   Globe,
+  Monitor,
+  Keyboard,
+  UserCircle,
+  X,
 } from "lucide-react";
 import { useChatStore } from "../../stores/chatStore";
+import {
+  useCodexProfileStore,
+} from "../../stores/codexProfileStore";
 import { useEngineStore } from "../../stores/engineStore";
 import { useThreadStore } from "../../stores/threadStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
@@ -29,7 +34,10 @@ import { useUiStore } from "../../stores/uiStore";
 import { useOnboardingStore } from "../../stores/onboardingStore";
 import { useUpdateStore } from "../../stores/updateStore";
 import { canToggleKeepAwake, useKeepAwakeStore } from "../../stores/keepAwakeStore";
+import { useAppearanceStore } from "../../stores/appearanceStore";
 import { useTerminalNotificationSettingsStore } from "../../stores/terminalNotificationSettingsStore";
+import { useProjectTabsStore } from "../../stores/projectTabsStore";
+import { useShortcutStore } from "../../stores/shortcutStore";
 import { toast } from "../../stores/toastStore";
 import { ipc } from "../../lib/ipc";
 import { formatRelativeTime } from "../../lib/formatters";
@@ -43,21 +51,250 @@ import {
   SUPPORTED_APP_LOCALES,
   type AppLocale,
 } from "../../lib/locale";
-import { handleDragMouseDown, handleDragDoubleClick } from "../../lib/windowDrag";
+import { handleDragMouseDown } from "../../lib/windowDrag";
 import { UpdateDialog } from "../onboarding/UpdateDialog";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
 import { WorkspaceMoreMenu } from "../workspace/WorkspaceMoreMenu";
-import type { Thread, Workspace } from "../../types";
+import type { CodexDetectedProject, Thread, Workspace } from "../../types";
 
 interface ProjectGroup {
   workspace: Workspace;
   threads: Thread[];
 }
 
+interface UnifiedProjectGroup {
+  key: string;
+  path: string;
+  name: string;
+  workspace: Workspace | null;
+  detectedCodexProject: CodexDetectedProject | null;
+  conversations: SidebarConversation[];
+  totalConversationCount: number;
+  latestActivityAt: string;
+}
+
+type SidebarConversation =
+  | {
+      kind: "local";
+      key: string;
+      updatedAt: string;
+      localThread: Thread;
+    }
+  | {
+      kind: "detected";
+      key: string;
+      updatedAt: string;
+      detectedThread: CodexDetectedProject["threads"][number];
+    };
+
+interface SidebarConversationRowProps {
+  label: string;
+  timeLabel?: string;
+  active?: boolean;
+  disabled?: boolean;
+  animationDelayMs: number;
+  opacity?: number;
+  className?: string;
+  onClick: () => void;
+  onMiddleClick?: () => void;
+  trailingAction?: {
+    title: string;
+    icon: ReactNode;
+    onClick: () => void;
+  };
+}
+
+interface SidebarProjectRowProps {
+  label: string;
+  count?: number;
+  active?: boolean;
+  collapsed?: boolean;
+  disabled?: boolean;
+  icon: ReactNode;
+  wrapperClassName?: string;
+  onClick: () => void;
+  onMiddleClick?: () => void;
+  trailing?: ReactNode;
+}
+
+interface SidebarSectionHeaderProps {
+  label: string;
+  count: number;
+  expanded: boolean;
+  controlsId: string;
+  toggleTitle: string;
+  onToggle: () => void;
+  action?: ReactNode;
+}
+
 const MAX_VISIBLE_THREADS = 8;
-const LEGACY_SCAN_DEPTH_STORAGE_KEY = "panes.workspace.scanDepth";
+const LEGACY_SCAN_DEPTH_STORAGE_KEY = "supacodex.workspace.scanDepth";
+const SIDEBAR_SECTION_STATE_STORAGE_KEY = "supacodex:sidebarSections:v1";
 const LEGACY_SCAN_DEPTH_MIN = 0;
 const LEGACY_SCAN_DEPTH_MAX = 12;
+const DEFAULT_CODEX_MODEL = "gpt-5.3-codex";
+
+interface SidebarSectionState {
+  openProjectsCollapsed: boolean;
+  projectLibraryCollapsed: boolean;
+}
+
+function SidebarProjectRow({
+  label,
+  count,
+  active = false,
+  collapsed = false,
+  disabled = false,
+  icon,
+  wrapperClassName,
+  onClick,
+  onMiddleClick,
+  trailing,
+}: SidebarProjectRowProps) {
+  return (
+    <div
+      className={`sb-project-row ${active ? "sb-project-row-active" : ""}${disabled ? " sb-project-row-disabled" : ""}${wrapperClassName ? ` ${wrapperClassName}` : ""}`}
+    >
+      <button
+        type="button"
+        className="sb-project"
+        disabled={disabled}
+        onClick={onClick}
+        onMouseDown={(event) => {
+          if (event.button === 1 && onMiddleClick) {
+            event.preventDefault();
+          }
+        }}
+        onAuxClick={(event) => {
+          if (event.button === 1 && onMiddleClick) {
+            event.preventDefault();
+            onMiddleClick();
+          }
+        }}
+      >
+        {collapsed ? (
+          <ChevronRight size={12} style={{ flexShrink: 0, opacity: 0.4 }} />
+        ) : (
+          <ChevronDown size={12} style={{ flexShrink: 0, opacity: 0.4 }} />
+        )}
+        {icon}
+        <span className="sb-project-name">{label}</span>
+      </button>
+      <div className="sb-project-row-meta">
+        {typeof count === "number" && count > 0 ? (
+          <span className="sb-project-count">{count}</span>
+        ) : (
+          <span className="sb-project-count-placeholder" aria-hidden="true" />
+        )}
+      </div>
+      <div className="sb-project-row-action">
+        {trailing ?? <span className="sb-project-row-action-placeholder" aria-hidden="true" />}
+      </div>
+    </div>
+  );
+}
+
+function SidebarConversationRow({
+  label,
+  timeLabel,
+  active = false,
+  disabled = false,
+  animationDelayMs,
+  opacity,
+  className,
+  onClick,
+  onMiddleClick,
+  trailingAction,
+}: SidebarConversationRowProps) {
+  return (
+    <div
+      className={`sb-thread sb-thread-animate ${active ? "sb-thread-active" : ""}${disabled ? " sb-thread-disabled" : ""}${className ? ` ${className}` : ""}`}
+      style={{
+        animationDelay: `${animationDelayMs}ms`,
+        ...(opacity === undefined ? {} : { opacity }),
+      }}
+    >
+      <button
+        type="button"
+        className="sb-thread-trigger"
+        disabled={disabled}
+        onClick={onClick}
+        onMouseDown={(event) => {
+          if (event.button === 1 && onMiddleClick) {
+            event.preventDefault();
+          }
+        }}
+        onAuxClick={(event) => {
+          if (event.button === 1 && onMiddleClick) {
+            event.preventDefault();
+            onMiddleClick();
+          }
+        }}
+      >
+        <span className="sb-thread-title">{label}</span>
+      </button>
+      <span className={`sb-thread-time-slot${timeLabel ? "" : " sb-thread-time-slot-empty"}`}>
+        {timeLabel ?? ""}
+      </span>
+      <div className="sb-thread-action-slot">
+        {trailingAction ? (
+          <button
+            type="button"
+            aria-label={trailingAction.title}
+            title={trailingAction.title}
+            className="sb-thread-archive"
+            disabled={disabled}
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              trailingAction.onClick();
+            }}
+          >
+            {trailingAction.icon}
+          </button>
+        ) : (
+          <span className="sb-thread-action-placeholder" aria-hidden="true" />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SidebarSectionHeader({
+  label,
+  count,
+  expanded,
+  controlsId,
+  toggleTitle,
+  onToggle,
+  action,
+}: SidebarSectionHeaderProps) {
+  return (
+    <div className="sb-section-label">
+      <button
+        type="button"
+        className="sb-section-toggle"
+        aria-expanded={expanded}
+        aria-controls={controlsId}
+        onClick={onToggle}
+        title={toggleTitle}
+      >
+        {expanded ? (
+          <ChevronDown size={11} style={{ flexShrink: 0, opacity: 0.6 }} />
+        ) : (
+          <ChevronRight size={11} style={{ flexShrink: 0, opacity: 0.6 }} />
+        )}
+        <span>{label}</span>
+      </button>
+      <div className="sb-section-meta">
+        <span className="sb-project-count">{count}</span>
+      </div>
+      <div className="sb-section-action">
+        {action ?? <span className="sb-section-action-placeholder" aria-hidden="true" />}
+      </div>
+    </div>
+  );
+}
 
 function readLegacyDefaultScanDepth(): number | undefined {
   const stored = window.localStorage.getItem(LEGACY_SCAN_DEPTH_STORAGE_KEY);
@@ -70,17 +307,47 @@ function readLegacyDefaultScanDepth(): number | undefined {
   return parsed;
 }
 
-/* ─────────────────────────────────────────────────────
-   Sidebar content — shared between pinned and flyout
-   ───────────────────────────────────────────────────── */
+function readSidebarSectionState(): SidebarSectionState {
+  try {
+    const raw = window.localStorage.getItem(SIDEBAR_SECTION_STATE_STORAGE_KEY);
+    if (!raw) {
+      return {
+        openProjectsCollapsed: false,
+        projectLibraryCollapsed: false,
+      };
+    }
 
-function SidebarContent({ onPin }: { onPin?: () => void }) {
-  const { t, i18n } = useTranslation(["app", "common"]);
+    const parsed = JSON.parse(raw) as Partial<SidebarSectionState> | null;
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("invalid sidebar section state");
+    }
+
+    return {
+      openProjectsCollapsed: parsed.openProjectsCollapsed === true,
+      projectLibraryCollapsed: parsed.projectLibraryCollapsed === true,
+    };
+  } catch {
+    return {
+      openProjectsCollapsed: false,
+      projectLibraryCollapsed: false,
+    };
+  }
+}
+
+function writeSidebarSectionState(state: SidebarSectionState): void {
+  try {
+    window.localStorage.setItem(SIDEBAR_SECTION_STATE_STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    // Ignore persistence failures.
+  }
+}
+
+function SidebarContent() {
+  const { t, i18n } = useTranslation(["app", "common", "chat"]);
   const {
     workspaces,
     archivedWorkspaces,
     activeWorkspaceId,
-    setActiveWorkspace,
     setActiveRepo,
     openWorkspace,
     removeWorkspace,
@@ -97,11 +364,10 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     restoreThread,
     createThread,
     refreshArchivedThreads,
+    attachCodexRemoteThread,
   } = useThreadStore();
   const openOnboarding = useOnboardingStore((state) => state.openOnboarding);
   const selectedChatEngines = useOnboardingStore((state) => state.selectedChatEngines);
-  const sidebarPinned = useUiStore((state) => state.sidebarPinned);
-  const toggleSidebarPin = useUiStore((state) => state.toggleSidebarPin);
   const activeView = useUiStore((state) => state.activeView);
   const setActiveView = useUiStore((state) => state.setActiveView);
   const openWorkspaceSettings = useUiStore((state) => state.openWorkspaceSettings);
@@ -113,6 +379,8 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   const keepAwakeLoading = useKeepAwakeStore((s) => s.loading);
   const toggleKeepAwake = useKeepAwakeStore((s) => s.toggle);
   const openPowerSettings = useKeepAwakeStore((s) => s.openPowerSettings);
+  const openAppearanceSettings = useAppearanceStore((s) => s.openModal);
+  const openShortcutSettings = useShortcutStore((s) => s.openModal);
   const terminalNotificationSettings = useTerminalNotificationSettingsStore((s) => s.settings);
   const terminalNotificationLoading = useTerminalNotificationSettingsStore((s) => s.loading);
   const terminalNotificationLoadedOnce = useTerminalNotificationSettingsStore((s) => s.loadedOnce);
@@ -120,6 +388,16 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   const terminalNotificationUpdatingTerminalEnabled = useTerminalNotificationSettingsStore((s) => s.updatingTerminalEnabled);
   const toggleTerminalNotifications = useTerminalNotificationSettingsStore((s) => s.toggle);
   const openTerminalNotificationSettings = useTerminalNotificationSettingsStore((s) => s.openModal);
+  const detectedCodexProjects = useCodexProfileStore((s) => s.detectedProjects);
+  const refreshDetectedCodexProjects = useCodexProfileStore((s) => s.refreshDetectedProjects);
+  const ensureActiveCodexProfile = useCodexProfileStore((s) => s.ensureActiveProfile);
+  const openCodexProfilesModal = useCodexProfileStore((s) => s.openModal);
+  const openWorkspaceIds = useProjectTabsStore((s) => s.openWorkspaceIds);
+  const tabThreadIdsByWorkspace = useProjectTabsStore((s) => s.tabThreadIdsByWorkspace);
+  const switchToWorkspaceTabs = useProjectTabsStore((s) => s.switchToWorkspace);
+  const switchToThreadTabs = useProjectTabsStore((s) => s.switchToThread);
+  const closeProjectWorkspace = useProjectTabsStore((s) => s.closeWorkspace);
+  const closeProjectThreadTab = useProjectTabsStore((s) => s.closeThreadTab);
   const hasUpdate = updateStatus === "available" && !updateSnoozed;
   const keepAwakeAvailable = canToggleKeepAwake(keepAwakeState);
   const preferredOnboardingChatSelection = useMemo(
@@ -127,7 +405,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     [engines, selectedChatEngines],
   );
 
-  const projects = useMemo<ProjectGroup[]>(
+  const workspaceProjects = useMemo<ProjectGroup[]>(
     () =>
       workspaces.map((ws) => ({
         workspace: ws,
@@ -135,9 +413,94 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
       })),
     [workspaces, threads],
   );
+  const detectedCodexProjectsByWorkspaceId = useMemo(
+    () =>
+      detectedCodexProjects.reduce<Record<string, CodexDetectedProject>>((acc, project) => {
+        if (project.workspaceId) {
+          acc[project.workspaceId] = project;
+        }
+        return acc;
+      }, {}),
+    [detectedCodexProjects],
+  );
+  const projectEntries = useMemo<UnifiedProjectGroup[]>(() => {
+    const importedProjects = workspaceProjects.map((project) => {
+      const detectedCodexProject =
+        detectedCodexProjectsByWorkspaceId[project.workspace.id] ?? null;
+      const attachedEngineThreadIds = new Set(
+        project.threads
+          .map((thread) => thread.engineThreadId)
+          .filter((engineThreadId): engineThreadId is string => Boolean(engineThreadId)),
+      );
+      const detectedConversations = (detectedCodexProject?.threads ?? [])
+        .filter((thread) => !attachedEngineThreadIds.has(thread.engineThreadId))
+        .map<SidebarConversation>((thread) => ({
+          kind: "detected",
+          key: `detected:${thread.profileId}:${thread.engineThreadId}`,
+          updatedAt: thread.updatedAt,
+          detectedThread: thread,
+        }));
+      const localConversations = project.threads.map<SidebarConversation>((thread) => ({
+        kind: "local",
+        key: `local:${thread.id}`,
+        updatedAt: thread.lastActivityAt,
+        localThread: thread,
+      }));
+      const conversations = [...localConversations, ...detectedConversations].sort(
+        (left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime(),
+      );
+
+      return {
+        key: project.workspace.id,
+        path: project.workspace.rootPath,
+        name: getWorkspaceLabel(project.workspace),
+        workspace: project.workspace,
+        detectedCodexProject,
+        conversations,
+        totalConversationCount: conversations.length,
+        latestActivityAt:
+          conversations[0]?.updatedAt ??
+          detectedCodexProject?.lastActivityAt ??
+          project.workspace.lastOpenedAt,
+      };
+    });
+
+    const externalProjects = detectedCodexProjects
+      .filter((project) => !project.workspaceId)
+      .map<UnifiedProjectGroup>((project) => ({
+        key: `detected:${project.path}`,
+        path: project.path,
+        name: project.name,
+        workspace: null,
+        detectedCodexProject: project,
+        conversations: project.threads
+          .map<SidebarConversation>((thread) => ({
+            kind: "detected",
+            key: `detected:${thread.profileId}:${thread.engineThreadId}`,
+            updatedAt: thread.updatedAt,
+            detectedThread: thread,
+          }))
+          .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()),
+        totalConversationCount: project.threads.length,
+        latestActivityAt: project.lastActivityAt,
+      }));
+
+    return [...importedProjects, ...externalProjects].sort((left, right) => {
+      const timeDiff =
+        new Date(right.latestActivityAt).getTime() - new Date(left.latestActivityAt).getTime();
+      if (timeDiff !== 0) {
+        return timeDiff;
+      }
+      return left.name.localeCompare(right.name, undefined, { sensitivity: "base" });
+    });
+  }, [detectedCodexProjects, detectedCodexProjectsByWorkspaceId, threads, workspaceProjects]);
 
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [showAll, setShowAll] = useState<Record<string, boolean>>({});
+  const [sidebarSections, setSidebarSections] = useState<SidebarSectionState>(() =>
+    readSidebarSectionState(),
+  );
+  const [pendingActionKeys, setPendingActionKeys] = useState<Record<string, true>>({});
   const [archivedOpen, setArchivedOpen] = useState(false);
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
   const [archiveWorkspacePrompt, setArchiveWorkspacePrompt] = useState<{
@@ -149,11 +512,53 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
   const [settingsMenuPos, setSettingsMenuPos] = useState({ top: 0, left: 0 });
   const [terminalAcceleratedRendering, setTerminalAcceleratedRendering] = useState(true);
+  const pendingActionKeysRef = useRef<Set<string>>(new Set());
   const settingsMenuRef = useRef<HTMLDivElement>(null);
   const settingsTriggerRef = useRef<HTMLButtonElement>(null);
   const activeLocale = normalizeAppLocale(i18n.language);
 
   const closeSettingsMenu = useCallback(() => setSettingsMenuOpen(false), []);
+  const isSidebarActionPending = useCallback(
+    (actionKey: string) => pendingActionKeys[actionKey] === true,
+    [pendingActionKeys],
+  );
+  const runWithSidebarActionLock = useCallback(
+    async <T,>(actionKey: string, action: () => Promise<T>): Promise<T | undefined> => {
+      if (pendingActionKeysRef.current.has(actionKey)) {
+        return undefined;
+      }
+
+      pendingActionKeysRef.current.add(actionKey);
+      setPendingActionKeys((prev) => {
+        if (prev[actionKey]) {
+          return prev;
+        }
+        return {
+          ...prev,
+          [actionKey]: true,
+        };
+      });
+
+      try {
+        return await action();
+      } finally {
+        pendingActionKeysRef.current.delete(actionKey);
+        setPendingActionKeys((prev) => {
+          if (!prev[actionKey]) {
+            return prev;
+          }
+          const next = { ...prev };
+          delete next[actionKey];
+          return next;
+        });
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    writeSidebarSectionState(sidebarSections);
+  }, [sidebarSections]);
 
   useEffect(() => {
     if (!settingsMenuOpen) return;
@@ -204,9 +609,55 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
         : [],
     [archivedThreadsByWorkspace, activeWorkspaceId],
   );
+  const openProjectEntries = useMemo(
+    () =>
+      openWorkspaceIds
+        .map((workspaceId) =>
+          projectEntries.find((project) => project.workspace?.id === workspaceId) ?? null,
+        )
+        .filter((project): project is UnifiedProjectGroup => project !== null),
+    [openWorkspaceIds, projectEntries],
+  );
+  const projectLibraryEntries = useMemo(
+    () =>
+      projectEntries.filter((project) => {
+        const workspaceId = project.workspace?.id;
+        return !workspaceId || !openWorkspaceIds.includes(workspaceId);
+      }),
+    [openWorkspaceIds, projectEntries],
+  );
+  const openProjectsCollapsed = sidebarSections.openProjectsCollapsed;
+  const projectLibraryCollapsed = sidebarSections.projectLibraryCollapsed;
+  const openProjectsSectionId = "sidebar-open-projects";
+  const projectLibrarySectionId = "sidebar-project-library";
 
-  const toggleCollapse = (wsId: string) =>
-    setCollapsed((prev) => ({ ...prev, [wsId]: !prev[wsId] }));
+  const toggleCollapse = (projectKey: string) =>
+    setCollapsed((prev) => ({ ...prev, [projectKey]: !prev[projectKey] }));
+  const toggleOpenProjectsCollapsed = () =>
+    setSidebarSections((prev) => ({
+      ...prev,
+      openProjectsCollapsed: !prev.openProjectsCollapsed,
+    }));
+  const toggleProjectLibraryCollapsed = () =>
+    setSidebarSections((prev) => ({
+      ...prev,
+      projectLibraryCollapsed: !prev.projectLibraryCollapsed,
+    }));
+
+  function getProjectOpenActionKey(project: UnifiedProjectGroup) {
+    return `sidebar:open-project:${project.key}`;
+  }
+
+  function getCreateThreadActionKey(workspaceId: string) {
+    return `sidebar:create-thread:${workspaceId}`;
+  }
+
+  function getDetectedConversationActionKey(
+    project: UnifiedProjectGroup,
+    detectedThread: CodexDetectedProject["threads"][number],
+  ) {
+    return `sidebar:attach-thread:${project.key}:${detectedThread.profileId}:${detectedThread.engineThreadId}`;
+  }
 
   useEffect(() => {
     void refreshArchivedWorkspaces();
@@ -224,42 +675,78 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   }
 
   async function onSelectThread(thread: Thread) {
-    if (activeView !== "chat") setActiveView("chat");
-    if (thread.workspaceId !== activeWorkspaceId) {
-      await setActiveWorkspace(thread.workspaceId);
-    }
-    if (thread.repoId) {
-      setActiveRepo(thread.repoId);
-    } else {
-      setActiveRepo(null, { remember: false });
-    }
-    setActiveThread(thread.id);
-    await bindChatThread(thread.id);
+    await switchToThreadTabs(thread);
   }
 
-  async function onSelectProject(wsId: string) {
-    if (activeView !== "chat") setActiveView("chat");
-    setCollapsed(
-      Object.fromEntries(projects.map((p) => [p.workspace.id, p.workspace.id !== wsId]))
-    );
-    await setActiveWorkspace(wsId);
+  async function ensureWorkspaceForProject(
+    project: UnifiedProjectGroup,
+  ): Promise<Workspace | null> {
+    if (project.workspace) {
+      return project.workspace;
+    }
+
+    const workspace = await openWorkspace(project.path, readLegacyDefaultScanDepth());
+    if (!workspace) {
+      return null;
+    }
+
+    await refreshDetectedCodexProjects();
+    return workspace;
+  }
+
+  async function onSelectProject(project: UnifiedProjectGroup) {
+    const localWorkspace = project.workspace;
+    if (localWorkspace && localWorkspace.id === activeWorkspaceId) {
+      setCollapsed((prev) => ({ ...prev, [localWorkspace.id]: !prev[localWorkspace.id] }));
+      return;
+    }
+
+    await runWithSidebarActionLock(getProjectOpenActionKey(project), async () => {
+      if (activeView !== "chat") setActiveView("chat");
+
+      const workspace = await ensureWorkspaceForProject(project);
+      if (!workspace) {
+        return;
+      }
+
+      setCollapsed(
+        Object.fromEntries(
+          projectEntries.map((entry) => [
+            entry.workspace?.id ?? entry.key,
+            (entry.workspace?.id ?? entry.key) !== workspace.id,
+          ]),
+        ),
+      );
+      await switchToWorkspaceTabs(workspace.id);
+    });
   }
 
   async function onCreateProjectThread(project: Workspace) {
-    if (project.id !== activeWorkspaceId) {
-      await setActiveWorkspace(project.id);
-    }
-    setActiveRepo(null, { remember: false });
-    const createdThreadId = await createThread({
-      workspaceId: project.id,
-      repoId: null,
-      engineId: preferredOnboardingChatSelection?.engineId,
-      modelId: preferredOnboardingChatSelection?.modelId,
-      title: t("app:sidebar.newThreadTitle"),
+    await runWithSidebarActionLock(getCreateThreadActionKey(project.id), async () => {
+      if (project.id !== activeWorkspaceId) {
+        await switchToWorkspaceTabs(project.id);
+      }
+      setActiveRepo(null, { remember: false });
+      const createdThreadId = await createThread({
+        workspaceId: project.id,
+        repoId: null,
+        engineId: preferredOnboardingChatSelection?.engineId,
+        modelId: preferredOnboardingChatSelection?.modelId,
+        title: t("app:sidebar.newThreadTitle"),
+      });
+      if (!createdThreadId) return;
+      setCollapsed((prev) => ({ ...prev, [project.id]: false }));
+      const createdThread =
+        useThreadStore
+          .getState()
+          .threads.find((thread) => thread.id === createdThreadId && thread.workspaceId === project.id)
+          ?? null;
+      if (createdThread) {
+        await switchToThreadTabs(createdThread);
+        return;
+      }
+      await bindChatThread(createdThreadId);
     });
-    if (!createdThreadId) return;
-    setCollapsed((prev) => ({ ...prev, [project.id]: false }));
-    await bindChatThread(createdThreadId);
   }
 
   function onDeleteWorkspace(project: Workspace) {
@@ -330,6 +817,67 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     return thread.title?.trim() || t("app:sidebar.untitledThread");
   }
 
+  const preferredCodexModelId = useMemo(() => {
+    if (
+      preferredOnboardingChatSelection?.engineId === "codex" &&
+      preferredOnboardingChatSelection.modelId
+    ) {
+      return preferredOnboardingChatSelection.modelId;
+    }
+
+    const codexEngine = engines.find((engine) => engine.id === "codex");
+    return (
+      codexEngine?.models.find((model) => model.isDefault && !model.hidden)?.id ??
+      codexEngine?.models.find((model) => !model.hidden)?.id ??
+      DEFAULT_CODEX_MODEL
+    );
+  }, [engines, preferredOnboardingChatSelection]);
+
+  async function onSelectDetectedConversation(
+    project: UnifiedProjectGroup,
+    detectedThread: CodexDetectedProject["threads"][number],
+  ) {
+    try {
+      await runWithSidebarActionLock(
+        getDetectedConversationActionKey(project, detectedThread),
+        async () => {
+          await ensureActiveCodexProfile(detectedThread.profileId);
+
+          const workspace = await ensureWorkspaceForProject(project);
+          if (!workspace) {
+            return;
+          }
+
+          const existingThread = threads.find(
+            (thread) =>
+              thread.workspaceId === workspace.id &&
+              thread.engineId === "codex" &&
+              thread.engineThreadId === detectedThread.engineThreadId,
+          );
+          if (existingThread) {
+            await onSelectThread(existingThread);
+            return;
+          }
+
+          const attachedThread = await attachCodexRemoteThread(
+            workspace.id,
+            detectedThread.engineThreadId,
+            preferredCodexModelId,
+          );
+          if (!attachedThread) {
+            throw new Error("Failed to resume Codex CLI conversation.");
+          }
+
+          setCollapsed((prev) => ({ ...prev, [workspace.id]: false }));
+          await switchToThreadTabs(attachedThread);
+          await refreshDetectedCodexProjects();
+        },
+      );
+    } catch (error) {
+      toast.error(String(error));
+    }
+  }
+
   const keepAwakeDescription = useMemo(() => {
     if (!keepAwakeState) {
       return t("app:sidebar.keepAwakeDescription");
@@ -389,52 +937,21 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     >
       {/* ── Header — drag region + actions ── */}
       <div
+        className="sb-header"
         onMouseDown={handleDragMouseDown}
-        onDoubleClick={handleDragDoubleClick}
-        style={{
-          padding: "42px 12px 10px",
-          borderBottom: "1px solid var(--border)",
-          flexShrink: 0,
-        }}
       >
-        <div className="no-drag" style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          {/* Top row: Pin button */}
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              marginBottom: 2,
-            }}
-          >
-            <span
-              style={{
-                fontSize: 11,
-                fontWeight: 600,
-                letterSpacing: "0.06em",
-                textTransform: "uppercase",
-                color: "var(--text-3)",
-              }}
-            >
-              Panes
-            </span>
-            <button
-              type="button"
-              className={`sb-pin-btn ${sidebarPinned ? "sb-pin-btn-active" : ""}`}
-              onClick={onPin ?? toggleSidebarPin}
-              title={sidebarPinned ? t("app:sidebar.unpin") : t("app:sidebar.pin")}
-            >
-              {sidebarPinned ? <Pin size={13} /> : <PinOff size={13} />}
-            </button>
-          </div>
-
+        <div className="sb-header-main no-drag">
           {/* New thread */}
           <button
             type="button"
             className="sb-new-thread-btn"
             style={{ margin: 0 }}
+            disabled={
+              !activeWorkspaceId ||
+              isSidebarActionPending(getCreateThreadActionKey(activeWorkspaceId))
+            }
             onClick={() => {
-              const activeProject = projects.find(
+              const activeProject = workspaceProjects.find(
                 (p) => p.workspace.id === activeWorkspaceId,
               );
               if (activeProject) {
@@ -460,135 +977,326 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
       </div>
 
       {/* ── Scrollable content ── */}
-      <div style={{ flex: 1, overflow: "auto", paddingBottom: 4 }}>
-        <div className="sb-section-label">
-          <span>{t("app:sidebar.projects")}</span>
-          <button
-            type="button"
-            className="sb-add-project-btn"
-            title={t("app:sidebar.openProject")}
-            onClick={() => {
-              if (activeView !== "chat") setActiveView("chat");
-              void onOpenFolder();
-            }}
-          >
-            <Plus size={12} strokeWidth={2.2} />
-          </button>
-        </div>
+      <div className="sb-scroll">
+        {openProjectEntries.length > 0 && (
+          <>
+            <SidebarSectionHeader
+              label={t("app:sidebar.openProjects")}
+              count={openProjectEntries.length}
+              expanded={!openProjectsCollapsed}
+              controlsId={openProjectsSectionId}
+              onToggle={toggleOpenProjectsCollapsed}
+              toggleTitle={
+                openProjectsCollapsed
+                  ? t("app:sidebar.showOpenProjects")
+                  : t("app:sidebar.hideOpenProjects")
+              }
+            />
+            {!openProjectsCollapsed && (
+              <div id={openProjectsSectionId} className="sb-open-projects-list">
+                {openProjectEntries.map((project) => {
+                  const workspace = project.workspace;
+                  if (!workspace) {
+                    return null;
+                  }
+                  const isActive = workspace.id === activeWorkspaceId;
+                  const isCollapsed = collapsed[workspace.id] ?? false;
+                  const openThreadIds = new Set(tabThreadIdsByWorkspace[workspace.id] ?? []);
+                  return (
+                    <div key={workspace.id} className="sb-open-project-entry">
+                      <SidebarProjectRow
+                        label={getWorkspaceLabel(workspace)}
+                        count={project.totalConversationCount}
+                        active={isActive}
+                        collapsed={isCollapsed}
+                        icon={
+                          <FolderGit2
+                            size={14}
+                            style={{
+                              flexShrink: 0,
+                              color: isActive ? "var(--accent)" : "var(--text-3)",
+                            }}
+                          />
+                        }
+                        onClick={() => {
+                          if (isActive) {
+                            toggleCollapse(workspace.id);
+                            return;
+                          }
+                          setCollapsed((prev) => ({ ...prev, [workspace.id]: false }));
+                          void switchToWorkspaceTabs(workspace.id);
+                        }}
+                        onMiddleClick={() => {
+                          void closeProjectWorkspace(workspace.id);
+                        }}
+                        trailing={
+                          <button
+                            type="button"
+                            className="sb-project-archive"
+                            title={t("app:sidebar.closeOpenProject")}
+                            aria-label={t("app:sidebar.closeOpenProject")}
+                            onMouseDown={(event) => event.stopPropagation()}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void closeProjectWorkspace(workspace.id);
+                            }}
+                          >
+                            <X size={11} />
+                          </button>
+                        }
+                      />
 
-        {projects.length === 0 ? (
+                      {!isCollapsed && project.conversations.length > 0 && (
+                        <div className="sb-open-project-tabs">
+                          {project.conversations.map((conversation) => {
+                            const localThread =
+                              conversation.kind === "local" ? conversation.localThread : null;
+                            const detectedThread =
+                              conversation.kind === "detected"
+                                ? conversation.detectedThread
+                                : null;
+                            const isOpenTab = Boolean(localThread && openThreadIds.has(localThread.id));
+
+                            return (
+                              <SidebarConversationRow
+                                key={conversation.key}
+                                label={
+                                  localThread
+                                    ? getThreadLabel(localThread)
+                                    : (detectedThread?.title ?? "")
+                                }
+                                timeLabel={
+                                  localThread
+                                    ? (
+                                        localThread.lastActivityAt
+                                          ? formatRelativeTime(localThread.lastActivityAt, i18n.language)
+                                          : ""
+                                      )
+                                    : (detectedThread
+                                        ? formatRelativeTime(detectedThread.updatedAt, i18n.language)
+                                        : "")
+                                }
+                                active={Boolean(localThread && localThread.id === activeThreadId)}
+                                animationDelayMs={0}
+                                className="sb-open-project-tab-row"
+                                onClick={() => {
+                                  if (localThread) {
+                                    void switchToThreadTabs(localThread);
+                                    return;
+                                  }
+                                  if (detectedThread) {
+                                    void onSelectDetectedConversation(project, detectedThread);
+                                  }
+                                }}
+                                onMiddleClick={
+                                  isOpenTab && localThread
+                                    ? () => {
+                                        void closeProjectThreadTab(workspace.id, localThread.id);
+                                      }
+                                    : undefined
+                                }
+                                trailingAction={
+                                  isOpenTab && localThread
+                                    ? {
+                                        title: t("chat:panel.projectTabs.closeTab"),
+                                        icon: <X size={11} />,
+                                        onClick: () => {
+                                          void closeProjectThreadTab(workspace.id, localThread.id);
+                                        },
+                                      }
+                                    : undefined
+                                }
+                              />
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </>
+        )}
+
+        <SidebarSectionHeader
+          label={t("app:sidebar.projects")}
+          count={projectLibraryEntries.length}
+          expanded={!projectLibraryCollapsed}
+          controlsId={projectLibrarySectionId}
+          onToggle={toggleProjectLibraryCollapsed}
+          toggleTitle={
+            projectLibraryCollapsed
+              ? t("app:sidebar.showProjectLibrary")
+              : t("app:sidebar.hideProjectLibrary")
+          }
+          action={(
+            <button
+              type="button"
+              className="sb-add-project-btn"
+              title={t("app:sidebar.openProject")}
+              onClick={() => {
+                if (activeView !== "chat") setActiveView("chat");
+                void onOpenFolder();
+              }}
+            >
+              <Plus size={12} strokeWidth={2.2} />
+            </button>
+          )}
+        />
+
+        {projectLibraryCollapsed ? null : projectLibraryEntries.length === 0 ? (
           <div className="sb-empty">
             {t("app:sidebar.noProjects")}
             <br />
             {t("app:sidebar.openFolder")}
           </div>
         ) : (
-          projects.map((project) => {
-            const isActiveProject = project.workspace.id === activeWorkspaceId;
-            const isCollapsed = collapsed[project.workspace.id] ?? false;
-            const projectName = getWorkspaceLabel(project.workspace);
-            const isShowingAll = showAll[project.workspace.id] ?? false;
-            const visibleThreads = isShowingAll
-              ? project.threads
-              : project.threads.slice(0, MAX_VISIBLE_THREADS);
-            const hasMore = project.threads.length > MAX_VISIBLE_THREADS;
+          <div id={projectLibrarySectionId} className="sb-project-library">
+            {projectLibraryEntries.map((project) => {
+            const workspace = project.workspace;
+            const isActiveProject =
+              !!workspace && workspace.id === activeWorkspaceId;
+            const isCollapsed = collapsed[project.key] ?? false;
+            const isShowingAll = showAll[project.key] ?? false;
+            const projectOpenActionPending = isSidebarActionPending(
+              getProjectOpenActionKey(project),
+            );
+            const visibleConversations = isShowingAll
+              ? project.conversations
+              : project.conversations.slice(0, MAX_VISIBLE_THREADS);
+            const hasMore = project.conversations.length > MAX_VISIBLE_THREADS;
 
             return (
-              <div key={project.workspace.id} style={{ marginBottom: 2 }}>
+              <div key={project.key} style={{ marginBottom: 2 }}>
                 {/* Project header */}
-                <button
-                  type="button"
-                  className={`sb-project ${isActiveProject ? "sb-project-active" : ""}`}
+                <SidebarProjectRow
+                  label={project.name}
+                  count={project.totalConversationCount}
+                  active={isActiveProject}
+                  collapsed={isCollapsed}
+                  disabled={projectOpenActionPending}
+                  icon={
+                    <FolderGit2
+                      size={14}
+                      style={{
+                        flexShrink: 0,
+                        color: isActiveProject ? "var(--accent)" : "var(--text-3)",
+                      }}
+                    />
+                  }
                   onClick={() => {
+                    if (!workspace) {
+                      void onSelectProject(project);
+                      return;
+                    }
+
                     if (isActiveProject) {
-                      toggleCollapse(project.workspace.id);
+                      toggleCollapse(project.key);
                     } else {
-                      void onSelectProject(project.workspace.id);
+                      void onSelectProject(project);
                     }
                   }}
-                >
-                  {isCollapsed ? (
-                    <ChevronRight size={12} style={{ flexShrink: 0, opacity: 0.4 }} />
-                  ) : (
-                    <ChevronDown size={12} style={{ flexShrink: 0, opacity: 0.4 }} />
-                  )}
-                  <FolderGit2
-                    size={14}
-                    style={{
-                      flexShrink: 0,
-                      color: isActiveProject ? "var(--accent)" : "var(--text-3)",
-                    }}
-                  />
-                  <span className="sb-project-name">{projectName}</span>
-
-                  {project.threads.length > 0 && (
-                    <span className="sb-project-count">
-                      {project.threads.length}
-                    </span>
-                  )}
-
-                  <WorkspaceMoreMenu
-                    workspace={project.workspace}
-                    onOpenSettings={() => openWorkspaceSettings(project.workspace.id)}
-                    onArchive={() => onDeleteWorkspace(project.workspace)}
-                  />
-                </button>
+                  trailing={
+                    workspace ? (
+                      <WorkspaceMoreMenu
+                        workspace={workspace}
+                        onOpenSettings={() => openWorkspaceSettings(workspace.id)}
+                        onArchive={() => onDeleteWorkspace(workspace)}
+                      />
+                    ) : undefined
+                  }
+                />
 
                 {/* Threads */}
                 {!isCollapsed && (
-                  <div style={{ display: "flex", flexDirection: "column", gap: 1, marginTop: 1 }}>
-                    {project.threads.length === 0 ? (
+                  <div className="sb-project-thread-list">
+                    {project.conversations.length === 0 ? (
                       <div className="sb-no-threads">{t("app:sidebar.noThreads")}</div>
                     ) : (
                       <>
-                        {visibleThreads.map((thread, i) => {
-                          const isActive = thread.id === activeThreadId;
+                        {visibleConversations.map((conversation, i) => {
+                          const isLocalConversation = conversation.kind === "local";
+                          const localThread =
+                            conversation.kind === "local" ? conversation.localThread : null;
+                          const detectedThread =
+                            conversation.kind === "detected"
+                              ? conversation.detectedThread
+                              : null;
+                          const detectedConversationActionPending =
+                            detectedThread
+                              ? isSidebarActionPending(
+                                  getDetectedConversationActionKey(project, detectedThread),
+                                )
+                              : false;
                           return (
-                            <button
-                              key={thread.id}
-                              type="button"
-                              className={`sb-thread sb-thread-animate ${isActive ? "sb-thread-active" : ""}`}
-                              style={{ animationDelay: `${i * 20}ms` }}
-                              onClick={() => void onSelectThread(thread)}
-                            >
-                              <span className="sb-thread-title">
-                                {getThreadLabel(thread)}
-                              </span>
-                              <span className="sb-thread-time">
-                                {thread.lastActivityAt
-                                  ? formatRelativeTime(thread.lastActivityAt, i18n.language)
-                                  : ""}
-                              </span>
-                              <span
-                                role="button"
-                                title={t("app:sidebar.archiveThread")}
-                                className="sb-thread-archive"
-                                onMouseDown={(e) => e.stopPropagation()}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  void onDeleteThread(thread);
-                                }}
-                              >
-                                <Archive size={11} />
-                              </span>
-                            </button>
+                            <SidebarConversationRow
+                              key={conversation.key}
+                              label={
+                                localThread
+                                  ? getThreadLabel(localThread)
+                                  : (detectedThread?.title ?? "")
+                              }
+                              timeLabel={
+                                localThread
+                                  ? (
+                                      localThread.lastActivityAt
+                                        ? formatRelativeTime(localThread.lastActivityAt, i18n.language)
+                                        : ""
+                                    )
+                                  : (detectedThread
+                                      ? formatRelativeTime(detectedThread.updatedAt, i18n.language)
+                                      : "")
+                              }
+                              active={Boolean(localThread && localThread.id === activeThreadId)}
+                              animationDelayMs={i * 20}
+                              className="sb-library-thread-row"
+                              opacity={
+                                isLocalConversation
+                                  ? undefined
+                                  : (detectedThread?.archived ? 0.58 : 1)
+                              }
+                              disabled={detectedConversationActionPending}
+                              onClick={() => {
+                                if (localThread) {
+                                  void onSelectThread(localThread);
+                                  return;
+                                }
+                                if (detectedThread) {
+                                  void onSelectDetectedConversation(project, detectedThread);
+                                }
+                              }}
+                              trailingAction={
+                                localThread
+                                  ? {
+                                      title: t("app:sidebar.archiveThread"),
+                                      icon: <Archive size={11} />,
+                                      onClick: () => {
+                                        void onDeleteThread(localThread);
+                                      },
+                                    }
+                                  : undefined
+                              }
+                            />
                           );
                         })}
 
-                        {hasMore && !isShowingAll && (
+                        {hasMore && (
                           <button
                             type="button"
                             className="sb-show-more"
                             onClick={() =>
                               setShowAll((prev) => ({
                                 ...prev,
-                                [project.workspace.id]: true,
+                                [project.key]: !isShowingAll,
                               }))
                             }
                           >
-                            {t("app:sidebar.showMore", {
-                              count: project.threads.length - MAX_VISIBLE_THREADS,
-                            })}
+                            {isShowingAll
+                              ? t("app:sidebar.showLess")
+                              : t("app:sidebar.showMore", {
+                                  count: project.conversations.length - MAX_VISIBLE_THREADS,
+                                })}
                           </button>
                         )}
                       </>
@@ -597,11 +1305,12 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                 )}
               </div>
             );
-          })
+          })}
+          </div>
         )}
 
         {/* Archived section */}
-        <div style={{ marginTop: 8, borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: 4 }}>
+        <div className="sb-archived-section">
           <button
             type="button"
             className="sb-archived-toggle"
@@ -614,13 +1323,13 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
             )}
             <Archive size={11} style={{ flexShrink: 0, opacity: 0.6 }} />
             <span style={{ flex: 1, textAlign: "left" }}>{t("app:sidebar.archived")}</span>
-            <span className="sb-project-count" style={{ fontSize: 9 }}>
+            <span className="sb-project-count">
               {archivedWorkspaces.length + archivedThreads.length}
             </span>
           </button>
 
           {archivedOpen && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 2, paddingBottom: 4 }}>
+            <div className="sb-archived-list">
               {archivedWorkspaces.map((workspace) => (
                 <div key={workspace.id} className="sb-archived-item">
                   <FolderGit2 size={12} style={{ flexShrink: 0, color: "var(--text-3)" }} />
@@ -836,7 +1545,7 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                 style={{
                   display: "inline-flex",
                   alignItems: "center",
-                  background: "rgba(255,255,255,0.06)",
+                  background: "var(--surface-3)",
                   borderRadius: 6,
                   padding: 2,
                   gap: 2,
@@ -854,8 +1563,8 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                       borderRadius: 4,
                       border: "none",
                       cursor: "pointer",
-                      background: activeLocale === locale ? "var(--accent)" : "transparent",
-                      color: activeLocale === locale ? "#fff" : "var(--text-3)",
+                      background: activeLocale === locale ? "var(--accent-dim)" : "transparent",
+                      color: activeLocale === locale ? "var(--accent)" : "var(--text-3)",
                       fontWeight: activeLocale === locale ? 500 : 400,
                       boxShadow: "none",
                       transition: "background 0.15s, color 0.15s, box-shadow 0.15s",
@@ -866,6 +1575,39 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
                 ))}
               </span>
             </div>
+            <button
+              type="button"
+              className="git-action-menu-item"
+              onClick={() => {
+                closeSettingsMenu();
+                openCodexProfilesModal();
+              }}
+            >
+              <UserCircle size={14} style={{ opacity: 0.5, flexShrink: 0 }} />
+              Codex profiles
+            </button>
+            <button
+              type="button"
+              className="git-action-menu-item"
+              onClick={() => {
+                closeSettingsMenu();
+                openAppearanceSettings();
+              }}
+            >
+              <Monitor size={14} style={{ opacity: 0.5, flexShrink: 0 }} />
+              Appearance
+            </button>
+            <button
+              type="button"
+              className="git-action-menu-item"
+              onClick={() => {
+                closeSettingsMenu();
+                openShortcutSettings();
+              }}
+            >
+              <Keyboard size={14} style={{ opacity: 0.5, flexShrink: 0 }} />
+              {t("app:shortcutSettings.title")}
+            </button>
 
             <div className="git-action-menu-divider" />
             <div
@@ -992,213 +1734,6 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   );
 }
 
-/* ─────────────────────────────────────────────────────
-   Collapsed rail — shown when unpinned
-   ───────────────────────────────────────────────────── */
-
-function CollapsedRail({
-  onHoverStart,
-  onHoverEnd,
-  flyoutVisible,
-}: {
-  onHoverStart: () => void;
-  onHoverEnd: () => void;
-  flyoutVisible?: boolean;
-}) {
-  const { t } = useTranslation("app");
-  const projects = useWorkspaceStore((s) => s.workspaces);
-  const activeWorkspaceId = useWorkspaceStore((s) => s.activeWorkspaceId);
-  const setActiveWorkspace = useWorkspaceStore((s) => s.setActiveWorkspace);
-  const setActiveRepo = useWorkspaceStore((s) => s.setActiveRepo);
-  const createThread = useThreadStore((s) => s.createThread);
-  const bindChatThread = useChatStore((s) => s.setActiveThread);
-  const engines = useEngineStore((s) => s.engines);
-  const selectedChatEngines = useOnboardingStore((s) => s.selectedChatEngines);
-  const hasUpdate = useUpdateStore((s) => s.status === "available" && !s.snoozed);
-  const activeView = useUiStore((s) => s.activeView);
-  const setActiveView = useUiStore((s) => s.setActiveView);
-  const preferredOnboardingChatSelection = useMemo(
-    () => resolvePreferredOnboardingChatSelection(selectedChatEngines, engines),
-    [engines, selectedChatEngines],
-  );
-
-  async function onNewThread() {
-    const activeProject = projects.find((p) => p.id === activeWorkspaceId);
-    if (!activeProject) return;
-    setActiveRepo(null, { remember: false });
-    const createdThreadId = await createThread({
-      workspaceId: activeProject.id,
-      repoId: null,
-      engineId: preferredOnboardingChatSelection?.engineId,
-      modelId: preferredOnboardingChatSelection?.modelId,
-      title: t("sidebar.newThreadTitle"),
-    });
-    if (!createdThreadId) return;
-    await bindChatThread(createdThreadId);
-  }
-
-  return (
-    <div
-      className="sb-rail"
-      onMouseEnter={onHoverStart}
-      onMouseLeave={onHoverEnd}
-      style={{
-        opacity: flyoutVisible ? 0 : 1,
-        transition: "opacity 150ms var(--ease-out)",
-      }}
-    >
-      {/* Drag region + logo — 74px to clear macOS traffic lights */}
-      <div
-        onMouseDown={handleDragMouseDown}
-        onDoubleClick={handleDragDoubleClick}
-        style={{
-          height: 74,
-          width: "100%",
-          flexShrink: 0,
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          justifyContent: "flex-end",
-          paddingBottom: 4,
-        }}
-      >
-        <button
-          type="button"
-          className="sb-rail-btn no-drag"
-          onClick={() => void onNewThread()}
-          disabled={!activeWorkspaceId}
-          title={t("sidebar.newThread")}
-          style={{
-            opacity: activeWorkspaceId ? 1 : 0.45,
-            border: "none",
-            background: "transparent",
-          }}
-        >
-          <svg viewBox="0 0 140 140" fill="none" xmlns="http://www.w3.org/2000/svg" width="24" height="24">
-            <rect x="10" y="36" width="94" height="94" stroke="white" strokeWidth="6"/>
-            <rect x="36" y="10" width="94" height="94" stroke="white" strokeWidth="6"/>
-            <rect x="23" y="23" width="94" height="94" stroke="white" strokeWidth="6"/>
-            <rect x="50" y="50" width="40" height="40" fill="#FF6B6B"/>
-          </svg>
-        </button>
-      </div>
-
-      <div className="sb-rail-divider" />
-
-      {/* Project icons */}
-      <div
-        style={{
-          flex: 1,
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          gap: 2,
-          paddingTop: 4,
-          overflow: "auto",
-        }}
-      >
-        {projects.map((ws) => {
-          const isActive = ws.id === activeWorkspaceId;
-          const name = ws.name || ws.rootPath.split("/").pop() || "P";
-          return (
-            <button
-              key={ws.id}
-              type="button"
-              className={`sb-rail-btn ${isActive ? "sb-rail-btn-active" : ""}`}
-              title={ws.name || ws.rootPath}
-              onClick={() => { if (activeView !== "chat") setActiveView("chat"); void setActiveWorkspace(ws.id); }}
-            >
-              <span
-                style={{
-                  fontSize: 12,
-                  fontWeight: 600,
-                  letterSpacing: "-0.02em",
-                }}
-              >
-                {name.charAt(0).toUpperCase()}
-              </span>
-            </button>
-          );
-        })}
-      </div>
-
-      <div className="sb-rail-divider" />
-
-      {/* Settings at bottom */}
-      <button
-        type="button"
-        className="sb-rail-btn"
-        title={t("sidebar.settings")}
-        style={{ marginBottom: 8 }}
-      >
-        <Settings size={15} />
-        {hasUpdate && <span className="sb-update-dot" />}
-      </button>
-    </div>
-  );
-}
-
-/* ─────────────────────────────────────────────────────
-   Main Sidebar export
-   ───────────────────────────────────────────────────── */
-
 export function Sidebar() {
-  const sidebarPinned = useUiStore((s) => s.sidebarPinned);
-  const toggleSidebarPin = useUiStore((s) => s.toggleSidebarPin);
-  const [hovered, setHovered] = useState(false);
-  const hoverTimeout = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const flyoutRef = useRef<HTMLDivElement>(null);
-
-  // When pinned, render the full sidebar content directly
-  if (sidebarPinned) {
-    return <SidebarContent />;
-  }
-
-  // When unpinned, render rail + hover flyout
-  const handleHoverStart = () => {
-    clearTimeout(hoverTimeout.current);
-    setHovered(true);
-  };
-
-  const handleHoverEnd = () => {
-    hoverTimeout.current = setTimeout(() => setHovered(false), 200);
-  };
-
-  const handleFlyoutEnter = () => {
-    clearTimeout(hoverTimeout.current);
-    setHovered(true);
-  };
-
-  const handleFlyoutLeave = () => {
-    hoverTimeout.current = setTimeout(() => setHovered(false), 150);
-  };
-
-  return (
-    <>
-      <CollapsedRail onHoverStart={handleHoverStart} onHoverEnd={handleHoverEnd} flyoutVisible={hovered} />
-
-      {/* Flyout overlay */}
-      {createPortal(
-        <div
-          className="sb-flyout-wrapper"
-          onMouseEnter={handleFlyoutEnter}
-          onMouseLeave={handleFlyoutLeave}
-          style={{ pointerEvents: hovered ? "auto" : "none" }}
-        >
-          <div
-            ref={flyoutRef}
-            className={`sb-flyout ${hovered ? "sb-flyout-visible" : ""}`}
-          >
-            <SidebarContent
-              onPin={() => {
-                setHovered(false);
-                toggleSidebarPin();
-              }}
-            />
-          </div>
-        </div>,
-        document.body,
-      )}
-    </>
-  );
+  return <SidebarContent />;
 }

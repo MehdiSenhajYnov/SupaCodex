@@ -43,7 +43,7 @@ describe("renderMarkdownToHtml", () => {
 
     const unclosed = renderMarkdownToHtml("```js\nconst value = 1;\n");
     expect(unclosed).toContain("const value = 1");
-    expect(unclosed).not.toContain("panes-code-block");
+    expect(unclosed).not.toContain("supacodex-code-block");
   });
 
   it("sanitizes dangerous tags, handlers and javascript links", () => {

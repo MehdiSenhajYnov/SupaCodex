@@ -56,7 +56,7 @@ const darkVoidTheme = EditorView.theme(
       borderLeftWidth: "2px",
     },
     "&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection": {
-      backgroundColor: "rgba(255, 107, 107, 0.12) !important",
+      backgroundColor: "rgba(139, 92, 246, 0.12) !important",
     },
     ".cm-activeLineGutter": {
       backgroundColor: "rgba(255, 255, 255, 0.04)",
@@ -69,7 +69,7 @@ const darkVoidTheme = EditorView.theme(
       fontSize: "11px",
     },
     ".cm-matchingBracket": {
-      backgroundColor: "rgba(255, 107, 107, 0.18)",
+      backgroundColor: "rgba(139, 92, 246, 0.18)",
       outline: "none",
     },
     ".cm-searchMatch": {
@@ -90,7 +90,7 @@ const darkVoidTheme = EditorView.theme(
       alignItems: "center",
       background: "var(--bg-2)",
       fontSize: "12px",
-      fontFamily: '"Sora", system-ui, sans-serif',
+      fontFamily: "var(--font-ui)",
     },
     ".cm-search label": {
       display: "inline-flex",
@@ -132,7 +132,7 @@ const darkVoidTheme = EditorView.theme(
       fontSize: "11px",
       cursor: "pointer",
       transition: "all 120ms ease",
-      fontFamily: '"Sora", system-ui, sans-serif',
+      fontFamily: "var(--font-ui)",
     },
     ".cm-button:hover": {
       background: "var(--bg-4)",

@@ -427,7 +427,7 @@ mod tests {
     use super::*;
 
     fn test_db() -> Database {
-        let path = std::env::temp_dir().join(format!("panes-workspaces-{}.db", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("supacodex-workspaces-{}.db", Uuid::new_v4()));
         let db = Database {
             path,
             pool: Arc::new(ConnectionPool {
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn upsert_workspace_preserves_existing_scan_depth_when_none_is_provided() {
         let db = test_db();
-        let root = std::env::temp_dir().join(format!("panes-workspace-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("supacodex-workspace-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("failed to create temp workspace root");
         let root = root.to_string_lossy().to_string();
 
@@ -456,10 +456,10 @@ mod tests {
 
     #[test]
     fn preferred_default_workspace_root_skips_transient_appimage_mounts() {
-        let home = std::env::temp_dir().join(format!("panes-home-{}", Uuid::new_v4()));
+        let home = std::env::temp_dir().join(format!("supacodex-home-{}", Uuid::new_v4()));
         fs::create_dir_all(&home).expect("failed to create temp home");
 
-        let cwd = std::path::Path::new("/tmp/.mount_PanesTest/usr");
+        let cwd = std::path::Path::new("/tmp/.mount_SupaCodexTest/usr");
         let selected =
             preferred_default_workspace_root_for(Some(cwd), Some(&home), None, false, None, None);
 
@@ -468,8 +468,8 @@ mod tests {
 
     #[test]
     fn preferred_default_workspace_root_keeps_existing_directory_cwd() {
-        let cwd = std::env::temp_dir().join(format!("panes-cwd-{}", Uuid::new_v4()));
-        let home = std::env::temp_dir().join(format!("panes-home-{}", Uuid::new_v4()));
+        let cwd = std::env::temp_dir().join(format!("supacodex-cwd-{}", Uuid::new_v4()));
+        let home = std::env::temp_dir().join(format!("supacodex-home-{}", Uuid::new_v4()));
         fs::create_dir_all(&cwd).expect("failed to create temp cwd");
         fs::create_dir_all(&home).expect("failed to create temp home");
 
@@ -481,8 +481,8 @@ mod tests {
 
     #[test]
     fn preferred_default_workspace_root_skips_current_executable_directory() {
-        let cwd = std::env::temp_dir().join(format!("panes-install-{}", Uuid::new_v4()));
-        let home = std::env::temp_dir().join(format!("panes-home-{}", Uuid::new_v4()));
+        let cwd = std::env::temp_dir().join(format!("supacodex-install-{}", Uuid::new_v4()));
+        let home = std::env::temp_dir().join(format!("supacodex-home-{}", Uuid::new_v4()));
         fs::create_dir_all(&cwd).expect("failed to create temp install root");
         fs::create_dir_all(&home).expect("failed to create temp home");
 
@@ -501,10 +501,10 @@ mod tests {
     #[test]
     fn preferred_default_workspace_root_keeps_windows_home_when_executable_is_nested_inside_it() {
         let home = std::env::temp_dir()
-            .join(format!("panes-home-{}", Uuid::new_v4()))
+            .join(format!("supacodex-home-{}", Uuid::new_v4()))
             .join("Users")
             .join("panes");
-        let install_dir = home.join("AppData").join("Local").join("Panes");
+        let install_dir = home.join("AppData").join("Local").join("SupaCodex");
         fs::create_dir_all(&install_dir).expect("failed to create fake install dir");
         fs::create_dir_all(&home).expect("failed to create temp home");
 
@@ -523,8 +523,8 @@ mod tests {
     #[test]
     fn preferred_default_workspace_root_skips_windows_system_dirs() {
         let windows_dir =
-            std::env::temp_dir().join(format!("panes-windows-dir-{}", Uuid::new_v4()));
-        let home = std::env::temp_dir().join(format!("panes-home-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("supacodex-windows-dir-{}", Uuid::new_v4()));
+        let home = std::env::temp_dir().join(format!("supacodex-home-{}", Uuid::new_v4()));
         let cwd = windows_dir.join("System32");
         fs::create_dir_all(&cwd).expect("failed to create fake windows cwd");
         fs::create_dir_all(&home).expect("failed to create temp home");
@@ -543,8 +543,8 @@ mod tests {
 
     #[test]
     fn preferred_default_workspace_root_skips_windows_temp_dirs() {
-        let temp_dir = std::env::temp_dir().join(format!("panes-temp-{}", Uuid::new_v4()));
-        let home = std::env::temp_dir().join(format!("panes-home-{}", Uuid::new_v4()));
+        let temp_dir = std::env::temp_dir().join(format!("supacodex-temp-{}", Uuid::new_v4()));
+        let home = std::env::temp_dir().join(format!("supacodex-home-{}", Uuid::new_v4()));
         let cwd = temp_dir.join("nsis");
         fs::create_dir_all(&cwd).expect("failed to create fake temp cwd");
         fs::create_dir_all(&home).expect("failed to create temp home");

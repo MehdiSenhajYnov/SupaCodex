@@ -9,7 +9,7 @@ import { readTextFromClipboard } from "./clipboard";
 import { type EditMenuAction, shouldDispatchTerminalEditAction } from "./editMenu";
 import { isTerminalInputFocused } from "./windowActions";
 
-const TERMINAL_EDIT_EVENT = "panes:terminal-edit-action";
+const TERMINAL_EDIT_EVENT = "supacodex:terminal-edit-action";
 
 type TerminalEditAction = "copy" | "paste" | "select-all";
 

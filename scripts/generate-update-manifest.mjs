@@ -16,7 +16,7 @@ import {
   resolveUpdaterAssetPairs,
 } from "./lib/update-manifest.mjs";
 
-const DEFAULT_REPO = "wygoralves/panes";
+const DEFAULT_REPO = "replace-with-your-fork/supacodex";
 
 export function resolveReleaseTag(argv = process.argv, env = process.env) {
   return argv[2] || env.RELEASE_TAG || null;
@@ -25,7 +25,7 @@ export function resolveReleaseTag(argv = process.argv, env = process.env) {
 function buildHeaders(token) {
   const headers = {
     Accept: "application/vnd.github+json",
-    "User-Agent": "panes-update-manifest",
+    "User-Agent": "supacodex-update-manifest",
   };
   if (token) {
     headers.Authorization = `Bearer ${token}`;

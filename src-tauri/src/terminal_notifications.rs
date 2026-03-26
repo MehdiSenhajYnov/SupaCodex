@@ -23,13 +23,13 @@ use uuid::Uuid;
 
 use crate::{models::TerminalNotificationDto, runtime_env};
 
-const PANES_NOTIFY_ADDR_ENV: &str = "PANES_NOTIFY_ADDR";
-const PANES_NOTIFY_TOKEN_ENV: &str = "PANES_NOTIFY_TOKEN";
-const PANES_SESSION_ID_ENV: &str = "PANES_SESSION_ID";
-const PANES_WORKSPACE_ID_ENV: &str = "PANES_WORKSPACE_ID";
+const SUPACODEX_NOTIFY_ADDR_ENV: &str = "SUPACODEX_NOTIFY_ADDR";
+const SUPACODEX_NOTIFY_TOKEN_ENV: &str = "SUPACODEX_NOTIFY_TOKEN";
+const SUPACODEX_SESSION_ID_ENV: &str = "SUPACODEX_SESSION_ID";
+const SUPACODEX_WORKSPACE_ID_ENV: &str = "SUPACODEX_WORKSPACE_ID";
 const CODEX_NOTIFY_SUBCOMMAND: &str = "codex-notify";
 const CODEX_WRAPPER_SUBCOMMAND: &str = "codex-wrapper";
-const CODEX_NOTIFY_CONFIG_OVERRIDE: &str = r#"notify=["panes","codex-notify"]"#;
+const CODEX_NOTIFY_CONFIG_OVERRIDE: &str = r#"notify=["supacodex","codex-notify"]"#;
 const CLAUDE_HOOK_SUBCOMMAND: &str = "claude-hook";
 const CLAUDE_WRAPPER_SUBCOMMAND: &str = "claude-wrapper";
 const CLEAR_NOTIFICATION_SUBCOMMAND: &str = "clear-notification";
@@ -46,8 +46,8 @@ const CLAUDE_STOP_FAILURE_HOOK_EVENT: &str = "StopFailure";
 const CLAUDE_NOTIFICATION_HOOK_EVENT: &str = "Notification";
 const CLAUDE_SESSION_END_HOOK_EVENT: &str = "SessionEnd";
 const CLAUDE_SESSION_START_HOOK_EVENT: &str = "SessionStart";
-const CLAUDE_HOOK_COMMAND: &str = "panes claude-hook";
-const NOTIFICATION_DEFAULT_TITLE: &str = "Panes";
+const CLAUDE_HOOK_COMMAND: &str = "supacodex claude-hook";
+const NOTIFICATION_DEFAULT_TITLE: &str = "SupaCodex";
 const NOTIFICATION_DEFAULT_BODY: &str = "Notification";
 const NOTIFICATION_EVENT_PREFIX: &str = "terminal-notification-";
 const NOTIFICATION_CLEARED_EVENT_PREFIX: &str = "terminal-notification-cleared-";
@@ -566,7 +566,7 @@ pub fn parse_terminal_notification_integration_kind(
 
 pub fn agent_notification_settings_status() -> anyhow::Result<AgentNotificationSettingsStatusDto> {
     let config = crate::config::app_config::AppConfig::load_or_create()
-        .context("failed to load Panes config")?;
+        .context("failed to load SupaCodex config")?;
     let claude = inspect_claude_notification_integration();
     let codex = inspect_codex_notification_integration();
     Ok(AgentNotificationSettingsStatusDto {
@@ -667,7 +667,7 @@ fn parse_notify_cli_args(args: Vec<String>) -> anyhow::Result<Option<NotifyCliAr
             "--workspace-id" => parsed.workspace_id = value,
             "--session-id" => parsed.session_id = value,
             "--source" => parsed.source = value,
-            other => anyhow::bail!("unknown panes notify argument: {other}"),
+            other => anyhow::bail!("unknown supacodex notify argument: {other}"),
         }
 
         index += if matches!(flag, "--help" | "-h") {
@@ -704,7 +704,7 @@ fn parse_clear_notification_cli_args(
             }
             "--workspace-id" => parsed.workspace_id = value,
             "--session-id" => parsed.session_id = value,
-            other => anyhow::bail!("unknown panes clear-notification argument: {other}"),
+            other => anyhow::bail!("unknown supacodex clear-notification argument: {other}"),
         }
 
         index += if matches!(flag, "--help" | "-h") {
@@ -803,20 +803,20 @@ fn build_ingress_target(
     workspace_id: Option<String>,
     session_id: Option<String>,
 ) -> anyhow::Result<NotificationIngressTarget> {
-    let addr = read_required_env(PANES_NOTIFY_ADDR_ENV)
+    let addr = read_required_env(SUPACODEX_NOTIFY_ADDR_ENV)
         .context("PANES terminal notification ingress is not available in this shell")?;
-    let token = read_required_env(PANES_NOTIFY_TOKEN_ENV)
+    let token = read_required_env(SUPACODEX_NOTIFY_TOKEN_ENV)
         .context("PANES terminal notification token is not available in this shell")?;
     let workspace_id = workspace_id
-        .or_else(|| read_non_empty_env(PANES_WORKSPACE_ID_ENV))
+        .or_else(|| read_non_empty_env(SUPACODEX_WORKSPACE_ID_ENV))
         .ok_or_else(|| anyhow::anyhow!("workspace id is required"))?;
     let session_id = session_id
-        .or_else(|| read_non_empty_env(PANES_SESSION_ID_ENV))
+        .or_else(|| read_non_empty_env(SUPACODEX_SESSION_ID_ENV))
         .ok_or_else(|| anyhow::anyhow!("session id is required"))?;
 
     let parsed_addr = addr
         .parse::<SocketAddr>()
-        .with_context(|| format!("invalid PANES_NOTIFY_ADDR value: {addr}"))?;
+        .with_context(|| format!("invalid SUPACODEX_NOTIFY_ADDR value: {addr}"))?;
     Ok(NotificationIngressTarget {
         addr: parsed_addr,
         token,
@@ -833,7 +833,7 @@ fn parse_codex_notify_args(args: Vec<String>) -> anyhow::Result<Option<String>> 
             Ok(None)
         }
         [payload] => Ok(Some(payload.clone())),
-        _ => anyhow::bail!("panes codex-notify expects a single JSON payload argument"),
+        _ => anyhow::bail!("supacodex codex-notify expects a single JSON payload argument"),
     }
 }
 
@@ -864,7 +864,7 @@ fn handle_claude_hook(args: Vec<String>) -> anyhow::Result<()> {
         return Ok(());
     }
     if !args.is_empty() {
-        anyhow::bail!("panes claude-hook does not accept arguments");
+        anyhow::bail!("supacodex claude-hook does not accept arguments");
     }
     if !panes_notification_env_available() {
         return Ok(());
@@ -979,7 +979,7 @@ fn build_claude_forwarded_args_with_session(
 
 fn current_panes_session_id_if_available() -> Option<String> {
     panes_notification_env_available()
-        .then(|| read_non_empty_env(PANES_SESSION_ID_ENV))
+        .then(|| read_non_empty_env(SUPACODEX_SESSION_ID_ENV))
         .flatten()
 }
 
@@ -1375,7 +1375,7 @@ fn is_managed_codex_notify_value(value: &toml::Value) -> bool {
         return false;
     };
     subcommand == CODEX_NOTIFY_SUBCOMMAND
-        && (command == "panes" || command == managed_panes_cli_path_string())
+        && (command == "supacodex" || command == managed_panes_cli_path_string())
 }
 
 fn claude_settings_path() -> anyhow::Result<PathBuf> {
@@ -1510,31 +1510,33 @@ fn send_notify_request(
     addr: &SocketAddr,
     request: &NotificationIngressRequest,
 ) -> anyhow::Result<()> {
-    let mut stream = TcpStream::connect_timeout(addr, Duration::from_secs(2))
-        .with_context(|| format!("failed to connect to Panes notification ingress at {addr}"))?;
+    let mut stream =
+        TcpStream::connect_timeout(addr, Duration::from_secs(2)).with_context(|| {
+            format!("failed to connect to SupaCodex notification ingress at {addr}")
+        })?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
     let payload =
-        serde_json::to_string(request).context("failed to serialize panes notify request")?;
+        serde_json::to_string(request).context("failed to serialize SupaCodex notify request")?;
     stream
         .write_all(payload.as_bytes())
-        .context("failed to write panes notify request")?;
+        .context("failed to write SupaCodex notify request")?;
     stream
         .write_all(b"\n")
-        .context("failed to finish panes notify request")?;
+        .context("failed to finish SupaCodex notify request")?;
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader
         .read_line(&mut line)
-        .context("failed to read panes notify response")?;
+        .context("failed to read SupaCodex notify response")?;
     if line.trim().is_empty() {
         return Ok(());
     }
 
     let response: NotificationIngressResponse =
-        serde_json::from_str(line.trim()).context("failed to parse panes notify response")?;
+        serde_json::from_str(line.trim()).context("failed to parse SupaCodex notify response")?;
     if response.ok {
         return Ok(());
     }
@@ -1543,7 +1545,7 @@ fn send_notify_request(
         "{}",
         response
             .error
-            .unwrap_or_else(|| "Panes notification ingress rejected the request".to_string())
+            .unwrap_or_else(|| "SupaCodex notification ingress rejected the request".to_string())
     );
 }
 
@@ -1551,17 +1553,17 @@ fn install_cli_shims() -> anyhow::Result<PathBuf> {
     let bin_dir = runtime_env::app_data_dir().join("bin");
     std::fs::create_dir_all(&bin_dir).with_context(|| {
         format!(
-            "failed to create panes shim directory at {}",
+            "failed to create SupaCodex shim directory at {}",
             bin_dir.display()
         )
     })?;
 
     let current_exe =
-        std::env::current_exe().context("failed to resolve current Panes executable")?;
+        std::env::current_exe().context("failed to resolve current SupaCodex executable")?;
     write_cli_shim(
         &bin_dir.join(panes_cli_shim_name()),
         &panes_cli_shim_contents(&current_exe),
-        "panes",
+        "supacodex",
     )?;
     write_cli_shim(
         &bin_dir.join(claude_cli_shim_name()),
@@ -1604,12 +1606,12 @@ fn write_cli_shim(shim_path: &Path, contents: &str, label: &str) -> anyhow::Resu
 
 #[cfg(windows)]
 fn panes_cli_shim_name() -> &'static str {
-    "panes.cmd"
+    "supacodex.cmd"
 }
 
 #[cfg(not(windows))]
 fn panes_cli_shim_name() -> &'static str {
-    "panes"
+    "supacodex"
 }
 
 #[cfg(windows)]
@@ -1773,10 +1775,10 @@ fn read_required_env(key: &str) -> anyhow::Result<String> {
 }
 
 fn panes_notification_env_available() -> bool {
-    read_non_empty_env(PANES_NOTIFY_ADDR_ENV).is_some()
-        && read_non_empty_env(PANES_NOTIFY_TOKEN_ENV).is_some()
-        && read_non_empty_env(PANES_WORKSPACE_ID_ENV).is_some()
-        && read_non_empty_env(PANES_SESSION_ID_ENV).is_some()
+    read_non_empty_env(SUPACODEX_NOTIFY_ADDR_ENV).is_some()
+        && read_non_empty_env(SUPACODEX_NOTIFY_TOKEN_ENV).is_some()
+        && read_non_empty_env(SUPACODEX_WORKSPACE_ID_ENV).is_some()
+        && read_non_empty_env(SUPACODEX_SESSION_ID_ENV).is_some()
 }
 
 fn terminal_notifications_enabled() -> bool {
@@ -1792,7 +1794,7 @@ fn resolve_wrapped_binary(binary: &str, shim_dir: &Path) -> anyhow::Result<PathB
     let filtered = std::env::join_paths(entries).context("failed to rebuild PATH without shims")?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     which::which_in(binary, Some(filtered), cwd)
-        .with_context(|| format!("failed to find the real {binary} binary outside Panes shims"))
+        .with_context(|| format!("failed to find the real {binary} binary outside SupaCodex shims"))
 }
 
 fn paths_match(left: &Path, right: &Path) -> bool {
@@ -1834,20 +1836,20 @@ fn focus_matches_target(
 
 fn print_notify_help() {
     println!(
-        "Usage: panes notify [--title TITLE] [--body BODY] [--workspace-id ID] [--session-id ID] [--source SOURCE]"
+        "Usage: supacodex notify [--title TITLE] [--body BODY] [--workspace-id ID] [--session-id ID] [--source SOURCE]"
     );
 }
 
 fn print_clear_notification_help() {
-    println!("Usage: panes clear-notification [--workspace-id ID] [--session-id ID]");
+    println!("Usage: supacodex clear-notification [--workspace-id ID] [--session-id ID]");
 }
 
 fn print_codex_notify_help() {
-    println!("Usage: panes codex-notify '<codex notify JSON payload>'");
+    println!("Usage: supacodex codex-notify '<codex notify JSON payload>'");
 }
 
 fn print_claude_hook_help() {
-    println!("Usage: panes claude-hook");
+    println!("Usage: supacodex claude-hook");
 }
 
 #[cfg(test)]
@@ -1868,7 +1870,7 @@ mod tests {
             .map(|key| (key, std::env::var_os(key)))
             .collect();
         let root =
-            std::env::temp_dir().join(format!("panes-terminal-notify-home-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("supacodex-terminal-notify-home-{}", Uuid::new_v4()));
         let local_app_data = root.join("AppData").join("Local");
         let roaming_app_data = root.join("AppData").join("Roaming");
         fs::create_dir_all(&local_app_data).expect("temp local app data should exist");
@@ -2290,14 +2292,14 @@ mod tests {
     #[test]
     #[cfg(not(windows))]
     fn unix_cli_shim_escapes_single_quotes() {
-        let contents = panes_cli_shim_contents(Path::new("/tmp/Panes' Dev"));
-        assert!(contents.contains("'/tmp/Panes'\\'' Dev'"));
+        let contents = panes_cli_shim_contents(Path::new("/tmp/SupaCodex' Dev"));
+        assert!(contents.contains("'/tmp/SupaCodex'\\'' Dev'"));
     }
 
     #[test]
     #[cfg(not(windows))]
     fn unix_claude_cli_shim_invokes_wrapper_subcommand() {
-        let contents = claude_cli_shim_contents(Path::new("/tmp/Panes' Dev"));
+        let contents = claude_cli_shim_contents(Path::new("/tmp/SupaCodex' Dev"));
         assert!(contents.contains(CLAUDE_WRAPPER_SUBCOMMAND));
     }
 

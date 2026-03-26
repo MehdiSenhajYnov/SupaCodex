@@ -4,8 +4,6 @@ import {
   type CommandPaletteLaunchState,
 } from "../lib/commandPalette";
 
-const SIDEBAR_PINNED_KEY = "panes:sidebarPinned";
-
 interface MessageFocusTarget {
   threadId: string;
   messageId: string;
@@ -19,9 +17,17 @@ interface FocusModeSnapshot {
 
 type ActiveView = "chat" | "harnesses" | "workspace-settings";
 
+interface PersistedUiShellState {
+  version: 1;
+  showSidebar: boolean;
+  showGitPanel: boolean;
+  activeView: ActiveView;
+}
+
+const UI_SHELL_STORAGE_KEY = "supacodex:uiShell:v1";
+
 interface UiState {
   showSidebar: boolean;
-  sidebarPinned: boolean;
   showGitPanel: boolean;
   focusMode: boolean;
   focusModeSnapshot: FocusModeSnapshot | null;
@@ -33,8 +39,6 @@ interface UiState {
   openCommandPalette: (launch?: Partial<CommandPaletteLaunchState>) => void;
   closeCommandPalette: () => void;
   toggleSidebar: () => void;
-  toggleSidebarPin: () => void;
-  setSidebarPinned: (pinned: boolean) => void;
   toggleGitPanel: () => void;
   setFocusMode: (enabled: boolean) => void;
   toggleFocusMode: () => void;
@@ -44,23 +48,72 @@ interface UiState {
   clearMessageFocusTarget: () => void;
 }
 
-const savedPinned = (() => {
+function normalizePersistedActiveView(value: unknown): ActiveView {
+  return value === "harnesses" ? "harnesses" : "chat";
+}
+
+function readPersistedUiShellState(): PersistedUiShellState {
   try {
-    return localStorage.getItem(SIDEBAR_PINNED_KEY);
+    const raw = localStorage.getItem(UI_SHELL_STORAGE_KEY);
+    if (!raw) {
+      return {
+        version: 1,
+        showSidebar: true,
+        showGitPanel: true,
+        activeView: "chat",
+      };
+    }
+
+    const parsed = JSON.parse(raw) as Partial<PersistedUiShellState> | null;
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("invalid ui shell state");
+    }
+
+    return {
+      version: 1,
+      showSidebar: parsed.showSidebar !== false,
+      showGitPanel: parsed.showGitPanel !== false,
+      activeView: normalizePersistedActiveView(parsed.activeView),
+    };
   } catch {
-    return null;
+    return {
+      version: 1,
+      showSidebar: true,
+      showGitPanel: true,
+      activeView: "chat",
+    };
   }
-})();
+}
+
+function persistUiShellState(state: Pick<UiState, "showSidebar" | "showGitPanel" | "activeView">): void {
+  try {
+    localStorage.setItem(
+      UI_SHELL_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        showSidebar: state.showSidebar,
+        showGitPanel: state.showGitPanel,
+        activeView:
+          state.activeView === "workspace-settings"
+            ? "chat"
+            : state.activeView,
+      } satisfies PersistedUiShellState),
+    );
+  } catch {
+    // Ignore storage failures in non-browser/test environments.
+  }
+}
+
+const persistedUiShellState = readPersistedUiShellState();
 
 export const useUiStore = create<UiState>((set) => ({
-  showSidebar: true,
-  sidebarPinned: savedPinned !== null ? savedPinned === "true" : true,
-  showGitPanel: true,
+  showSidebar: persistedUiShellState.showSidebar,
+  showGitPanel: persistedUiShellState.showGitPanel,
   focusMode: false,
   focusModeSnapshot: null,
   commandPaletteOpen: false,
   commandPaletteLaunch: COMMAND_PALETTE_DEFAULT_LAUNCH,
-  activeView: "chat",
+  activeView: persistedUiShellState.activeView,
   settingsWorkspaceId: null,
   messageFocusTarget: null,
   openCommandPalette: (launch) =>
@@ -76,26 +129,32 @@ export const useUiStore = create<UiState>((set) => ({
       commandPaletteOpen: false,
       commandPaletteLaunch: COMMAND_PALETTE_DEFAULT_LAUNCH,
     }),
-  toggleSidebar: () => set((state) => ({ showSidebar: !state.showSidebar })),
-  toggleSidebarPin: () =>
+  toggleSidebar: () =>
     set((state) => {
-      const next = !state.sidebarPinned;
-      try {
-        localStorage.setItem(SIDEBAR_PINNED_KEY, String(next));
-      } catch {
-        // Ignore storage failures in non-browser/test environments.
+      const nextState = {
+        showSidebar: !state.showSidebar,
+      };
+      if (!state.focusMode) {
+        persistUiShellState({
+          ...state,
+          ...nextState,
+        });
       }
-      return { sidebarPinned: next, showSidebar: true };
+      return nextState;
     }),
-  setSidebarPinned: (pinned) => {
-    try {
-      localStorage.setItem(SIDEBAR_PINNED_KEY, String(pinned));
-    } catch {
-      // Ignore storage failures in non-browser/test environments.
-    }
-    set({ sidebarPinned: pinned, showSidebar: true });
-  },
-  toggleGitPanel: () => set((state) => ({ showGitPanel: !state.showGitPanel })),
+  toggleGitPanel: () =>
+    set((state) => {
+      const nextState = {
+        showGitPanel: !state.showGitPanel,
+      };
+      if (!state.focusMode) {
+        persistUiShellState({
+          ...state,
+          ...nextState,
+        });
+      }
+      return nextState;
+    }),
   setFocusMode: (enabled) =>
     set((state) => {
       if (enabled) {
@@ -146,7 +205,13 @@ export const useUiStore = create<UiState>((set) => ({
       };
     }),
   setActiveView: (view) => {
-    set({ activeView: view });
+    set((state) => {
+      persistUiShellState({
+        ...state,
+        activeView: view,
+      });
+      return { activeView: view };
+    });
     if (view === "harnesses") {
       // Lazy import to avoid circular dependency
       void import("./harnessStore").then(({ useHarnessStore }) => {

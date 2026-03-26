@@ -186,6 +186,48 @@ export interface CodexRemoteThreadPage {
   nextCursor?: string | null;
 }
 
+export interface CodexProfile {
+  id: string;
+  name: string;
+  codexHome: string;
+  isDefault: boolean;
+}
+
+export interface CodexProfilesState {
+  activeProfileId: string;
+  profiles: CodexProfile[];
+}
+
+export interface CodexDetectedProjectProfile {
+  profileId: string;
+  profileName: string;
+  threadCount: number;
+  lastActivityAt: string;
+  latestThreadTitle?: string | null;
+}
+
+export interface CodexDetectedThread {
+  engineThreadId: string;
+  title: string;
+  preview: string;
+  createdAt: string;
+  updatedAt: string;
+  profileId: string;
+  profileName: string;
+  modelProvider: string;
+  archived: boolean;
+}
+
+export interface CodexDetectedProject {
+  path: string;
+  name: string;
+  threadCount: number;
+  lastActivityAt: string;
+  workspaceId?: string | null;
+  profiles: CodexDetectedProjectProfile[];
+  threads: CodexDetectedThread[];
+}
+
 export type CodexReviewDelivery = "inline" | "detached";
 
 export type CodexReviewTarget =

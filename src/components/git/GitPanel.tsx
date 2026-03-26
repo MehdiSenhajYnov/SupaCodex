@@ -19,7 +19,7 @@ import {
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { useGitStore, type GitPanelView } from "../../stores/gitStore";
 import { ipc, listenGitRepoChanged } from "../../lib/ipc";
-import { handleDragMouseDown, handleDragDoubleClick } from "../../lib/windowDrag";
+import { handleDragMouseDown } from "../../lib/windowDrag";
 import { toast } from "../../stores/toastStore";
 import { Dropdown } from "../shared/Dropdown";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
@@ -449,7 +449,6 @@ export function GitPanel() {
       <div
         className="git-header"
         onMouseDown={handleDragMouseDown}
-        onDoubleClick={handleDragDoubleClick}
       >
         <div className="no-drag">
           <Dropdown

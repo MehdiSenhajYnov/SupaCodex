@@ -27,6 +27,7 @@ import {
   Server,
   FlaskConical,
   UserCircle,
+  type LucideIcon,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useShallow } from "zustand/react/shallow";
@@ -38,16 +39,30 @@ import { useUiStore } from "../../stores/uiStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { useGitStore } from "../../stores/gitStore";
 import { useTerminalStore, type LayoutMode } from "../../stores/terminalStore";
+import { useCodexProfileStore } from "../../stores/codexProfileStore";
+import { useProjectTabsStore } from "../../stores/projectTabsStore";
 import { toast } from "../../stores/toastStore";
 import { ipc } from "../../lib/ipc";
 import { resolvePreferredOnboardingChatSelection } from "../../lib/onboarding";
 import { recordPerfMetric } from "../../lib/perfTelemetry";
-import { isMacDesktop, usesCustomWindowFrame } from "../../lib/windowActions";
+import {
+  readPersistedWorkspaceComposerState,
+  writePersistedWorkspaceComposerState,
+  type PersistedWorkspaceComposerState,
+} from "../../lib/workspaceComposerState";
 import { MessageBlocks, shouldShowClaudeUnsupportedApproval } from "./MessageBlocks";
 import { resolveEngineCapabilities } from "./engineCapabilities";
-import { buildCodexInputItems } from "./codexInputItems";
+import {
+  buildCodexInputItems,
+  normalizeCodexReferenceToken,
+} from "./codexInputItems";
 import { resolveReasoningEffortForModel } from "./reasoningEffort";
 import { ToolInputQuestionnaire } from "./ToolInputQuestionnaire";
+import {
+  extractShellCommand,
+  findComposerTrigger,
+  type ComposerTriggerMatch,
+} from "./chatComposerTriggers";
 import {
   buildPermissionsApprovalResponse,
   buildPermissionsDeclineResponse,
@@ -61,6 +76,7 @@ import {
   parseToolInputQuestions,
   requiresCustomApprovalPayload,
 } from "./toolInputApproval";
+import { CodexThreadPicker } from "./CodexThreadPicker";
 import { ModelPicker } from "./ModelPicker";
 import {
   type CodexConfigPatch,
@@ -69,11 +85,10 @@ import {
 } from "./CodexConfigPicker";
 // CodexRuntimePicker removed from toolbar — runtime info accessed via /slash commands
 import { PermissionPicker } from "./PermissionPicker";
-// CodexReviewPicker and CodexThreadPicker replaced by slash commands (ChatSlashMenu + ChatCommandPanel)
-import { ChatSlashMenu, type SlashCommand } from "./ChatSlashMenu";
+import { ChatComposerMenu, type ChatComposerMenuItem } from "./ChatSlashMenu";
 import { ChatCommandPanel, type ActiveSlashCommand } from "./ChatCommandPanel";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
-import { handleDragMouseDown, handleDragDoubleClick } from "../../lib/windowDrag";
+import { Dropdown } from "../shared/Dropdown";
 import { getHarnessIcon } from "../shared/HarnessLogos";
 import { shouldSubmitChatInput } from "./chatInputShortcuts";
 import type {
@@ -82,9 +97,11 @@ import type {
   ChatAttachment,
   ChatInputItem,
   CodexApp,
+  CodexPluginMarketplace,
   CodexSkill,
   ContentBlock,
   EngineHealth,
+  FileTreeEntry,
   Message,
   Thread,
   TrustLevel,
@@ -109,6 +126,238 @@ interface MeasuredMessageRowProps {
   messageId: string;
   onHeightChange: (messageId: string, height: number) => void;
   children: ReactNode;
+}
+
+interface ProjectConversationTabsBarProps {
+  workspaceName: string | null;
+  threads: Thread[];
+  activeThreadId: string | null;
+  creatingThread?: boolean;
+  layoutModeButtons?: Array<{
+    key: string;
+    title: string;
+    active: boolean;
+    disabled: boolean;
+    icon: ReactNode;
+    onClick: () => void;
+  }>;
+  onSelectThread: (thread: Thread) => void;
+  onCloseThread: (thread: Thread) => void;
+  onCreateThread: () => void;
+}
+
+interface SlashCommand {
+  id: string;
+  name: string;
+  description: string;
+  icon: LucideIcon;
+  codexOnly?: boolean;
+  disabled?: boolean;
+}
+
+interface ComposerMenuActionItem extends ChatComposerMenuItem {
+  action:
+    | {
+        type: "slash";
+        commandId: string;
+      }
+    | {
+        type: "reference";
+        insertText: string;
+      }
+    | {
+        type: "file";
+        relativePath: string;
+        absolutePath: string;
+        attachAsImage: boolean;
+      }
+    | {
+        type: "none";
+      };
+}
+
+function resolveProjectTabStatusClass(status: Thread["status"]): string {
+  switch (status) {
+    case "streaming":
+      return "project-tab-status-streaming";
+    case "awaiting_approval":
+      return "project-tab-status-awaiting_approval";
+    case "error":
+      return "project-tab-status-error";
+    case "completed":
+      return "project-tab-status-completed";
+    case "idle":
+    default:
+      return "project-tab-status-idle";
+  }
+}
+
+function ProjectConversationTabsBar({
+  workspaceName,
+  threads,
+  activeThreadId,
+  creatingThread = false,
+  layoutModeButtons = [],
+  onSelectThread,
+  onCloseThread,
+  onCreateThread,
+}: ProjectConversationTabsBarProps) {
+  const { t } = useTranslation("chat");
+  const tabButtonRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+
+  const focusProjectTabByIndex = useCallback(
+    (index: number) => {
+      const targetThread = threads[index];
+      if (!targetThread) {
+        return;
+      }
+
+      onSelectThread(targetThread);
+      window.requestAnimationFrame(() => {
+        tabButtonRefs.current[targetThread.id]?.focus();
+      });
+    },
+    [onSelectThread, threads],
+  );
+
+  const workspaceLabel = workspaceName ?? t("panel.threadTitle.newChat");
+
+  return (
+    <div
+      className="project-tabs-bar"
+    >
+      {threads.length > 0 ? (
+        <div
+          className="project-tabs-scroller"
+          role="tablist"
+          aria-label={t("panel.projectTabs.tablistLabel", { workspace: workspaceLabel })}
+        >
+          {threads.map((thread, index) => {
+            const label = thread.title?.trim() || t("panel.threadTitle.newChat");
+            const isActive = thread.id === activeThreadId;
+            return (
+              <div
+                key={thread.id}
+                className={`project-tab-shell ${isActive ? "project-tab-active" : ""}`}
+                title={label}
+              >
+                <button
+                  type="button"
+                  ref={(node) => {
+                    tabButtonRefs.current[thread.id] = node;
+                  }}
+                  className="project-tab"
+                  role="tab"
+                  aria-selected={isActive}
+                  aria-label={t("panel.projectTabs.tabLabel", { title: label })}
+                  tabIndex={isActive ? 0 : -1}
+                  onClick={() => onSelectThread(thread)}
+                  onKeyDown={(event) => {
+                    if (event.key === "ArrowRight") {
+                      event.preventDefault();
+                      focusProjectTabByIndex((index + 1) % threads.length);
+                      return;
+                    }
+                    if (event.key === "ArrowLeft") {
+                      event.preventDefault();
+                      focusProjectTabByIndex((index - 1 + threads.length) % threads.length);
+                      return;
+                    }
+                    if (event.key === "Home") {
+                      event.preventDefault();
+                      focusProjectTabByIndex(0);
+                      return;
+                    }
+                    if (event.key === "End") {
+                      event.preventDefault();
+                      focusProjectTabByIndex(threads.length - 1);
+                      return;
+                    }
+                    if (event.key === "Delete") {
+                      event.preventDefault();
+                      onCloseThread(thread);
+                    }
+                  }}
+                  onMouseDown={(event) => {
+                    if (event.button === 1) {
+                      event.preventDefault();
+                    }
+                  }}
+                  onAuxClick={(event) => {
+                    if (event.button === 1) {
+                      event.preventDefault();
+                      onCloseThread(thread);
+                    }
+                  }}
+                  title={label}
+                >
+                  <span
+                    className={`project-tab-status ${resolveProjectTabStatusClass(thread.status)}`}
+                  />
+                  <span className="project-tab-label">{label}</span>
+                </button>
+                  <button
+                    type="button"
+                    aria-label={t("panel.projectTabs.closeTab")}
+                    title={t("panel.projectTabs.closeTab")}
+                    className="project-tab-close"
+                    tabIndex={-1}
+                    onMouseDown={(event) => event.stopPropagation()}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onCloseThread(thread);
+                    }}
+                  >
+                    <X size={11} />
+                  </button>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="project-tabs-empty">
+          <MessageSquare size={12} />
+          <span className="project-tabs-empty-copy">
+            {t("panel.projectTabs.empty", { workspace: workspaceName ?? t("panel.threadTitle.newChat") })}
+          </span>
+          <span className="project-tabs-empty-hint">
+            {t("panel.projectTabs.hint")}
+          </span>
+        </div>
+      )}
+
+      <div className="project-tabs-actions">
+        {layoutModeButtons.length > 0 && (
+          <div className="layout-mode-switcher">
+            {layoutModeButtons.map((button) => (
+              <button
+                key={button.key}
+                type="button"
+                title={button.title}
+                disabled={button.disabled}
+                onClick={button.onClick}
+                className={`layout-mode-btn ${button.active ? "active" : ""}`}
+              >
+                {button.icon}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <button
+          type="button"
+          className="project-tabs-new"
+          disabled={creatingThread}
+          onClick={onCreateThread}
+          aria-label={t("panel.projectTabs.newThread")}
+          title={t("panel.projectTabs.newThread")}
+        >
+          <Plus size={12} />
+          <span>{t("panel.projectTabs.newThread")}</span>
+        </button>
+      </div>
+    </div>
+  );
 }
 
 export function resolvePendingToolInputApproval(
@@ -640,6 +889,20 @@ function readThreadOutputSchemaText(thread: Thread | null): string {
   return serializePrettyJson(value);
 }
 
+function normalizePersistedPersonalityValue(value: string | null | undefined): CodexPersonalityValue {
+  if (value === "none" || value === "friendly" || value === "pragmatic") {
+    return value;
+  }
+  return "inherit";
+}
+
+function normalizePersistedServiceTierValue(value: string | null | undefined): CodexServiceTierValue {
+  if (value === "fast" || value === "flex") {
+    return value;
+  }
+  return "inherit";
+}
+
 function readClaudeThreadPermissionModeValue(
   thread: Thread | null,
 ): ClaudeThreadPermissionModeValue {
@@ -1009,43 +1272,27 @@ function MessageRowView({
   );
   const hasAssistantContent = !isUser && hasVisibleContent(message.blocks);
   const showAssistantShell = !isUser && (hasAssistantContent || message.status === "streaming");
+  const showAssistantMeta = !isUser && Boolean(assistantLabel || assistantEngineId);
+  const rowClassName = [
+    "animate-slide-up",
+    "chat-message-row",
+    isUser ? "chat-message-row-user" : "chat-message-row-assistant",
+    isHighlighted ? "chat-message-row-highlighted" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <div
       data-message-id={message.id}
-      className="animate-slide-up"
-      style={{
-        animationDelay: `${Math.min(index * 20, 200)}ms`,
-        display: "flex",
-        flexDirection: "column",
-        alignItems: isUser ? "flex-end" : "flex-start",
-        maxWidth: "100%",
-        borderRadius: "var(--radius-md)",
-        outline: isHighlighted ? "2px solid rgba(255, 107, 107, 0.35)" : "none",
-        boxShadow: isHighlighted
-          ? "0 10px 28px rgba(255, 107, 107, 0.12)"
-          : "none",
-        transition:
-          "outline-color var(--duration-normal) var(--ease-out), box-shadow var(--duration-normal) var(--ease-out)",
-      }}
+      className={rowClassName}
+      style={{ animationDelay: `${Math.min(index * 20, 200)}ms` }}
     >
       {isUser ? (
         <>
-          <div
-            style={{
-              maxWidth: "75%",
-              padding: "10px 14px",
-              borderRadius: "var(--radius-md)",
-              background: "rgba(255, 107, 107, 0.06)",
-              border: "1px solid rgba(255, 107, 107, 0.10)",
-              fontSize: 13,
-              lineHeight: 1.6,
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-            }}
-          >
+          <div className="chat-message-surface chat-user-bubble">
             {userAuxiliaryBlocks.length > 0 && (
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 6 }}>
+              <div className="chat-user-bubble-auxiliary">
                 {userAuxiliaryBlocks.map((block, i) => {
                   if (block.type === "attachment") {
                     const mime = block.mimeType ?? "";
@@ -1080,7 +1327,7 @@ function MessageRowView({
               </div>
             )}
             {userPlanMode && (
-              <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 6, fontSize: 10, color: "var(--text-3)" }}>
+              <div className="chat-user-bubble-plan">
                 <ListChecks size={10} />
                 <span>{t("panel.planMode")}</span>
               </div>
@@ -1088,64 +1335,30 @@ function MessageRowView({
             {userContent}
           </div>
           {messageTimestamp && (
-            <span
-              style={{
-                fontSize: 10,
-                color: "var(--text-3)",
-                paddingRight: 4,
-                marginTop: 4,
-              }}
-            >
-              {messageTimestamp}
-            </span>
+            <span className="chat-message-timestamp chat-message-timestamp-user">{messageTimestamp}</span>
           )}
         </>
       ) : showAssistantShell ? (
         <>
-          <div
-            style={{
-              width: "100%",
-              maxWidth: "100%",
-              padding: "8px 4px",
-              borderRadius: "var(--radius-md)",
-              background: "var(--bg-2)",
-              border: "1px solid var(--border)",
-              overflow: "hidden",
-            }}
-          >
-            <div
-              style={{
-                padding: "2px 14px 6px",
-                fontSize: 11,
-                fontWeight: 600,
-                color: "var(--text-3)",
-                letterSpacing: "0.02em",
-              }}
-            >
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+          <div className="chat-message-surface chat-assistant-message">
+            {showAssistantMeta && (
+              <div className="chat-assistant-meta">
                 {assistantEngineId && getHarnessIcon(assistantEngineId, 11)}
                 <span>{assistantLabel}</span>
-              </span>
-            </div>
+              </div>
+            )}
             {hasAssistantContent ? (
-              <MessageBlocks
-                blocks={message.blocks}
-                status={message.status}
-                engineId={assistantEngineId}
-                onApproval={onApproval}
-                onLoadActionOutput={(actionId) => onLoadActionOutput(message.id, actionId)}
-              />
+              <div className="chat-assistant-content">
+                <MessageBlocks
+                  blocks={message.blocks}
+                  status={message.status}
+                  engineId={assistantEngineId}
+                  onApproval={onApproval}
+                  onLoadActionOutput={(actionId) => onLoadActionOutput(message.id, actionId)}
+                />
+              </div>
             ) : (
-              <div
-                style={{
-                  padding: "8px 14px 12px",
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: 8,
-                  color: "var(--text-3)",
-                  fontSize: 12,
-                }}
-              >
+              <div className="chat-assistant-thinking">
                 <Brain
                   size={12}
                   className="thinking-icon-active"
@@ -1161,16 +1374,7 @@ function MessageRowView({
             )}
           </div>
           {messageTimestamp && (
-            <span
-              style={{
-                fontSize: 10,
-                color: "var(--text-3)",
-                marginTop: 4,
-                paddingLeft: 4,
-              }}
-            >
-              {messageTimestamp}
-            </span>
+            <span className="chat-message-timestamp chat-message-timestamp-assistant">{messageTimestamp}</span>
           )}
         </>
       ) : null}
@@ -1211,6 +1415,53 @@ function getFileExtension(fileName: string): string {
 
 function fileNameFromPath(filePath: string): string {
   return filePath.split("/").pop() ?? filePath.split("\\").pop() ?? filePath;
+}
+
+function joinFileSystemPath(basePath: string, relativePath: string): string {
+  const separator = basePath.includes("\\") ? "\\" : "/";
+  const normalizedBase = basePath.replace(/[\\/]+$/, "");
+  const normalizedRelative = relativePath.replace(/[\\/]+/g, separator);
+  return `${normalizedBase}${separator}${normalizedRelative}`;
+}
+
+function quoteComposerPath(path: string): string {
+  if (!/\s/.test(path)) {
+    return path;
+  }
+  return `"${path.replace(/"/g, '\\"')}"`;
+}
+
+function buildComposerInsertion(input: string, replaceTo: number, insertion: string): string {
+  const suffix = input.slice(replaceTo);
+  if (!insertion || /^\s/.test(suffix)) {
+    return insertion;
+  }
+  return `${insertion} `;
+}
+
+function scoreFileSearchResult(path: string, query: string): number {
+  if (!query) {
+    return 0;
+  }
+  const normalizedPath = path.toLowerCase();
+  const normalizedQuery = query.toLowerCase();
+  if (normalizedPath === normalizedQuery) {
+    return 100;
+  }
+  if (normalizedPath.startsWith(normalizedQuery)) {
+    return 80;
+  }
+  if (normalizedPath.includes(`/${normalizedQuery}`)) {
+    return 60;
+  }
+  const fileName = fileNameFromPath(normalizedPath);
+  if (fileName.startsWith(normalizedQuery)) {
+    return 50;
+  }
+  if (normalizedPath.includes(normalizedQuery)) {
+    return 20;
+  }
+  return 0;
 }
 
 function isSupportedAttachmentName(fileName: string, supportedExtensions: ReadonlySet<string>): boolean {
@@ -1274,9 +1525,8 @@ export function ChatPanel() {
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [isFileDropOver, setIsFileDropOver] = useState(false);
   const [planMode, setPlanMode] = useState(false);
-  const [slashMenuOpen, setSlashMenuOpen] = useState(false);
-  const [slashMenuQuery, setSlashMenuQuery] = useState("");
-  const [slashMenuActiveIndex, setSlashMenuActiveIndex] = useState(0);
+  const [composerTrigger, setComposerTrigger] = useState<ComposerTriggerMatch | null>(null);
+  const [composerMenuActiveIndex, setComposerMenuActiveIndex] = useState(0);
   const [activeCommandPanel, setActiveCommandPanel] = useState<ActiveSlashCommand | null>(null);
   const [commandPanelBusy, setCommandPanelBusy] = useState(false);
   const [commandPanelError, setCommandPanelError] = useState<string | null>(null);
@@ -1290,6 +1540,11 @@ export function ChatPanel() {
   const selectedEffortRef = useRef(selectedEffort);
   const [codexSkills, setCodexSkills] = useState<CodexSkill[]>([]);
   const [codexApps, setCodexApps] = useState<CodexApp[]>([]);
+  const [repoFileEntries, setRepoFileEntries] = useState<FileTreeEntry[]>([]);
+  const [repoFileEntriesLoadedForPath, setRepoFileEntriesLoadedForPath] = useState<string | null>(
+    null,
+  );
+  const [repoFileEntriesLoading, setRepoFileEntriesLoading] = useState(false);
   const [codexReferenceCatalogState, setCodexReferenceCatalogState] =
     useState<CodexReferenceCatalogState>({
       skillsLoaded: false,
@@ -1299,8 +1554,6 @@ export function ChatPanel() {
   const [selectedServiceTier, setSelectedServiceTier] = useState<CodexServiceTierValue>("inherit");
   const [outputSchemaText, setOutputSchemaText] = useState("");
   const [customApprovalPolicyText, setCustomApprovalPolicyText] = useState("");
-  const [editingThreadTitle, setEditingThreadTitle] = useState(false);
-  const [threadTitleDraft, setThreadTitleDraft] = useState("");
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(
     null,
   );
@@ -1310,6 +1563,7 @@ export function ChatPanel() {
     loadingOlderMessages,
     loadOlderMessages,
     send,
+    runCodexShellCommand,
     steer,
     cancel,
     respondApproval,
@@ -1326,6 +1580,7 @@ export function ChatPanel() {
       loadingOlderMessages: state.loadingOlderMessages,
       loadOlderMessages: state.loadOlderMessages,
       send: state.send,
+      runCodexShellCommand: state.runCodexShellCommand,
       steer: state.steer,
       cancel: state.cancel,
       respondApproval: state.respondApproval,
@@ -1339,11 +1594,6 @@ export function ChatPanel() {
   );
   const messageFocusTarget = useUiStore((s) => s.messageFocusTarget);
   const clearMessageFocusTarget = useUiStore((s) => s.clearMessageFocusTarget);
-  const focusMode = useUiStore((s) => s.focusMode);
-  const showSidebar = useUiStore((s) => s.showSidebar);
-  const isMac = isMacDesktop();
-  const customWindowFrame = usesCustomWindowFrame();
-  const useTitlebarSafeInset = isMac && focusMode && !showSidebar;
   const engines = useEngineStore((s) => s.engines);
   const health = useEngineStore((s) => s.health);
   const onboardingOpen = useOnboardingStore((s) => s.open);
@@ -1398,6 +1648,7 @@ export function ChatPanel() {
     })),
   );
   const {
+    threads,
     activeThread,
     createThread,
     forkCodexThread,
@@ -1409,9 +1660,9 @@ export function ChatPanel() {
     applyThreadUpdateLocal,
     setThreadReasoningEffortLocal,
     setThreadLastModelLocal,
-    renameThread,
   } = useThreadStore(
     useShallow((state) => ({
+      threads: state.threads,
       activeThread: state.threads.find((thread) => thread.id === state.activeThreadId) ?? null,
       createThread: state.createThread,
       forkCodexThread: state.forkCodexThread,
@@ -1423,9 +1674,12 @@ export function ChatPanel() {
       applyThreadUpdateLocal: state.applyThreadUpdateLocal,
       setThreadReasoningEffortLocal: state.setThreadReasoningEffortLocal,
       setThreadLastModelLocal: state.setThreadLastModelLocal,
-      renameThread: state.renameThread,
     })),
   );
+  const tabThreadIdsByWorkspace = useProjectTabsStore((s) => s.tabThreadIdsByWorkspace);
+  const activeThreadIdByWorkspace = useProjectTabsStore((s) => s.activeThreadIdByWorkspace);
+  const switchProjectThread = useProjectTabsStore((s) => s.switchToThread);
+  const closeProjectTab = useProjectTabsStore((s) => s.closeThreadTab);
   const gitStatus = useGitStore((s) => s.status);
   const terminalWorkspaceState = useTerminalStore((s) =>
     activeWorkspaceId ? s.workspaces[activeWorkspaceId] : undefined,
@@ -1433,18 +1687,23 @@ export function ChatPanel() {
   const setLayoutMode = useTerminalStore((s) => s.setLayoutMode);
   const setTerminalPanelSize = useTerminalStore((s) => s.setPanelSize);
   const syncTerminalSessions = useTerminalStore((s) => s.syncSessions);
+  const runCommandInTerminal = useTerminalStore((s) => s.runCommandInTerminal);
+  const codexProfiles = useCodexProfileStore((s) => s.profiles);
+  const activeCodexProfileId = useCodexProfileStore((s) => s.activeProfileId);
+  const setActiveCodexProfile = useCodexProfileStore((s) => s.setActiveProfile);
   const viewportRef = useRef<HTMLDivElement>(null);
   const chatSectionRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const titleInputRef = useRef<HTMLInputElement>(null);
   const effortSyncKeyRef = useRef<string | null>(null);
   const manuallyOverrodeThreadSelectionRef = useRef(false);
   const lastSyncedThreadIdRef = useRef<string | null>(null);
   const highlightTimeoutRef = useRef<number | null>(null);
   const prependLoadInFlightRef = useRef(false);
+  const creatingProjectTabRef = useRef(false);
   const threadActivatedAtRef = useRef(0);
   const initialScrollThreadRef = useRef<string | null>(null);
   const messageHeightsRef = useRef<Map<string, number>>(new Map());
+  const [creatingProjectTab, setCreatingProjectTab] = useState(false);
   const layoutVersionRafRef = useRef<number | null>(null);
   const threadExecutionPolicyRequestIdsRef = useRef<Record<string, number>>({});
   const [listLayoutVersion, setListLayoutVersion] = useState(0);
@@ -1457,6 +1716,7 @@ export function ChatPanel() {
     threadId: string;
     threadPaths: string[];
     text: string;
+    shellCommand: string | null;
     attachments: ChatAttachment[];
     inputItems: ChatInputItem[] | null;
     planMode: boolean;
@@ -1581,6 +1841,38 @@ export function ChatPanel() {
   useEffect(() => {
     selectedEffortRef.current = selectedEffort;
   }, [selectedEffort]);
+
+  const persistWorkspaceComposerState = useCallback(
+    (overrides: Partial<PersistedWorkspaceComposerState> = {}) => {
+      if (!activeWorkspaceId) {
+        return;
+      }
+
+      const nextModelId = Object.prototype.hasOwnProperty.call(overrides, "modelId")
+        ? overrides.modelId ?? null
+        : selectedModelIdRef.current;
+
+      writePersistedWorkspaceComposerState(activeWorkspaceId, {
+        engineId: overrides.engineId ?? selectedEngineIdRef.current,
+        modelId: nextModelId,
+        effort: overrides.effort ?? selectedEffortRef.current,
+        planMode: overrides.planMode ?? planMode,
+        personality: overrides.personality ?? selectedPersonality,
+        serviceTier: overrides.serviceTier ?? selectedServiceTier,
+        outputSchemaText: overrides.outputSchemaText ?? outputSchemaText,
+        customApprovalPolicyText:
+          overrides.customApprovalPolicyText ?? customApprovalPolicyText,
+      });
+    },
+    [
+      activeWorkspaceId,
+      customApprovalPolicyText,
+      outputSchemaText,
+      planMode,
+      selectedPersonality,
+      selectedServiceTier,
+    ],
+  );
   const canSteerActiveTurn = useMemo(() => {
     if (
       !streaming ||
@@ -1607,7 +1899,14 @@ export function ChatPanel() {
     streaming,
     threadId,
   ]);
-  const codexReferencesAvailable = codexSkills.length > 0 || codexApps.length > 0;
+  const codexPluginMarketplaces = useMemo<CodexPluginMarketplace[]>(
+    () => codexProtocolDiagnostics?.pluginMarketplaces ?? [],
+    [codexProtocolDiagnostics?.pluginMarketplaces],
+  );
+  const codexReferencesAvailable =
+    codexSkills.length > 0 ||
+    codexApps.length > 0 ||
+    codexPluginMarketplaces.some((marketplace) => marketplace.plugins.length > 0);
 
   const loadCodexReferenceCatalogs = useCallback(async (): Promise<{
     skills: CodexSkill[];
@@ -1657,6 +1956,14 @@ export function ChatPanel() {
       let apps = codexApps;
       let skillsLoaded = codexReferenceCatalogState.skillsLoaded;
       let appsLoaded = codexReferenceCatalogState.appsLoaded;
+      if (!skillsLoaded && codexProtocolDiagnostics?.skills) {
+        skills = codexProtocolDiagnostics.skills.filter((skill) => skill.enabled);
+      }
+      if (!appsLoaded && codexProtocolDiagnostics?.apps) {
+        apps = codexProtocolDiagnostics.apps.filter(
+          (app) => app.isEnabled && app.isAccessible,
+        );
+      }
       if ((!skillsLoaded || !appsLoaded) && message.includes("$")) {
         const loaded = await loadCodexReferenceCatalogs();
         if (loaded.skillsLoaded) {
@@ -1675,16 +1982,45 @@ export function ChatPanel() {
         });
       }
 
-      return buildCodexInputItems(message, skills, apps);
+      return buildCodexInputItems(
+        message,
+        skills,
+        apps,
+        codexPluginMarketplaces,
+      );
     },
     [
       codexApps,
+      codexPluginMarketplaces,
+      codexProtocolDiagnostics?.apps,
+      codexProtocolDiagnostics?.skills,
       codexReferenceCatalogState.appsLoaded,
       codexReferenceCatalogState.skillsLoaded,
       codexSkills,
       loadCodexReferenceCatalogs,
     ],
   );
+
+  const loadRepoComposerFiles = useCallback(async () => {
+    const repoPath = activeRepo?.path ?? null;
+    if (!repoPath) {
+      setRepoFileEntries([]);
+      setRepoFileEntriesLoadedForPath(null);
+      return [];
+    }
+    if (repoFileEntriesLoadedForPath === repoPath) {
+      return repoFileEntries;
+    }
+    setRepoFileEntriesLoading(true);
+    try {
+      const entries = await ipc.getFileTree(repoPath);
+      setRepoFileEntries(entries);
+      setRepoFileEntriesLoadedForPath(repoPath);
+      return entries;
+    } finally {
+      setRepoFileEntriesLoading(false);
+    }
+  }, [activeRepo?.path, repoFileEntries, repoFileEntriesLoadedForPath]);
 
   const supportedEfforts = useMemo(
     () => selectedModel?.supportedReasoningEfforts ?? [],
@@ -2147,33 +2483,59 @@ export function ChatPanel() {
   }, [messages, scheduleListLayoutVersionBump]);
 
   useEffect(() => {
-    if (!editingThreadTitle) {
-      setThreadTitleDraft(activeThread?.title ?? "");
-    }
-  }, [activeThread?.id, activeThread?.title, editingThreadTitle]);
-
-  useEffect(() => {
-    if (!editingThreadTitle) {
-      return;
-    }
-    titleInputRef.current?.focus();
-    titleInputRef.current?.select();
-  }, [editingThreadTitle]);
-
-  useEffect(() => {
     if (!engines.length) {
       return;
     }
     if (!engines.some((engine) => engine.id === selectedEngineId)) {
+      selectedEngineIdRef.current = engines[0].id;
       setSelectedEngineId(engines[0].id);
     }
   }, [engines, selectedEngineId]);
 
   useEffect(() => {
-    if (onboardingOpen || activeThread || !preferredOnboardingChatSelection) {
+    const activeThreadInWorkspace =
+      activeThread && activeThread.workspaceId === activeWorkspaceId
+        ? activeThread
+        : null;
+    if (!activeWorkspaceId || activeThreadInWorkspace) {
       return;
     }
 
+    const persistedState = readPersistedWorkspaceComposerState(activeWorkspaceId);
+    if (!persistedState) {
+      return;
+    }
+
+    selectedEngineIdRef.current = persistedState.engineId;
+    selectedModelIdRef.current = persistedState.modelId;
+    selectedEffortRef.current = persistedState.effort;
+
+    setSelectedEngineId(persistedState.engineId);
+    setSelectedModelId(persistedState.modelId);
+    setSelectedEffort(persistedState.effort);
+    setPlanMode(persistedState.planMode);
+    setSelectedPersonality(
+      normalizePersistedPersonalityValue(persistedState.personality),
+    );
+    setSelectedServiceTier(
+      normalizePersistedServiceTierValue(persistedState.serviceTier),
+    );
+    setOutputSchemaText(persistedState.outputSchemaText);
+    setCustomApprovalPolicyText(persistedState.customApprovalPolicyText);
+  }, [activeThread, activeWorkspaceId]);
+
+  useEffect(() => {
+    if (
+      onboardingOpen ||
+      activeThread ||
+      !preferredOnboardingChatSelection ||
+      (activeWorkspaceId && readPersistedWorkspaceComposerState(activeWorkspaceId))
+    ) {
+      return;
+    }
+
+    selectedEngineIdRef.current = preferredOnboardingChatSelection.engineId;
+    selectedModelIdRef.current = preferredOnboardingChatSelection.modelId;
     setSelectedEngineId((current) =>
       current === preferredOnboardingChatSelection.engineId
         ? current
@@ -2184,7 +2546,17 @@ export function ChatPanel() {
         ? current
         : preferredOnboardingChatSelection.modelId,
     );
-  }, [activeThread, onboardingOpen, preferredOnboardingChatSelection]);
+    persistWorkspaceComposerState({
+      engineId: preferredOnboardingChatSelection.engineId,
+      modelId: preferredOnboardingChatSelection.modelId,
+    });
+  }, [
+    activeThread,
+    activeWorkspaceId,
+    onboardingOpen,
+    persistWorkspaceComposerState,
+    preferredOnboardingChatSelection,
+  ]);
 
   useEffect(() => {
     if (!selectedModel) {
@@ -2192,6 +2564,7 @@ export function ChatPanel() {
       return;
     }
     if (selectedModelId !== selectedModel.id) {
+      selectedModelIdRef.current = selectedModel.id;
       setSelectedModelId(selectedModel.id);
     }
   }, [selectedModel, selectedModelId]);
@@ -2308,6 +2681,35 @@ export function ChatPanel() {
   ]);
 
   useEffect(() => {
+    const repoPath = activeRepo?.path ?? null;
+    if (!repoPath) {
+      setRepoFileEntries([]);
+      setRepoFileEntriesLoadedForPath(null);
+      setRepoFileEntriesLoading(false);
+      return;
+    }
+    if (repoFileEntriesLoadedForPath && repoFileEntriesLoadedForPath !== repoPath) {
+      setRepoFileEntries([]);
+      setRepoFileEntriesLoadedForPath(null);
+    }
+  }, [activeRepo?.path, repoFileEntriesLoadedForPath]);
+
+  useEffect(() => {
+    if (composerTrigger?.kind !== "file" || !activeRepo?.path) {
+      return;
+    }
+    if (repoFileEntriesLoadedForPath === activeRepo.path) {
+      return;
+    }
+    void loadRepoComposerFiles();
+  }, [
+    activeRepo?.path,
+    composerTrigger?.kind,
+    loadRepoComposerFiles,
+    repoFileEntriesLoadedForPath,
+  ]);
+
+  useEffect(() => {
     if (!selectedModel) {
       return;
     }
@@ -2324,11 +2726,14 @@ export function ChatPanel() {
     );
 
     if (nextEffort && selectedEffort !== nextEffort) {
+      selectedEffortRef.current = nextEffort;
       setSelectedEffort(nextEffort);
+      persistWorkspaceComposerState({ effort: nextEffort });
     }
   }, [
     activeThread?.id,
     activeThreadReasoningEffort,
+    persistWorkspaceComposerState,
     selectedModel?.id,
     selectedModel?.defaultReasoningEffort,
     selectedEffort,
@@ -2336,18 +2741,40 @@ export function ChatPanel() {
   ]);
 
   useEffect(() => {
-    if (activeThread?.engineId !== "codex") {
+    if (
+      activeThread?.engineId !== "codex" ||
+      !activeWorkspaceId ||
+      activeThread.workspaceId !== activeWorkspaceId
+    ) {
       return;
     }
 
-    setSelectedPersonality(readThreadPersonalityValue(activeThread));
-    setSelectedServiceTier(readThreadServiceTierValue(activeThread));
-    setOutputSchemaText(readThreadOutputSchemaText(activeThread));
-    setCustomApprovalPolicyText(readCodexThreadCustomApprovalPolicyText(activeThread));
-  }, [activeThread?.engineId, activeThread?.id, activeThread?.engineMetadata]);
+    const nextPersonality = readThreadPersonalityValue(activeThread);
+    const nextServiceTier = readThreadServiceTierValue(activeThread);
+    const nextOutputSchemaText = readThreadOutputSchemaText(activeThread);
+    const nextCustomApprovalPolicyText =
+      readCodexThreadCustomApprovalPolicyText(activeThread);
+
+    setSelectedPersonality(nextPersonality);
+    setSelectedServiceTier(nextServiceTier);
+    setOutputSchemaText(nextOutputSchemaText);
+    setCustomApprovalPolicyText(nextCustomApprovalPolicyText);
+    persistWorkspaceComposerState({
+      personality: nextPersonality,
+      serviceTier: nextServiceTier,
+      outputSchemaText: nextOutputSchemaText,
+      customApprovalPolicyText: nextCustomApprovalPolicyText,
+    });
+  }, [
+    activeThread?.engineId,
+    activeThread?.id,
+    activeThread?.engineMetadata,
+    activeWorkspaceId,
+    persistWorkspaceComposerState,
+  ]);
 
   useEffect(() => {
-    if (!activeThread) {
+    if (!activeThread || !activeWorkspaceId || activeThread.workspaceId !== activeWorkspaceId) {
       lastSyncedThreadIdRef.current = null;
       manuallyOverrodeThreadSelectionRef.current = false;
       return;
@@ -2358,7 +2785,10 @@ export function ChatPanel() {
     }
     lastSyncedThreadIdRef.current = activeThread.id;
     manuallyOverrodeThreadSelectionRef.current = false;
+    let nextEngineId = selectedEngineId;
     if (activeThread.engineId !== selectedEngineId) {
+      nextEngineId = activeThread.engineId;
+      selectedEngineIdRef.current = activeThread.engineId;
       setSelectedEngineId(activeThread.engineId);
     }
     const threadEngine =
@@ -2372,17 +2802,28 @@ export function ChatPanel() {
       threadEngine?.models.some((model) => model.id === preferredModelId) ?? false;
     const threadModelExists =
       threadEngine?.models.some((model) => model.id === activeThread.modelId) ?? false;
+    let nextModelId: string | null = selectedModelIdRef.current;
     if (preferredModelExists) {
+      nextModelId = preferredModelId;
+      selectedModelIdRef.current = preferredModelId;
       setSelectedModelId(preferredModelId);
     } else if (threadModelExists) {
+      nextModelId = activeThread.modelId;
+      selectedModelIdRef.current = activeThread.modelId;
       setSelectedModelId(activeThread.modelId);
     }
+    persistWorkspaceComposerState({
+      engineId: nextEngineId,
+      modelId: nextModelId,
+    });
   }, [
     activeThread?.id,
     activeThread?.engineId,
     activeThread?.modelId,
     activeThread?.engineMetadata,
+    activeWorkspaceId,
     engines,
+    persistWorkspaceComposerState,
     selectedEngineId,
   ]);
 
@@ -2669,6 +3110,12 @@ export function ChatPanel() {
       setSelectedServiceTier(nextServiceTier);
       setOutputSchemaText(nextOutputSchemaText);
       setCustomApprovalPolicyText(nextCustomApprovalPolicyText);
+      persistWorkspaceComposerState({
+        personality: nextPersonality,
+        serviceTier: nextServiceTier,
+        outputSchemaText: nextOutputSchemaText,
+        customApprovalPolicyText: nextCustomApprovalPolicyText,
+      });
     };
 
     if (!activeThreadMatchesComposer || activeThread?.engineId !== "codex") {
@@ -2698,6 +3145,33 @@ export function ChatPanel() {
       throw new Error(
         t("panel.toasts.updateCodexConfigFailed", { error: String(error) }),
       );
+    }
+  }
+
+  async function toggleFastServiceTier(nextTier?: CodexServiceTierValue) {
+    const resolvedTier = nextTier ?? (selectedServiceTier === "fast" ? "inherit" : "fast");
+    const serviceTier = resolvedTier === "inherit" ? null : resolvedTier;
+
+    try {
+      await onCodexConfigSave({
+        updatePersonality: false,
+        personality: null,
+        updateServiceTier: true,
+        serviceTier,
+        updateOutputSchema: false,
+        outputSchema: null,
+        updateApprovalPolicy: false,
+        approvalPolicy: null,
+      });
+      toast.success(
+        t("panel.toasts.fastToggled", {
+          state: resolvedTier === "fast"
+            ? t("panel.toasts.on")
+            : t("panel.toasts.off"),
+        }),
+      );
+    } catch (error) {
+      toast.error(String(error));
     }
   }
 
@@ -2872,8 +3346,51 @@ export function ChatPanel() {
   const canUseNativeCodexHistoryTools =
     canManageActiveCodexThread &&
     activeThread?.engineMetadata?.codexTranscriptImported !== false;
+  const canOpenActiveCodexThreadInCli =
+    !!activeThread &&
+    activeThread.engineId === "codex" &&
+    !!activeThread.engineThreadId &&
+    !!activeWorkspaceId;
+  const activeCodexProfileName =
+    codexProfiles.find((profile) => profile.id === activeCodexProfileId)?.name ?? "Codex profile";
 
   const isCodexEngine = selectedEngineId === "codex";
+
+  async function onActiveCodexProfileChange(profileId: string) {
+    if (!profileId || profileId === activeCodexProfileId) {
+      return;
+    }
+
+    try {
+      await setActiveCodexProfile(profileId);
+      toast.success(
+        `Switched Codex profile to ${
+          codexProfiles.find((profile) => profile.id === profileId)?.name ?? profileId
+        }.`,
+      );
+    } catch (error) {
+      toast.error(String(error));
+    }
+  }
+
+  async function onOpenActiveCodexThreadInCli() {
+    if (!activeThread || activeThread.engineId !== "codex" || !activeWorkspaceId) {
+      throw new Error(t("panel.toasts.codexThreadToolUnavailable"));
+    }
+
+    const command = await ipc.buildCodexResumeCommandForThread(activeThread.id);
+    if (!command) {
+      throw new Error("The active Codex thread cannot be resumed in the CLI yet.");
+    }
+
+    await setLayoutMode(activeWorkspaceId, "terminal");
+    const launched = await runCommandInTerminal(activeWorkspaceId, command);
+    if (!launched) {
+      throw new Error("Failed to open the integrated terminal for this Codex thread.");
+    }
+
+    toast.success("Opened the active Codex thread in the terminal.");
+  }
 
   const slashCommands: SlashCommand[] = useMemo(
     () => [
@@ -2954,19 +3471,224 @@ export function ChatPanel() {
   );
 
   const filteredSlashCommands = useMemo(() => {
-    if (!slashMenuQuery) return slashCommands;
-    const q = slashMenuQuery.toLowerCase();
+    if (composerTrigger?.kind !== "slash" || !composerTrigger.query) {
+      return slashCommands;
+    }
+    const q = composerTrigger.query.toLowerCase();
     return slashCommands.filter(
       (c) =>
         c.name.toLowerCase().startsWith(q) ||
         c.id.startsWith(q) ||
         c.description.toLowerCase().includes(q),
     );
-  }, [slashCommands, slashMenuQuery]);
+  }, [composerTrigger?.kind, composerTrigger?.query, slashCommands]);
+
+  const composerMenuItems = useMemo<ComposerMenuActionItem[]>(() => {
+    if (!composerTrigger) {
+      return [];
+    }
+
+    if (composerTrigger.kind === "slash") {
+      return filteredSlashCommands.map((command) => ({
+        id: `slash:${command.id}`,
+        name: command.name[0].toUpperCase() + command.name.slice(1),
+        description: command.description,
+        icon: command.icon,
+        badge: command.codexOnly ? "Codex" : undefined,
+        disabled: command.disabled,
+        action: {
+          type: "slash",
+          commandId: command.id,
+        },
+      }));
+    }
+
+    if (composerTrigger.kind === "reference") {
+      if (!isCodexEngine) {
+        return [
+          {
+            id: "reference:disabled",
+            name: "Codex references",
+            description: "Switch to Codex to use skills, apps, and plugins.",
+            icon: Sparkles,
+            badge: "Codex",
+            disabled: true,
+            action: { type: "none" },
+          },
+        ];
+      }
+
+      const skills = (
+        codexReferenceCatalogState.skillsLoaded
+          ? codexSkills
+          : (codexProtocolDiagnostics?.skills ?? [])
+      ).filter((skill) => skill.enabled);
+      const apps = (
+        codexReferenceCatalogState.appsLoaded
+          ? codexApps
+          : (codexProtocolDiagnostics?.apps ?? [])
+      ).filter((app) => app.isEnabled && app.isAccessible);
+      const items: ComposerMenuActionItem[] = [
+        ...skills.map((skill) => ({
+          id: `skill:${skill.path}`,
+          name: skill.name,
+          description: skill.description || skill.path,
+          icon: Sparkles,
+          badge: "Skill",
+          action: {
+            type: "reference" as const,
+            insertText: `$${normalizeCodexReferenceToken(skill.name)}`,
+          },
+        })),
+        ...apps.map((app) => ({
+          id: `app:${app.id}`,
+          name: app.name,
+          description: app.description || `app://${app.id}`,
+          icon: Monitor,
+          badge: "App",
+          action: {
+            type: "reference" as const,
+            insertText: `$${normalizeCodexReferenceToken(app.id)}`,
+          },
+        })),
+        ...codexPluginMarketplaces.flatMap((marketplace) =>
+          marketplace.plugins
+            .filter((plugin) => plugin.enabled && plugin.installed)
+            .map((plugin) => ({
+              id: `plugin:${marketplace.name}:${plugin.id}`,
+              name: plugin.name,
+              description:
+                plugin.description || `${marketplace.name} plugin${plugin.developerName ? ` by ${plugin.developerName}` : ""}`,
+              icon: Server,
+              badge: "Plugin",
+              action: {
+                type: "reference" as const,
+                insertText: `$${normalizeCodexReferenceToken(plugin.id)}`,
+              },
+            })),
+        ),
+      ];
+      const query = composerTrigger.query.toLowerCase();
+      const filteredItems = !query
+        ? items
+        : items.filter((item) => {
+            const haystack = `${item.name} ${item.description}`.toLowerCase();
+            return haystack.includes(query);
+          });
+      if (filteredItems.length === 0) {
+        return [
+          {
+            id: "reference:none",
+            name: "No Codex references",
+            description: "No skill, app, or plugin matches this query.",
+            icon: Sparkles,
+            disabled: true,
+            action: { type: "none" },
+          },
+        ];
+      }
+      return filteredItems.slice(0, 12);
+    }
+
+    if (!activeRepo?.path) {
+      return [
+        {
+          id: "file:no-repo",
+          name: "Repo files unavailable",
+          description: "Select a repository tab to search files with @.",
+          icon: File,
+          disabled: true,
+          action: { type: "none" },
+        },
+      ];
+    }
+
+    if (repoFileEntriesLoading && repoFileEntries.length === 0) {
+      return [
+        {
+          id: "file:loading",
+          name: "Loading files",
+          description: "Scanning the active repository for file suggestions.",
+          icon: File,
+          disabled: true,
+          action: { type: "none" },
+        },
+      ];
+    }
+
+    const fileEntries = repoFileEntries.filter((entry) => !entry.isDir);
+    const query = composerTrigger.query.toLowerCase();
+    const filteredItems = fileEntries
+      .filter((entry) => !query || scoreFileSearchResult(entry.path, query) > 0)
+      .sort((left, right) => {
+        const scoreDelta =
+          scoreFileSearchResult(right.path, query) - scoreFileSearchResult(left.path, query);
+        if (scoreDelta !== 0) {
+          return scoreDelta;
+        }
+        return left.path.localeCompare(right.path);
+      })
+      .slice(0, 20)
+      .map((entry) => {
+        const fileName = fileNameFromPath(entry.path);
+        const mimeType = guessMimeType(fileName);
+        return {
+          id: `file:${entry.path}`,
+          name: fileName,
+          description: entry.path,
+          icon: mimeType?.startsWith("image/") ? Image : FileText,
+          badge: mimeType?.startsWith("image/") ? "Image" : "File",
+          action: {
+            type: "file" as const,
+            relativePath: entry.path,
+            absolutePath: joinFileSystemPath(activeRepo.path, entry.path),
+            attachAsImage: mimeType?.startsWith("image/") === true,
+          },
+        };
+      });
+
+    if (filteredItems.length === 0) {
+      return [
+        {
+          id: "file:none",
+          name: "No files found",
+          description: "No repository file matches this query.",
+          icon: File,
+          disabled: true,
+          action: { type: "none" },
+        },
+      ];
+    }
+
+    return filteredItems;
+  }, [
+    activeRepo?.path,
+    codexApps,
+    codexPluginMarketplaces,
+    codexProtocolDiagnostics?.apps,
+    codexProtocolDiagnostics?.skills,
+    codexReferenceCatalogState.appsLoaded,
+    codexReferenceCatalogState.skillsLoaded,
+    codexSkills,
+    composerTrigger,
+    filteredSlashCommands,
+    isCodexEngine,
+    repoFileEntries,
+    repoFileEntriesLoading,
+  ]);
+
+  useEffect(() => {
+    if (composerMenuItems.length === 0) {
+      setComposerMenuActiveIndex(0);
+      return;
+    }
+    setComposerMenuActiveIndex((current) =>
+      Math.min(current, composerMenuItems.length - 1),
+    );
+  }, [composerMenuItems.length]);
 
   function handleSlashCommandSelect(commandId: string) {
-    setSlashMenuOpen(false);
-    setSlashMenuQuery("");
+    setComposerTrigger(null);
 
     const cmd = slashCommands.find((c) => c.id === commandId);
     if (!cmd || cmd.disabled) return;
@@ -2974,11 +3696,7 @@ export function ChatPanel() {
     // /fast is a simple toggle — no panel needed
     if (commandId === "fast") {
       setInput("");
-      const nextTier = selectedServiceTier === "fast" ? "inherit" : "fast";
-      handleCommandPanelConfirm(
-        { type: "fast" } as ActiveSlashCommand,
-        { serviceTier: nextTier },
-      );
+      void toggleFastServiceTier();
       return;
     }
 
@@ -3020,24 +3738,7 @@ export function ChatPanel() {
           break;
         case "fast":
           if (payload?.serviceTier !== undefined) {
-            const tier = payload.serviceTier === "inherit" ? null : payload.serviceTier;
-            await onCodexConfigSave({
-              updatePersonality: false,
-              personality: null,
-              updateServiceTier: true,
-              serviceTier: tier,
-              updateOutputSchema: false,
-              outputSchema: null,
-              updateApprovalPolicy: false,
-              approvalPolicy: null,
-            });
-            toast.success(
-              t("panel.toasts.fastToggled", {
-                state: payload.serviceTier === "fast"
-                  ? t("panel.toasts.on")
-                  : t("panel.toasts.off"),
-              }),
-            );
+            await toggleFastServiceTier(payload.serviceTier as CodexServiceTierValue);
           }
           break;
         case "personality":
@@ -3066,15 +3767,60 @@ export function ChatPanel() {
     }
   }
 
-  function handleSlashDetection(value: string, cursorPos: number) {
-    const textBeforeCursor = value.slice(0, cursorPos);
-    const slashMatch = /(?:^|\s)(\/([a-z]*))$/.exec(textBeforeCursor);
-    if (slashMatch) {
-      setSlashMenuOpen(true);
-      setSlashMenuQuery(slashMatch[2] ?? "");
-      setSlashMenuActiveIndex(0);
-    } else if (slashMenuOpen) {
-      setSlashMenuOpen(false);
+  function syncComposerTrigger(value: string, cursorPos: number) {
+    const nextTrigger = findComposerTrigger(value, cursorPos);
+    setComposerTrigger(nextTrigger);
+    setComposerMenuActiveIndex(0);
+  }
+
+  function updateTextareaValue(nextValue: string, cursorPos: number) {
+    setInput(nextValue);
+    window.requestAnimationFrame(() => {
+      inputRef.current?.focus();
+      inputRef.current?.setSelectionRange(cursorPos, cursorPos);
+      const nextTrigger = findComposerTrigger(nextValue, cursorPos);
+      setComposerTrigger(nextTrigger);
+      setComposerMenuActiveIndex(0);
+    });
+  }
+
+  function replaceComposerToken(replacement: string) {
+    if (!composerTrigger) {
+      return;
+    }
+    const prefix = input.slice(0, composerTrigger.replaceFrom);
+    let suffix = input.slice(composerTrigger.replaceTo);
+    if (!replacement && prefix.endsWith(" ") && suffix.startsWith(" ")) {
+      suffix = suffix.slice(1);
+    }
+    const insertion = buildComposerInsertion(input, composerTrigger.replaceTo, replacement);
+    const nextValue = `${prefix}${insertion}${suffix}`;
+    updateTextareaValue(nextValue, prefix.length + insertion.length);
+  }
+
+  function handleComposerItemSelect(itemId: string) {
+    const item = composerMenuItems.find((candidate) => candidate.id === itemId);
+    if (!item || item.disabled) {
+      return;
+    }
+
+    switch (item.action.type) {
+      case "slash":
+        handleSlashCommandSelect(item.action.commandId);
+        break;
+      case "reference":
+        replaceComposerToken(item.action.insertText);
+        break;
+      case "file":
+        if (item.action.attachAsImage) {
+          appendAttachmentsFromPaths([item.action.absolutePath]);
+          replaceComposerToken("");
+        } else {
+          replaceComposerToken(quoteComposerPath(item.action.relativePath));
+        }
+        break;
+      case "none":
+        break;
     }
   }
 
@@ -3083,6 +3829,10 @@ export function ChatPanel() {
     if (!input.trim() || !activeWorkspaceId) return;
     const text = input.trim();
     const currentAttachments = [...attachments];
+    const activeShellCommand =
+      selectedEngineId === "codex" && currentAttachments.length === 0 && !planMode
+        ? extractShellCommand(text)
+        : null;
 
     if (streaming) {
       if (!canSteerActiveTurn) {
@@ -3091,6 +3841,17 @@ export function ChatPanel() {
 
       const activeThreadId = threadId ?? activeThread?.id ?? null;
       if (!activeThreadId) {
+        return;
+      }
+
+      if (activeShellCommand) {
+        const executed = await runCodexShellCommand(activeShellCommand, {
+          threadIdOverride: activeThreadId,
+        });
+        if (executed) {
+          setInput("");
+          setAttachments([]);
+        }
         return;
       }
 
@@ -3115,6 +3876,10 @@ export function ChatPanel() {
     const submitEngineId = composerRuntime.engineId;
     const submitModelId = composerRuntime.modelId;
     const submitReasoningEffort = composerRuntime.reasoningEffort;
+    const shellCommand =
+      submitEngineId === "codex" && currentAttachments.length === 0 && !planMode
+        ? extractShellCommand(text)
+        : null;
 
     const activeScopeRepoId = activeRepo?.id ?? null;
     const activeThreadInScope = activeThread
@@ -3155,7 +3920,9 @@ export function ChatPanel() {
       await bindChatThread(createdThreadId);
     }
 
-    const inputItems = await resolveCodexInputItems(text, submitEngineId);
+    const inputItems = shellCommand
+      ? undefined
+      : await resolveCodexInputItems(text, submitEngineId);
 
     const currentThread =
       useThreadStore.getState().threads.find((thread) => thread.id === targetThreadId) ??
@@ -3181,6 +3948,7 @@ export function ChatPanel() {
           threadId: targetThreadId,
           threadPaths: availableRepoPaths,
           text,
+          shellCommand,
           attachments: [...attachments],
           inputItems: inputItems ?? null,
           planMode,
@@ -3206,6 +3974,20 @@ export function ChatPanel() {
       return;
     }
     setThreadLastModelLocal(targetThreadId, submitModelId);
+
+    if (shellCommand) {
+      const executed = await runCodexShellCommand(shellCommand, {
+        threadIdOverride: targetThreadId,
+        engineId: submitEngineId,
+        modelId: submitModelId,
+        reasoningEffort: submitReasoningEffort,
+      });
+      if (executed) {
+        setInput("");
+        setAttachments([]);
+      }
+      return;
+    }
 
     const sent = await send(text, {
       threadIdOverride: targetThreadId,
@@ -3245,15 +4027,22 @@ export function ChatPanel() {
       }
       setThreadLastModelLocal(prompt.threadId, prompt.modelId);
 
-      const sent = await send(prompt.text, {
-        threadIdOverride: prompt.threadId,
-        engineId: prompt.engineId,
-        modelId: prompt.modelId,
-        reasoningEffort: prompt.effort,
-        attachments: prompt.attachments.length > 0 ? prompt.attachments : undefined,
-        inputItems: prompt.inputItems ?? undefined,
-        planMode: prompt.planMode,
-      });
+      const sent = prompt.shellCommand
+        ? await runCodexShellCommand(prompt.shellCommand, {
+            threadIdOverride: prompt.threadId,
+            engineId: prompt.engineId,
+            modelId: prompt.modelId,
+            reasoningEffort: prompt.effort,
+          })
+        : await send(prompt.text, {
+            threadIdOverride: prompt.threadId,
+            engineId: prompt.engineId,
+            modelId: prompt.modelId,
+            reasoningEffort: prompt.effort,
+            attachments: prompt.attachments.length > 0 ? prompt.attachments : undefined,
+            inputItems: prompt.inputItems ?? undefined,
+            planMode: prompt.planMode,
+          });
       if (!sent) {
         setInput(prompt.text);
         setAttachments(prompt.attachments);
@@ -3273,6 +4062,7 @@ export function ChatPanel() {
   async function onReasoningEffortChange(nextEffort: string) {
     selectedEffortRef.current = nextEffort;
     setSelectedEffort(nextEffort);
+    persistWorkspaceComposerState({ effort: nextEffort });
     const targetThreadId = threadId ?? activeThread?.id ?? null;
     if (!targetThreadId) {
       return;
@@ -3384,38 +4174,6 @@ export function ChatPanel() {
       toast.error(t("panel.toasts.updateExecutionPolicyFailed", { error: String(error) }));
       await refreshThreads(currentThread.workspaceId);
     }
-  }
-
-  function startThreadTitleEdit() {
-    if (!activeThread) {
-      return;
-    }
-    setThreadTitleDraft(activeThread.title ?? "");
-    setEditingThreadTitle(true);
-  }
-
-  function cancelThreadTitleEdit() {
-    setThreadTitleDraft(activeThread?.title ?? "");
-    setEditingThreadTitle(false);
-  }
-
-  async function saveThreadTitleEdit() {
-    if (!activeThread) {
-      setEditingThreadTitle(false);
-      return;
-    }
-
-    const normalized = threadTitleDraft.trim();
-    if (!normalized) {
-      cancelThreadTitleEdit();
-      return;
-    }
-
-    if (normalized !== (activeThread.title ?? "")) {
-      await renameThread(activeThread.id, normalized);
-    }
-
-    setEditingThreadTitle(false);
   }
 
   async function handleAddAttachment() {
@@ -3591,10 +4349,6 @@ export function ChatPanel() {
   }, [renderAssistantIdentity, visibleMessages]);
 
   const workspaceName = activeWorkspace?.name || activeWorkspace?.rootPath.split("/").pop() || "";
-
-  // Compute total diff stats for header display
-  const gitFiles = gitStatus?.files ?? [];
-  const totalAdded = gitFiles.length;
   const layoutMode: LayoutMode = activeWorkspaceId
     ? (terminalWorkspaceState?.layoutMode ?? "chat")
     : "chat";
@@ -3602,10 +4356,159 @@ export function ChatPanel() {
   const isSplitLayoutActive = layoutMode === "split";
   const isTerminalLayoutActive = layoutMode === "terminal";
   const isEditorLayoutActive = layoutMode === "editor";
-  const showFocusModeHeader = focusMode && !showSidebar && (layoutMode === "chat" || layoutMode === "split");
   const terminalPanelSize = activeWorkspaceId
     ? terminalWorkspaceState?.panelSize ?? 32
     : 32;
+  const layoutModeButtons = useMemo(
+    () => [
+      {
+        key: "chat",
+        title: t("panel.layout.chatOnly"),
+        active: isChatLayoutActive,
+        disabled: !activeWorkspaceId,
+        icon: <MessageSquare size={12} />,
+        onClick: () => {
+          if (activeWorkspaceId) {
+            void setLayoutMode(activeWorkspaceId, "chat");
+          }
+        },
+      },
+      {
+        key: "split",
+        title: t("panel.layout.splitView"),
+        active: isSplitLayoutActive,
+        disabled: !activeWorkspaceId,
+        icon: <Monitor size={12} />,
+        onClick: () => {
+          if (activeWorkspaceId) {
+            void setLayoutMode(activeWorkspaceId, "split");
+          }
+        },
+      },
+      {
+        key: "terminal",
+        title: t("panel.layout.terminalOnly"),
+        active: isTerminalLayoutActive,
+        disabled: !activeWorkspaceId,
+        icon: <SquareTerminal size={12} />,
+        onClick: () => {
+          if (activeWorkspaceId) {
+            void setLayoutMode(activeWorkspaceId, "terminal");
+          }
+        },
+      },
+      {
+        key: "editor",
+        title: t("panel.layout.fileEditor"),
+        active: isEditorLayoutActive,
+        disabled: !activeWorkspaceId,
+        icon: <FilePen size={12} />,
+        onClick: () => {
+          if (activeWorkspaceId) {
+            void setLayoutMode(activeWorkspaceId, "editor");
+          }
+        },
+      },
+    ],
+    [
+      activeWorkspaceId,
+      isChatLayoutActive,
+      isEditorLayoutActive,
+      isSplitLayoutActive,
+      isTerminalLayoutActive,
+      setLayoutMode,
+      t,
+    ],
+  );
+  const openProjectTabThreads = useMemo(() => {
+    if (!activeWorkspaceId) {
+      return [];
+    }
+
+    const threadIds = tabThreadIdsByWorkspace[activeWorkspaceId] ?? [];
+    const threadsById = new Map(
+      threads
+        .filter((thread) => thread.workspaceId === activeWorkspaceId)
+        .map((thread) => [thread.id, thread] as const),
+    );
+
+    return threadIds
+      .map((threadId) => threadsById.get(threadId) ?? null)
+      .filter((thread): thread is Thread => thread !== null);
+  }, [activeWorkspaceId, tabThreadIdsByWorkspace, threads]);
+  const activeProjectTabThreadId =
+    activeWorkspaceId
+      ? activeThreadIdByWorkspace[activeWorkspaceId] ?? activeThread?.id ?? null
+      : null;
+
+  const handleSelectProjectTab = useCallback(
+    (thread: Thread) => {
+      void switchProjectThread(thread);
+    },
+    [switchProjectThread],
+  );
+
+  const handleCloseProjectTab = useCallback(
+    (thread: Thread) => {
+      void closeProjectTab(thread.workspaceId, thread.id);
+    },
+    [closeProjectTab],
+  );
+
+  const handleCreateProjectTab = useCallback(() => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    if (creatingProjectTabRef.current) {
+      return;
+    }
+
+    const activeScopeRepoId = activeRepo?.id ?? null;
+    void (async () => {
+      creatingProjectTabRef.current = true;
+      setCreatingProjectTab(true);
+      try {
+        const createdThreadId = await createThread({
+          workspaceId: activeWorkspaceId,
+          repoId: activeScopeRepoId,
+          engineId: selectedEngineId,
+          modelId: selectedModelId ?? undefined,
+          title: activeRepo
+            ? t("panel.repoChatTitle", { name: activeRepo.name })
+            : t("panel.workspaceChatTitle"),
+        });
+        if (!createdThreadId) {
+          return;
+        }
+
+        const createdThread =
+          useThreadStore
+            .getState()
+            .threads.find(
+              (thread) => thread.id === createdThreadId && thread.workspaceId === activeWorkspaceId,
+            ) ?? null;
+        if (createdThread) {
+          await switchProjectThread(createdThread);
+          return;
+        }
+
+        await bindChatThread(createdThreadId);
+      } finally {
+        creatingProjectTabRef.current = false;
+        setCreatingProjectTab(false);
+      }
+    })();
+  }, [
+    activeRepo,
+    activeWorkspaceId,
+    bindChatThread,
+    creatingProjectTabRef,
+    createThread,
+    selectedEngineId,
+    selectedModelId,
+    switchProjectThread,
+    t,
+  ]);
 
   const hasTerminalMountedRef = useRef(false);
   const hasEditorMountedRef = useRef(false);
@@ -3663,320 +4566,17 @@ export function ChatPanel() {
         background: "var(--content-bg)",
       }}
     >
-      {(!focusMode || showSidebar) && (
-        <div
-          onMouseDown={handleDragMouseDown}
-          onDoubleClick={handleDragDoubleClick}
-          style={{
-            height: "var(--panel-header-height)",
-            padding: "0 16px",
-            paddingLeft: showSidebar ? 16 : (customWindowFrame ? 16 : 80),
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            borderBottom: "1px solid var(--border)",
-            flexShrink: 0,
-          }}
-        >
-          {/* Breadcrumb: workspace / thread title / +N files */}
-          <div className="no-drag" style={{ flex: 1, display: "flex", alignItems: "center", gap: 0, minWidth: 0 }}>
-            {workspaceName && (
-              <>
-                <span
-                  style={{
-                    fontSize: 12,
-                    color: "var(--text-3)",
-                    whiteSpace: "nowrap",
-                    flexShrink: 0,
-                  }}
-                >
-                  {workspaceName}
-                </span>
-                <span style={{ fontSize: 12, color: "var(--border)", margin: "0 6px", flexShrink: 0 }}>/</span>
-              </>
-            )}
-            {editingThreadTitle && activeThread ? (
-              <input
-                ref={titleInputRef}
-                value={threadTitleDraft}
-                onChange={(event) => setThreadTitleDraft(event.target.value)}
-                onBlur={cancelThreadTitleEdit}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    void saveThreadTitleEdit();
-                    return;
-                  }
-                  if (event.key === "Escape") {
-                    event.preventDefault();
-                    cancelThreadTitleEdit();
-                  }
-                }}
-                style={{
-                  minWidth: 120,
-                  width: "100%",
-                  fontSize: 13.5,
-                  fontWeight: 600,
-                  letterSpacing: "-0.01em",
-                  color: "var(--text-1)",
-                  background: "var(--bg-3)",
-                  border: "1px solid var(--border-active)",
-                  borderRadius: "var(--radius-sm)",
-                  padding: "4px 8px",
-                }}
-              />
-            ) : (
-              <button
-                type="button"
-                onClick={startThreadTitleEdit}
-                disabled={!activeThread}
-                title={activeThread ? t("panel.renameThread") : ""}
-                style={{
-                  border: "none",
-                  background: "transparent",
-                  padding: "2px 6px",
-                  margin: 0,
-                  fontSize: 13.5,
-                  fontWeight: 600,
-                  letterSpacing: "-0.01em",
-                  color: "var(--text-1)",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                  cursor: activeThread ? "text" : "default",
-                  textAlign: "left",
-                  borderRadius: "var(--radius-sm)",
-                  transition: "background var(--duration-fast) var(--ease-out)",
-                }}
-                onMouseEnter={(e) => {
-                  if (activeThread) e.currentTarget.style.background = "rgba(255,255,255,0.04)";
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.background = "transparent";
-                }}
-              >
-                {activeThread?.title || (
-                  layoutMode === "terminal" ? t("panel.threadTitle.terminal")
-                  : layoutMode === "editor" ? t("panel.threadTitle.fileEditor")
-                  : layoutMode === "split" ? t("panel.threadTitle.newChat")
-                  : t("panel.threadTitle.newChat")
-                )}
-              </button>
-            )}
-            {totalAdded > 0 && (
-              <>
-                <span style={{ fontSize: 12, color: "var(--border)", margin: "0 6px", flexShrink: 0 }}>/</span>
-                <span
-                  style={{
-                    fontSize: 11,
-                    fontFamily: '"JetBrains Mono", monospace',
-                    color: "var(--warning)",
-                    whiteSpace: "nowrap",
-                    flexShrink: 0,
-                  }}
-                >
-                  {t("panel.changedFiles", { count: totalAdded })}
-                </span>
-              </>
-            )}
-          </div>
-
-          {/* Right-side action buttons */}
-          <div className="no-drag" style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            <div className="layout-mode-switcher">
-              <button
-                type="button"
-                title={t("panel.layout.chatOnly")}
-                disabled={!activeWorkspaceId}
-                onClick={() => activeWorkspaceId && void setLayoutMode(activeWorkspaceId, "chat")}
-                className={`layout-mode-btn ${isChatLayoutActive ? "active" : ""}`}
-              >
-                <MessageSquare size={12} />
-              </button>
-              <button
-                type="button"
-                title={t("panel.layout.splitView")}
-                disabled={!activeWorkspaceId}
-                onClick={() => activeWorkspaceId && void setLayoutMode(activeWorkspaceId, "split")}
-                className={`layout-mode-btn ${isSplitLayoutActive ? "active" : ""}`}
-              >
-                <Monitor size={12} />
-              </button>
-              <button
-                type="button"
-                title={t("panel.layout.terminalOnly")}
-                disabled={!activeWorkspaceId}
-                onClick={() => activeWorkspaceId && void setLayoutMode(activeWorkspaceId, "terminal")}
-                className={`layout-mode-btn ${isTerminalLayoutActive ? "active" : ""}`}
-              >
-                <SquareTerminal size={12} />
-              </button>
-              <button
-                type="button"
-                title={t("panel.layout.fileEditor")}
-                disabled={!activeWorkspaceId}
-                onClick={() => activeWorkspaceId && void setLayoutMode(activeWorkspaceId, "editor")}
-                className={`layout-mode-btn ${isEditorLayoutActive ? "active" : ""}`}
-              >
-                <FilePen size={12} />
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {showFocusModeHeader && (
-        <div
-          className="chat-focus-header"
-          onMouseDown={handleDragMouseDown}
-          onDoubleClick={handleDragDoubleClick}
-        >
-          <div
-            className="chat-focus-header-leading"
-            style={{ width: useTitlebarSafeInset ? 74 : 16 }}
-          />
-
-          <div className="chat-focus-header-content no-drag" style={{ flex: 1, display: "flex", alignItems: "center", gap: 0, minWidth: 0 }}>
-            {workspaceName && (
-              <>
-                <span
-                  style={{
-                    fontSize: 12,
-                    color: "var(--text-3)",
-                    whiteSpace: "nowrap",
-                    flexShrink: 0,
-                  }}
-                >
-                  {workspaceName}
-                </span>
-                <span style={{ fontSize: 12, color: "var(--border)", margin: "0 6px", flexShrink: 0 }}>/</span>
-              </>
-            )}
-            {editingThreadTitle && activeThread ? (
-              <input
-                ref={titleInputRef}
-                value={threadTitleDraft}
-                onChange={(event) => setThreadTitleDraft(event.target.value)}
-                onBlur={cancelThreadTitleEdit}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    void saveThreadTitleEdit();
-                    return;
-                  }
-                  if (event.key === "Escape") {
-                    event.preventDefault();
-                    cancelThreadTitleEdit();
-                  }
-                }}
-                style={{
-                  minWidth: 120,
-                  width: "100%",
-                  fontSize: 13.5,
-                  fontWeight: 600,
-                  letterSpacing: "-0.01em",
-                  color: "var(--text-1)",
-                  background: "var(--bg-3)",
-                  border: "1px solid var(--border-active)",
-                  borderRadius: "var(--radius-sm)",
-                  padding: "4px 8px",
-                }}
-              />
-            ) : (
-              <button
-                type="button"
-                onClick={startThreadTitleEdit}
-                disabled={!activeThread}
-                title={activeThread ? t("panel.renameThread") : ""}
-                style={{
-                  border: "none",
-                  background: "transparent",
-                  padding: "2px 6px",
-                  margin: 0,
-                  fontSize: 13.5,
-                  fontWeight: 600,
-                  letterSpacing: "-0.01em",
-                  color: "var(--text-1)",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                  cursor: activeThread ? "text" : "default",
-                  textAlign: "left",
-                  borderRadius: "var(--radius-sm)",
-                  transition: "background var(--duration-fast) var(--ease-out)",
-                }}
-                onMouseEnter={(e) => {
-                  if (activeThread) e.currentTarget.style.background = "rgba(255,255,255,0.04)";
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.background = "transparent";
-                }}
-              >
-                {activeThread?.title || (
-                  layoutMode === "split" ? t("panel.threadTitle.newChat")
-                  : t("panel.threadTitle.newChat")
-                )}
-              </button>
-            )}
-            {totalAdded > 0 && (
-              <>
-                <span style={{ fontSize: 12, color: "var(--border)", margin: "0 6px", flexShrink: 0 }}>/</span>
-                <span
-                  style={{
-                    fontSize: 11,
-                    fontFamily: '"JetBrains Mono", monospace',
-                    color: "var(--warning)",
-                    whiteSpace: "nowrap",
-                    flexShrink: 0,
-                  }}
-                >
-                  {t("panel.changedFiles", { count: totalAdded })}
-                </span>
-              </>
-            )}
-          </div>
-
-          <div className="no-drag" style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            <div className="layout-mode-switcher">
-              <button
-                type="button"
-                title={t("panel.layout.chatOnly")}
-                disabled={!activeWorkspaceId}
-                onClick={() => activeWorkspaceId && void setLayoutMode(activeWorkspaceId, "chat")}
-                className={`layout-mode-btn ${isChatLayoutActive ? "active" : ""}`}
-              >
-                <MessageSquare size={12} />
-              </button>
-              <button
-                type="button"
-                title={t("panel.layout.splitView")}
-                disabled={!activeWorkspaceId}
-                onClick={() => activeWorkspaceId && void setLayoutMode(activeWorkspaceId, "split")}
-                className={`layout-mode-btn ${isSplitLayoutActive ? "active" : ""}`}
-              >
-                <Monitor size={12} />
-              </button>
-              <button
-                type="button"
-                title={t("panel.layout.terminalOnly")}
-                disabled={!activeWorkspaceId}
-                onClick={() => activeWorkspaceId && void setLayoutMode(activeWorkspaceId, "terminal")}
-                className={`layout-mode-btn ${isTerminalLayoutActive ? "active" : ""}`}
-              >
-                <SquareTerminal size={12} />
-              </button>
-              <button
-                type="button"
-                title={t("panel.layout.fileEditor")}
-                disabled={!activeWorkspaceId}
-                onClick={() => activeWorkspaceId && void setLayoutMode(activeWorkspaceId, "editor")}
-                className={`layout-mode-btn ${isEditorLayoutActive ? "active" : ""}`}
-              >
-                <FilePen size={12} />
-              </button>
-            </div>
-          </div>
-        </div>
+      {activeWorkspaceId && (
+        <ProjectConversationTabsBar
+          workspaceName={workspaceName}
+          threads={openProjectTabThreads}
+          activeThreadId={activeProjectTabThreadId}
+          creatingThread={creatingProjectTab}
+          layoutModeButtons={layoutModeButtons}
+          onSelectThread={handleSelectProjectTab}
+          onCloseThread={handleCloseProjectTab}
+          onCreateThread={handleCreateProjectTab}
+        />
       )}
 
       <div ref={contentAreaRef} className="chat-terminal-content">
@@ -3993,7 +4593,7 @@ export function ChatPanel() {
             visibility: (layoutMode === "terminal" || layoutMode === "editor") ? "hidden" : "visible",
             display: "flex",
             flexDirection: "column",
-            outline: isFileDropOver ? "2px dashed rgba(96, 165, 250, 0.7)" : "none",
+            outline: isFileDropOver ? "2px dashed color-mix(in srgb, var(--accent) 62%, transparent)" : "none",
             outlineOffset: isFileDropOver ? "-8px" : undefined,
           }}
         >
@@ -4003,8 +4603,8 @@ export function ChatPanel() {
                   position: "absolute",
                   inset: 12,
                   borderRadius: "var(--radius-md)",
-                  border: "1px solid rgba(96, 165, 250, 0.45)",
-                  background: "rgba(96, 165, 250, 0.08)",
+                  border: "1px solid color-mix(in srgb, var(--accent) 34%, transparent)",
+                  background: "color-mix(in srgb, var(--accent) 8%, transparent)",
                   color: "var(--text-1)",
                   fontSize: 13,
                   fontWeight: 600,
@@ -4063,6 +4663,11 @@ export function ChatPanel() {
               <p style={{ margin: 0, fontSize: 12.5 }}>
                 {t("panel.emptyHint")}
               </p>
+              {selectedEngineId === "codex" && activeWorkspaceId && (
+                <p style={{ margin: "8px 0 0", fontSize: 12, color: "var(--text-3)" }}>
+                  {t("panel.emptyCodexSidebarHint")}
+                </p>
+              )}
             </div>
           </div>
         ) : virtualizationEnabled && virtualWindow ? (
@@ -4136,9 +4741,13 @@ export function ChatPanel() {
               gap: 6,
               padding: "6px 10px",
               borderRadius: "var(--radius-sm)",
-              border: streaming ? "1px solid rgba(96, 165, 250, 0.25)" : "1px solid var(--border)",
-              background: streaming ? "rgba(96, 165, 250, 0.08)" : "var(--bg-2)",
-              color: streaming ? "var(--info)" : "var(--text-2)",
+              border: streaming
+                ? "1px solid color-mix(in srgb, var(--accent) 24%, transparent)"
+                : "1px solid var(--border)",
+              background: streaming
+                ? "color-mix(in srgb, var(--accent) 8%, transparent)"
+                : "var(--bg-2)",
+              color: streaming ? "var(--accent-2)" : "var(--text-2)",
               fontSize: 11.5,
               cursor: "pointer",
               boxShadow: "0 8px 24px rgba(0,0,0,0.28)",
@@ -4151,7 +4760,7 @@ export function ChatPanel() {
                   width: 6,
                   height: 6,
                   borderRadius: "50%",
-                  background: "var(--info)",
+                  background: "var(--accent-2)",
                   animation: "pulse-soft 1.5s ease-in-out infinite",
                   flexShrink: 0,
                 }}
@@ -4540,35 +5149,47 @@ export function ChatPanel() {
                   value={input}
                   onChange={(e) => {
                     setInput(e.target.value);
-                    handleSlashDetection(
+                    syncComposerTrigger(
                       e.target.value,
                       e.target.selectionStart ?? e.target.value.length,
                     );
                   }}
+                  onSelect={(e) => {
+                    const target = e.currentTarget;
+                    syncComposerTrigger(
+                      target.value,
+                      target.selectionStart ?? target.value.length,
+                    );
+                  }}
                   onKeyDown={(e) => {
-                    /* ── Slash menu keyboard nav ── */
-                    if (slashMenuOpen) {
+                    /* ── Composer menu keyboard nav ── */
+                    if (composerTrigger && composerMenuItems.length > 0) {
                       if (e.key === "ArrowDown") {
                         e.preventDefault();
-                        setSlashMenuActiveIndex((i) =>
-                          Math.min(i + 1, filteredSlashCommands.length - 1),
+                        setComposerMenuActiveIndex((i) =>
+                          Math.min(i + 1, composerMenuItems.length - 1),
                         );
                         return;
                       }
                       if (e.key === "ArrowUp") {
                         e.preventDefault();
-                        setSlashMenuActiveIndex((i) => Math.max(i - 1, 0));
+                        setComposerMenuActiveIndex((i) => Math.max(i - 1, 0));
                         return;
                       }
                       if (e.key === "Enter" || e.key === "Tab") {
                         e.preventDefault();
-                        const cmd = filteredSlashCommands[Math.min(slashMenuActiveIndex, filteredSlashCommands.length - 1)];
-                        if (cmd) handleSlashCommandSelect(cmd.id);
+                        const item =
+                          composerMenuItems[
+                            Math.min(composerMenuActiveIndex, composerMenuItems.length - 1)
+                          ];
+                        if (item) {
+                          handleComposerItemSelect(item.id);
+                        }
                         return;
                       }
                       if (e.key === "Escape") {
                         e.preventDefault();
-                        setSlashMenuOpen(false);
+                        setComposerTrigger(null);
                         return;
                       }
                     }
@@ -4618,28 +5239,27 @@ export function ChatPanel() {
                   }}
                 />
 
-                {/* Slash command menu (portal) */}
-                <ChatSlashMenu
-                  visible={slashMenuOpen && filteredSlashCommands.length > 0}
-                  query={slashMenuQuery}
-                  commands={filteredSlashCommands}
+                <ChatComposerMenu
+                  visible={Boolean(composerTrigger) && composerMenuItems.length > 0}
+                  queryKey={
+                    composerTrigger
+                      ? `${composerTrigger.kind}:${composerTrigger.query}:${composerTrigger.replaceFrom}:${composerTrigger.replaceTo}`
+                      : ""
+                  }
+                  items={composerMenuItems}
                   anchorRef={inputRef}
-                  activeIndex={slashMenuActiveIndex}
-                  onSelect={handleSlashCommandSelect}
-                  onDismiss={() => setSlashMenuOpen(false)}
-                  onActiveChange={setSlashMenuActiveIndex}
+                  caretIndex={composerTrigger?.anchorOffset ?? 0}
+                  activeIndex={composerMenuActiveIndex}
+                  onSelect={handleComposerItemSelect}
+                  onDismiss={() => setComposerTrigger(null)}
+                  onActiveChange={setComposerMenuActiveIndex}
                 />
               </>
             )}
 
             {/* Input toolbar with selectors */}
             <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                padding: "6px 10px",
-                gap: 6,
-              }}
+              className="chat-input-toolbar"
             >
               {/* Attach file button */}
               {!showPendingToolInputComposer && (
@@ -4661,7 +5281,13 @@ export function ChatPanel() {
                 <button
                   type="button"
                   className={`chat-toolbar-btn chat-toolbar-btn-bordered ${planMode ? "chat-toolbar-btn-active" : ""}`}
-                  onClick={() => setPlanMode((prev) => !prev)}
+                  onClick={() => {
+                    setPlanMode((prev) => {
+                      const next = !prev;
+                      persistWorkspaceComposerState({ planMode: next });
+                      return next;
+                    });
+                  }}
                   disabled={!activeWorkspaceId}
                   title={
                     selectedEngineId === "codex"
@@ -4707,13 +5333,76 @@ export function ChatPanel() {
                       selectedEffortRef.current = nextEffort;
                       setSelectedEffort(nextEffort);
                     }
+                    persistWorkspaceComposerState({
+                      engineId,
+                      modelId,
+                      effort: nextEffort ?? selectedEffortRef.current,
+                    });
                   }}
                   onEffortChange={(effort) => void onReasoningEffortChange(effort)}
                   disabled={availableModels.length === 0}
                 />
               )}
 
-              {/* Codex Runtime + Config removed from toolbar — accessed via /slash commands */}
+              {!showPendingToolInputComposer && selectedEngineId === "codex" && codexProfiles.length > 0 && (
+                <>
+                  <div className="chat-toolbar-divider" />
+                  <Dropdown
+                    options={codexProfiles.map((profile) => ({
+                      value: profile.id,
+                      label: profile.name,
+                    }))}
+                    value={activeCodexProfileId ?? ""}
+                    onChange={(value) => {
+                      void onActiveCodexProfileChange(value);
+                    }}
+                    disabled={codexProfiles.length <= 1}
+                    preferredDirection="top"
+                    title={`${t("runtimePicker.fields.profile")}: ${activeCodexProfileName}`}
+                    selectedLabel={`${t("runtimePicker.fields.profile")}: ${activeCodexProfileName}`}
+                    selectedIcon={<UserCircle size={12} />}
+                    triggerStyle={{
+                      background: "transparent",
+                      borderColor: "var(--border)",
+                      color: "var(--text-3)",
+                      gap: 6,
+                      maxWidth: 220,
+                    }}
+                  />
+                </>
+              )}
+
+              {!showPendingToolInputComposer && selectedEngineId === "codex" && (
+                <>
+                  <div className="chat-toolbar-divider" />
+                  <button
+                    type="button"
+                    className={`chat-toolbar-btn chat-toolbar-btn-bordered${selectedServiceTier === "fast" ? " chat-toolbar-btn-active" : ""}`}
+                    onClick={() => void toggleFastServiceTier()}
+                    title={t("configPicker.serviceTierDescription")}
+                  >
+                    <Zap size={12} />
+                    <span style={{ fontSize: 11 }}>{t("modelPicker.fastOn")}</span>
+                  </button>
+                </>
+              )}
+
+              {!showPendingToolInputComposer && isCodexEngine && (
+                <>
+                  <div className="chat-toolbar-divider" />
+                  <CodexThreadPicker
+                    workspaceId={activeWorkspaceId}
+                    modelId={selectedModelId ?? selectedModel?.id ?? null}
+                    canManageActiveThread={canManageActiveCodexThread}
+                    canOpenInCli={canOpenActiveCodexThreadInCli}
+                    onFork={onForkCodexThread}
+                    onRollback={onRollbackCodexThread}
+                    onCompact={onCompactCodexThread}
+                    onAttachRemoteThread={onAttachCodexRemoteThread}
+                    onOpenInCli={onOpenActiveCodexThreadInCli}
+                  />
+                </>
+              )}
 
               {!showPendingToolInputComposer &&
                 (activeRepo ||

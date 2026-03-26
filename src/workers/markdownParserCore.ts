@@ -232,7 +232,7 @@ function tokenizeFences(markdown: string): { source: string; fences: FenceToken[
       plainBuffer = "";
     }
 
-    const placeholder = `<panes-code-block data-panes-id="${fenceIndex}"></panes-code-block>`;
+    const placeholder = `<supacodex-code-block data-supacodex-id="${fenceIndex}"></supacodex-code-block>`;
     source += placeholder;
 
     fences.push({
