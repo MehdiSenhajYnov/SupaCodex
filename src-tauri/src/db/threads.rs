@@ -65,6 +65,29 @@ pub fn find_thread_by_engine_thread_id(
     .context("failed to query thread by engine thread id")
 }
 
+pub fn list_threads_by_engine_thread_id(
+    db: &Database,
+    engine_id: &str,
+    engine_thread_id: &str,
+) -> anyhow::Result<Vec<ThreadDto>> {
+    let conn = db.connect()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, workspace_id, repo_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
+                COALESCE(title, ''), status, message_count, total_tokens, created_at, last_activity_at
+         FROM threads
+         WHERE engine_id = ?1
+           AND engine_thread_id = ?2
+         ORDER BY archived_at IS NULL DESC, last_activity_at DESC, created_at DESC",
+    )?;
+
+    let rows = stmt.query_map(params![engine_id, engine_thread_id], map_thread_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 pub fn list_threads_for_workspace(
     db: &Database,
     workspace_id: &str,

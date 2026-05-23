@@ -17,6 +17,8 @@
     "typecheck": "tsc --noEmit",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
+    "tauri:build:linux": "node scripts/build-tauri-linux.mjs",
+    "install:linux": "node scripts/install-linux-local.mjs",
     "release:check": "node scripts/should-release.mjs",
     "release": "release-it"
   },

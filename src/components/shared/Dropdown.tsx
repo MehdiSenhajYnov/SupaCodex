@@ -2,7 +2,11 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Check, ChevronDown, ChevronRight } from "lucide-react";
-import { useAnchoredPopoverPosition } from "./anchoredPopoverPosition";
+import {
+  normalizeClientRectForFixedPosition,
+  readFixedViewportSize,
+  useAnchoredPopoverPosition,
+} from "./anchoredPopoverPosition";
 
 export interface DropdownOption {
   value: string;
@@ -127,17 +131,23 @@ export function Dropdown({
     }
     setActiveGroup(groupIndex);
 
-    const menuRect = menuRef.current?.getBoundingClientRect();
-    const itemRect = e.currentTarget.getBoundingClientRect();
+    const rawMenuRect = menuRef.current?.getBoundingClientRect();
+    const menuRect = rawMenuRect
+      ? normalizeClientRectForFixedPosition(rawMenuRect)
+      : null;
+    const itemRect = normalizeClientRectForFixedPosition(
+      e.currentTarget.getBoundingClientRect(),
+    );
     if (menuRect) {
+      const viewport = readFixedViewportSize();
       const group = groups?.[groupIndex];
       const submenuHeight = (group?.options.length ?? 0) * 32 + 8;
       let top = itemRect.top;
-      if (top + submenuHeight > window.innerHeight - 8) {
-        top = window.innerHeight - submenuHeight - 8;
+      if (top + submenuHeight > viewport.height - 8) {
+        top = viewport.height - submenuHeight - 8;
       }
       let left = menuRect.right + 4;
-      if (left + 180 > window.innerWidth) {
+      if (left + 180 > viewport.width) {
         left = menuRect.left - 184;
       }
       setSubmenuPos({ top, left });

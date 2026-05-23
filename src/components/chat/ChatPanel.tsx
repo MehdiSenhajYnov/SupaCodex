@@ -1,7 +1,21 @@
-import { FormEvent, Suspense, lazy, memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  type ClipboardEvent,
+  FormEvent,
+  Suspense,
+  lazy,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { TFunction } from "i18next";
 import {
+  Check,
+  Copy,
   Send,
   Square,
   GitBranch,
@@ -27,6 +41,7 @@ import {
   Server,
   FlaskConical,
   UserCircle,
+  Loader2,
   type LucideIcon,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -39,10 +54,20 @@ import { useUiStore } from "../../stores/uiStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { useGitStore } from "../../stores/gitStore";
 import { useTerminalStore, type LayoutMode } from "../../stores/terminalStore";
-import { useCodexProfileStore } from "../../stores/codexProfileStore";
+import {
+  readThreadCodexProfileId,
+  useCodexProfileStore,
+} from "../../stores/codexProfileStore";
 import { useProjectTabsStore } from "../../stores/projectTabsStore";
 import { toast } from "../../stores/toastStore";
 import { ipc } from "../../lib/ipc";
+import {
+  CHAT_COMPOSER_DATA_ATTRIBUTE,
+  CHAT_COMPOSER_DATA_VALUE,
+  CHAT_COMPOSER_NATIVE_IMAGE_PASTE_EVENT,
+  type ChatComposerNativeImagePasteDetail,
+} from "../../lib/chatComposerClipboard";
+import { copyTextToClipboard } from "../../lib/clipboard";
 import { resolvePreferredOnboardingChatSelection } from "../../lib/onboarding";
 import { recordPerfMetric } from "../../lib/perfTelemetry";
 import {
@@ -107,10 +132,11 @@ import type {
   TrustLevel,
 } from "../../types";
 
-const MESSAGE_VIRTUALIZATION_THRESHOLD = 40;
+const MESSAGE_VIRTUALIZATION_THRESHOLD = 200;
 const MESSAGE_ESTIMATED_ROW_HEIGHT = 220;
 const MESSAGE_ROW_GAP = 16;
-const MESSAGE_OVERSCAN_PX = 700;
+const MESSAGE_OVERSCAN_PX = 1100;
+const CLIPBOARD_IMAGE_PASTE_DEDUPE_WINDOW_MS = 900;
 const LazyTerminalPanel = lazy(() =>
   import("../terminal/TerminalPanel").then((module) => ({
     default: module.TerminalPanel,
@@ -126,6 +152,33 @@ interface MeasuredMessageRowProps {
   messageId: string;
   onHeightChange: (messageId: string, height: number) => void;
   children: ReactNode;
+}
+
+interface VirtualizedLayout {
+  offsets: number[];
+  rowCount: number;
+}
+
+interface VirtualWindow {
+  startIndex: number;
+  endIndexExclusive: number;
+  topSpacerHeight: number;
+  bottomSpacerHeight: number;
+}
+
+interface ConversationViewportProps {
+  messages: Message[];
+  threadId: string | null;
+  streaming: boolean;
+  hasOlderMessages: boolean;
+  loadingOlderMessages: boolean;
+  loadOlderMessages: () => Promise<void>;
+  showCodexEmptyHint: boolean;
+  renderAssistantIdentity: (message: Message) => { label: string; engineId: string };
+  onApproval: (approvalId: string, response: ApprovalResponse) => void;
+  onLoadActionOutput: (messageId: string, actionId: string) => Promise<void>;
+  canEditUserMessages: boolean;
+  onEditUserMessage: (message: Message) => void;
 }
 
 interface ProjectConversationTabsBarProps {
@@ -174,6 +227,23 @@ interface ComposerMenuActionItem extends ChatComposerMenuItem {
     | {
         type: "none";
       };
+}
+
+interface EditableMessageDraft {
+  text: string;
+  attachments: ChatAttachment[];
+  inputItems: ChatInputItem[];
+  planMode: boolean;
+}
+
+interface EditingMessageState {
+  messageId: string;
+  sourceThreadId: string;
+  turnsToRollback: number;
+  inputItems: ChatInputItem[];
+  previousInput: string;
+  previousAttachments: ChatAttachment[];
+  previousPlanMode: boolean;
 }
 
 function resolveProjectTabStatusClass(status: Thread["status"]): string {
@@ -425,8 +495,8 @@ function MeasuredMessageRow({ messageId, onHeightChange, children }: MeasuredMes
       return;
     }
 
-    const publishHeight = () => {
-      onHeightChange(messageId, element.getBoundingClientRect().height);
+    const publishHeight = (nextHeight?: number) => {
+      onHeightChange(messageId, nextHeight ?? element.offsetHeight);
     };
 
     publishHeight();
@@ -435,12 +505,81 @@ function MeasuredMessageRow({ messageId, onHeightChange, children }: MeasuredMes
       return;
     }
 
-    const observer = new ResizeObserver(() => publishHeight());
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      publishHeight(entry?.contentRect.height);
+    });
     observer.observe(element);
     return () => observer.disconnect();
   }, [messageId, onHeightChange]);
 
   return <div ref={rowRef}>{children}</div>;
+}
+
+function resolveVirtualWindow(
+  virtualizedLayout: VirtualizedLayout | null,
+  viewportScrollTop: number,
+  viewportHeight: number,
+): VirtualWindow | null {
+  if (!virtualizedLayout) {
+    return null;
+  }
+
+  const { offsets, rowCount } = virtualizedLayout;
+  const visibleStart = Math.max(0, viewportScrollTop - MESSAGE_OVERSCAN_PX);
+  const visibleEnd = viewportScrollTop + viewportHeight + MESSAGE_OVERSCAN_PX;
+
+  let lo = 0;
+  let hi = rowCount;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (offsets[mid + 1] < visibleStart) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  const startIndex = lo;
+
+  lo = startIndex;
+  hi = rowCount;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (offsets[mid] <= visibleEnd) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  let endIndexExclusive = lo;
+  if (endIndexExclusive <= startIndex) {
+    endIndexExclusive = Math.min(rowCount, startIndex + 1);
+  }
+
+  return {
+    startIndex,
+    endIndexExclusive,
+    topSpacerHeight: offsets[startIndex],
+    bottomSpacerHeight: offsets[rowCount] - offsets[endIndexExclusive],
+  };
+}
+
+function areVirtualWindowsEqual(
+  previous: VirtualWindow | null,
+  next: VirtualWindow | null,
+): boolean {
+  if (previous === next) {
+    return true;
+  }
+  if (!previous || !next) {
+    return false;
+  }
+  return (
+    previous.startIndex === next.startIndex &&
+    previous.endIndexExclusive === next.endIndexExclusive &&
+    previous.topSpacerHeight === next.topSpacerHeight &&
+    previous.bottomSpacerHeight === next.bottomSpacerHeight
+  );
 }
 
 const MODEL_TOKEN_LABELS: Record<string, string> = {
@@ -1140,12 +1279,29 @@ function readThreadLastModelId(thread: {
   return normalized.length > 0 ? normalized : null;
 }
 
-function hasVisibleContent(blocks?: ContentBlock[]): boolean {
+function hasVisibleContent(
+  blocks?: ContentBlock[],
+  status?: Message["status"],
+): boolean {
   if (!blocks || blocks.length === 0) return false;
   return blocks.some((b) => {
-    if (b.type === "text" || b.type === "thinking") return Boolean(b.content?.trim());
+    if (b.type === "text") return Boolean(b.content?.trim());
+    if (b.type === "thinking") {
+      return status !== "interrupted" && Boolean(b.content?.trim());
+    }
     return true;
   });
+}
+
+function buildClipboardImageSignature(files: File[]): string | null {
+  if (files.length === 0) {
+    return null;
+  }
+
+  return files
+    .map((file) => `${file.type}:${file.size}`)
+    .sort()
+    .join("|");
 }
 
 function parseMessageDate(raw?: string): Date | null {
@@ -1219,24 +1375,104 @@ function estimateMessageOffset(
   return offset;
 }
 
+function compactClipboardParts(parts: Array<string | null | undefined>): string {
+  return parts
+    .map((part) => (typeof part === "string" ? part.trim() : ""))
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function formatCodeForClipboard(language: string | undefined, content: string): string {
+  const cleanLanguage = String(language ?? "")
+    .replace(/`/g, "")
+    .trim();
+  const cleanContent = String(content ?? "").trimEnd();
+  if (!cleanContent) {
+    return "";
+  }
+  return `\`\`\`${cleanLanguage}\n${cleanContent}\n\`\`\``;
+}
+
+function extractMessageCopyText(message: Message): string {
+  const blocks = Array.isArray(message.blocks) ? message.blocks : [];
+  const blockText = compactClipboardParts(
+    blocks.map((block) => {
+      switch (block.type) {
+        case "text":
+          return block.content;
+        case "code":
+          return formatCodeForClipboard(block.language, block.content);
+        case "diff":
+          return formatCodeForClipboard("diff", block.diff);
+        case "notice":
+          return compactClipboardParts([block.title, block.message]);
+        case "action": {
+          const output = (block.outputChunks ?? [])
+            .map((chunk) => String(chunk.content ?? ""))
+            .join("")
+            .trim();
+          return compactClipboardParts([
+            block.summary,
+            output ? `Output:\n${output}` : null,
+            block.result?.error ? `Error:\n${String(block.result.error)}` : null,
+          ]);
+        }
+        case "approval":
+          return block.summary;
+        case "error":
+          return block.message;
+        case "attachment":
+          return block.fileName ? `[Attachment] ${block.fileName}` : null;
+        case "skill":
+          return block.name ? `$${block.name}` : null;
+        case "mention":
+          return block.name ? `@${block.name}` : null;
+        case "steer": {
+          const attachmentText = (block.attachments ?? []).map(
+            (attachment) => `[Attachment] ${attachment.fileName}`,
+          );
+          const skillText = (block.skills ?? []).map((skill) => `$${skill.name}`);
+          const mentionText = (block.mentions ?? []).map((mention) => `@${mention.name}`);
+          return compactClipboardParts([
+            block.content,
+            compactClipboardParts([...skillText, ...mentionText, ...attachmentText]),
+          ]);
+        }
+        case "thinking":
+          return null;
+        default:
+          return null;
+      }
+    }),
+  );
+
+  return blockText || String(message.content ?? "").trim();
+}
+
 interface MessageRowProps {
   message: Message;
   index: number;
   isHighlighted: boolean;
+  animateOnMount: boolean;
   assistantLabel: string;
   assistantEngineId: string;
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
   onLoadActionOutput: (messageId: string, actionId: string) => Promise<void>;
+  canEditUserMessage: boolean;
+  onEditUserMessage: (message: Message) => void;
 }
 
 function MessageRowView({
   message,
   index,
   isHighlighted,
+  animateOnMount,
   assistantLabel,
   assistantEngineId,
   onApproval,
   onLoadActionOutput,
+  canEditUserMessage,
+  onEditUserMessage,
 }: MessageRowProps) {
   const { t, i18n } = useTranslation("chat");
   const isUser = message.role === "user";
@@ -1270,26 +1506,68 @@ function MessageRowView({
       ),
     [message.blocks],
   );
-  const hasAssistantContent = !isUser && hasVisibleContent(message.blocks);
+  const hasAssistantContent = !isUser && hasVisibleContent(message.blocks, message.status);
   const showAssistantShell = !isUser && (hasAssistantContent || message.status === "streaming");
   const showAssistantMeta = !isUser && Boolean(assistantLabel || assistantEngineId);
+  const copyText = useMemo(() => extractMessageCopyText(message), [message]);
+  const canCopyMessage = copyText.length > 0;
+  const [copyAcknowledged, setCopyAcknowledged] = useState(false);
+  const copyResetTimeoutRef = useRef<number | null>(null);
   const rowClassName = [
-    "animate-slide-up",
+    animateOnMount ? "animate-slide-up" : "",
     "chat-message-row",
     isUser ? "chat-message-row-user" : "chat-message-row-assistant",
     isHighlighted ? "chat-message-row-highlighted" : "",
   ]
     .filter(Boolean)
     .join(" ");
+  const copyButtonLabel = copyAcknowledged
+    ? t("panel.copyMessageCopied")
+    : t("panel.copyMessage");
+
+  useEffect(() => {
+    setCopyAcknowledged(false);
+    return () => {
+      if (copyResetTimeoutRef.current !== null) {
+        window.clearTimeout(copyResetTimeoutRef.current);
+        copyResetTimeoutRef.current = null;
+      }
+    };
+  }, [message.id]);
+
+  const handleCopyMessage = useCallback(() => {
+    if (!copyText) {
+      return;
+    }
+
+    void copyTextToClipboard(copyText)
+      .then(() => {
+        setCopyAcknowledged(true);
+        if (copyResetTimeoutRef.current !== null) {
+          window.clearTimeout(copyResetTimeoutRef.current);
+        }
+        copyResetTimeoutRef.current = window.setTimeout(() => {
+          copyResetTimeoutRef.current = null;
+          setCopyAcknowledged(false);
+        }, 1400);
+      })
+      .catch((error) => {
+        toast.error(
+          t("panel.copyMessageFailed", {
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      });
+  }, [copyText, t]);
 
   return (
     <div
       data-message-id={message.id}
       className={rowClassName}
-      style={{ animationDelay: `${Math.min(index * 20, 200)}ms` }}
+      style={animateOnMount ? { animationDelay: `${Math.min(index * 20, 200)}ms` } : undefined}
     >
       {isUser ? (
-        <>
+        <div className="chat-message-stack chat-message-stack-user">
           <div className="chat-message-surface chat-user-bubble">
             {userAuxiliaryBlocks.length > 0 && (
               <div className="chat-user-bubble-auxiliary">
@@ -1334,12 +1612,48 @@ function MessageRowView({
             )}
             {userContent}
           </div>
-          {messageTimestamp && (
-            <span className="chat-message-timestamp chat-message-timestamp-user">{messageTimestamp}</span>
+          {(canCopyMessage || canEditUserMessage || messageTimestamp) && (
+            <div
+              className={`chat-message-footer chat-message-footer-user${
+                canCopyMessage || canEditUserMessage ? " chat-message-footer-has-actions" : ""
+              }`}
+            >
+              {(canCopyMessage || canEditUserMessage) && (
+                <div className="chat-message-actions chat-message-actions-user">
+                  {canCopyMessage && (
+                    <button
+                      type="button"
+                      className={`chat-message-action-btn${
+                        copyAcknowledged ? " chat-message-action-btn-copied" : ""
+                      }`}
+                      title={copyButtonLabel}
+                      aria-label={copyButtonLabel}
+                      onClick={handleCopyMessage}
+                    >
+                      {copyAcknowledged ? <Check size={12} /> : <Copy size={12} />}
+                    </button>
+                  )}
+                  {canEditUserMessage && (
+                    <button
+                      type="button"
+                      className="chat-message-action-btn"
+                      title={t("panel.editMessage")}
+                      aria-label={t("panel.editMessage")}
+                      onClick={() => onEditUserMessage(message)}
+                    >
+                      <FilePen size={12} />
+                    </button>
+                  )}
+                </div>
+              )}
+              {messageTimestamp && (
+                <span className="chat-message-timestamp chat-message-timestamp-user">{messageTimestamp}</span>
+              )}
+            </div>
           )}
-        </>
+        </div>
       ) : showAssistantShell ? (
-        <>
+        <div className="chat-message-stack chat-message-stack-assistant">
           <div className="chat-message-surface chat-assistant-message">
             {showAssistantMeta && (
               <div className="chat-assistant-meta">
@@ -1373,10 +1687,33 @@ function MessageRowView({
               </div>
             )}
           </div>
-          {messageTimestamp && (
-            <span className="chat-message-timestamp chat-message-timestamp-assistant">{messageTimestamp}</span>
+          {(canCopyMessage || messageTimestamp) && (
+            <div
+              className={`chat-message-footer chat-message-footer-assistant${
+                canCopyMessage ? " chat-message-footer-has-actions" : ""
+              }`}
+            >
+              {canCopyMessage && (
+                <div className="chat-message-actions chat-message-actions-assistant">
+                  <button
+                    type="button"
+                    className={`chat-message-action-btn${
+                      copyAcknowledged ? " chat-message-action-btn-copied" : ""
+                    }`}
+                    title={copyButtonLabel}
+                    aria-label={copyButtonLabel}
+                    onClick={handleCopyMessage}
+                  >
+                    {copyAcknowledged ? <Check size={12} /> : <Copy size={12} />}
+                  </button>
+                </div>
+              )}
+              {messageTimestamp && (
+                <span className="chat-message-timestamp chat-message-timestamp-assistant">{messageTimestamp}</span>
+              )}
+            </div>
           )}
-        </>
+        </div>
       ) : null}
     </div>
   );
@@ -1388,10 +1725,660 @@ const MessageRow = memo(
     prev.message === next.message &&
     prev.index === next.index &&
     prev.isHighlighted === next.isHighlighted &&
+    prev.animateOnMount === next.animateOnMount &&
     prev.assistantLabel === next.assistantLabel &&
     prev.assistantEngineId === next.assistantEngineId &&
     prev.onApproval === next.onApproval &&
-    prev.onLoadActionOutput === next.onLoadActionOutput,
+    prev.onLoadActionOutput === next.onLoadActionOutput &&
+    prev.canEditUserMessage === next.canEditUserMessage &&
+    prev.onEditUserMessage === next.onEditUserMessage,
+);
+
+function ConversationViewportView({
+  messages,
+  threadId,
+  streaming,
+  hasOlderMessages,
+  loadingOlderMessages,
+  loadOlderMessages,
+  showCodexEmptyHint,
+  renderAssistantIdentity,
+  onApproval,
+  onLoadActionOutput,
+  canEditUserMessages,
+  onEditUserMessage,
+}: ConversationViewportProps) {
+  const { t } = useTranslation("chat");
+  const messageFocusTarget = useUiStore((state) => state.messageFocusTarget);
+  const clearMessageFocusTarget = useUiStore((state) => state.clearMessageFocusTarget);
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const threadActivatedAtRef = useRef(0);
+  const initialScrollThreadRef = useRef<string | null>(null);
+  const prependLoadInFlightRef = useRef(false);
+  const highlightTimeoutRef = useRef<number | null>(null);
+  const layoutVersionRafRef = useRef<number | null>(null);
+  const messageAnimationTimeoutsRef = useRef<number[]>([]);
+  const previousMessageIdsRef = useRef<string[]>([]);
+  const previousThreadIdRef = useRef<string | null>(null);
+  const messageHeightsRef = useRef<Map<string, number>>(new Map());
+  const viewportScrollTopRef = useRef(0);
+  const viewportHeightRef = useRef(0);
+  const autoScrollLockedRef = useRef(false);
+  const virtualWindowRef = useRef<VirtualWindow | null>(null);
+  const [listLayoutVersion, setListLayoutVersion] = useState(0);
+  const [autoScrollLocked, setAutoScrollLocked] = useState(false);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+  const [animatedMessageIds, setAnimatedMessageIds] = useState<Set<string>>(() => new Set());
+  const [virtualWindow, setVirtualWindow] = useState<VirtualWindow | null>(null);
+
+  const scheduleListLayoutVersionBump = useCallback(() => {
+    if (layoutVersionRafRef.current !== null) {
+      return;
+    }
+    layoutVersionRafRef.current = window.requestAnimationFrame(() => {
+      layoutVersionRafRef.current = null;
+      setListLayoutVersion((version) => version + 1);
+    });
+  }, []);
+
+  useEffect(() => {
+    threadActivatedAtRef.current = performance.now();
+    prependLoadInFlightRef.current = false;
+    initialScrollThreadRef.current = null;
+    messageHeightsRef.current.clear();
+    viewportScrollTopRef.current = 0;
+    viewportHeightRef.current = viewportRef.current?.clientHeight ?? 0;
+    virtualWindowRef.current = null;
+    autoScrollLockedRef.current = false;
+    previousThreadIdRef.current = threadId;
+    previousMessageIdsRef.current = [];
+    messageAnimationTimeoutsRef.current.forEach((timeoutId) => {
+      window.clearTimeout(timeoutId);
+    });
+    messageAnimationTimeoutsRef.current = [];
+    setAnimatedMessageIds(new Set());
+    setAutoScrollLocked(false);
+    setHighlightedMessageId(null);
+    setVirtualWindow(null);
+    scheduleListLayoutVersionBump();
+  }, [threadId, scheduleListLayoutVersionBump]);
+
+  useEffect(() => {
+    const currentIds = messages.map((message) => message.id);
+    const previousIds = previousMessageIdsRef.current;
+    const threadChanged = previousThreadIdRef.current !== threadId;
+
+    if (threadChanged) {
+      previousThreadIdRef.current = threadId;
+      previousMessageIdsRef.current = currentIds;
+      setAnimatedMessageIds(new Set());
+      return;
+    }
+
+    if (previousIds.length === 0) {
+      previousMessageIdsRef.current = currentIds;
+      return;
+    }
+
+    const appendedOnly =
+      currentIds.length > previousIds.length &&
+      previousIds.every((messageId, index) => currentIds[index] === messageId);
+
+    if (appendedOnly) {
+      const appendedIds = currentIds
+        .slice(previousIds.length)
+        .filter((messageId) => !previousIds.includes(messageId));
+      if (appendedIds.length > 0) {
+        setAnimatedMessageIds((current) => {
+          const next = new Set(current);
+          appendedIds.forEach((messageId) => next.add(messageId));
+          return next;
+        });
+        const timeoutId = window.setTimeout(() => {
+          setAnimatedMessageIds((current) => {
+            if (!appendedIds.some((messageId) => current.has(messageId))) {
+              return current;
+            }
+            const next = new Set(current);
+            appendedIds.forEach((messageId) => next.delete(messageId));
+            return next;
+          });
+          messageAnimationTimeoutsRef.current = messageAnimationTimeoutsRef.current.filter(
+            (candidateId) => candidateId !== timeoutId,
+          );
+        }, 520);
+        messageAnimationTimeoutsRef.current.push(timeoutId);
+      }
+    }
+
+    previousThreadIdRef.current = threadId;
+    previousMessageIdsRef.current = currentIds;
+  }, [messages, threadId]);
+
+  useEffect(() => {
+    const existingIds = new Set(messages.map((message) => message.id));
+    let changed = false;
+    for (const messageId of messageHeightsRef.current.keys()) {
+      if (!existingIds.has(messageId)) {
+        messageHeightsRef.current.delete(messageId);
+        changed = true;
+      }
+    }
+    if (changed) {
+      scheduleListLayoutVersionBump();
+    }
+  }, [messages, scheduleListLayoutVersionBump]);
+
+  const virtualizationEnabled =
+    messages.length >= MESSAGE_VIRTUALIZATION_THRESHOLD && !streaming;
+
+  const virtualizedLayout = useMemo<VirtualizedLayout | null>(() => {
+    if (!virtualizationEnabled || messages.length === 0) {
+      return null;
+    }
+
+    const rowCount = messages.length;
+    const offsets = new Array<number>(rowCount + 1);
+    offsets[0] = 0;
+
+    for (let index = 0; index < rowCount; index += 1) {
+      const messageId = messages[index].id;
+      const measuredHeight = messageHeightsRef.current.get(messageId);
+      const rowHeight = measuredHeight ?? MESSAGE_ESTIMATED_ROW_HEIGHT;
+      offsets[index + 1] =
+        offsets[index] + rowHeight + (index < rowCount - 1 ? MESSAGE_ROW_GAP : 0);
+    }
+
+    return {
+      offsets,
+      rowCount,
+    };
+  }, [messages, virtualizationEnabled, listLayoutVersion]);
+
+  const syncVirtualWindow = useCallback(
+    (scrollTop = viewportScrollTopRef.current, viewportHeight = viewportHeightRef.current) => {
+      const nextVirtualWindow = resolveVirtualWindow(
+        virtualizationEnabled ? virtualizedLayout : null,
+        scrollTop,
+        viewportHeight,
+      );
+      if (areVirtualWindowsEqual(virtualWindowRef.current, nextVirtualWindow)) {
+        return;
+      }
+      virtualWindowRef.current = nextVirtualWindow;
+      setVirtualWindow(nextVirtualWindow);
+    },
+    [virtualizationEnabled, virtualizedLayout],
+  );
+
+  const syncViewportState = useCallback(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    viewportScrollTopRef.current = viewport.scrollTop;
+    viewportHeightRef.current = viewport.clientHeight;
+    const nextAutoScrollLocked =
+      viewport.scrollTop + viewport.clientHeight < viewport.scrollHeight - 120;
+    if (autoScrollLockedRef.current !== nextAutoScrollLocked) {
+      autoScrollLockedRef.current = nextAutoScrollLocked;
+      setAutoScrollLocked(nextAutoScrollLocked);
+    }
+    syncVirtualWindow(viewport.scrollTop, viewport.clientHeight);
+  }, [syncVirtualWindow]);
+
+  const scrollViewportToBottom = useCallback(
+    (behavior: ScrollBehavior = "auto") => {
+      const viewport = viewportRef.current;
+      if (!viewport) {
+        return;
+      }
+
+      viewport.scrollTo({ top: viewport.scrollHeight, behavior });
+      if (behavior === "auto") {
+        window.requestAnimationFrame(() => {
+          syncViewportState();
+        });
+      }
+    },
+    [syncViewportState],
+  );
+
+  const maybeLoadOlderMessages = useCallback(() => {
+    const viewport = viewportRef.current;
+    if (!viewport || !threadId || !hasOlderMessages || loadingOlderMessages) {
+      return;
+    }
+    if (performance.now() - threadActivatedAtRef.current < 700) {
+      return;
+    }
+    if (viewportScrollTopRef.current > 80 || prependLoadInFlightRef.current) {
+      return;
+    }
+
+    prependLoadInFlightRef.current = true;
+    const previousScrollHeight = viewport.scrollHeight;
+    void loadOlderMessages()
+      .then(() => {
+        window.requestAnimationFrame(() => {
+          const latestViewport = viewportRef.current;
+          if (!latestViewport) {
+            return;
+          }
+          const nextScrollHeight = latestViewport.scrollHeight;
+          const delta = nextScrollHeight - previousScrollHeight;
+          if (delta > 0) {
+            latestViewport.scrollTop = latestViewport.scrollTop + delta;
+          }
+          syncViewportState();
+        });
+      })
+      .finally(() => {
+        prependLoadInFlightRef.current = false;
+      });
+  }, [
+    hasOlderMessages,
+    loadOlderMessages,
+    loadingOlderMessages,
+    syncViewportState,
+    threadId,
+  ]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    let rafId = 0;
+    syncViewportState();
+
+    const onScroll = () => {
+      if (rafId !== 0) {
+        return;
+      }
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0;
+        syncViewportState();
+        maybeLoadOlderMessages();
+      });
+    };
+
+    viewport.addEventListener("scroll", onScroll, { passive: true });
+
+    let resizeObserver: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      resizeObserver = new ResizeObserver(() => {
+        syncViewportState();
+      });
+      resizeObserver.observe(viewport);
+    } else {
+      window.addEventListener("resize", syncViewportState);
+    }
+
+    return () => {
+      viewport.removeEventListener("scroll", onScroll);
+      if (rafId !== 0) {
+        window.cancelAnimationFrame(rafId);
+      }
+      if (resizeObserver) {
+        resizeObserver.disconnect();
+      } else {
+        window.removeEventListener("resize", syncViewportState);
+      }
+    };
+  }, [maybeLoadOlderMessages, syncViewportState]);
+
+  useEffect(() => {
+    syncVirtualWindow();
+  }, [syncVirtualWindow]);
+
+  useEffect(() => {
+    if (!threadId) {
+      return;
+    }
+    if (messages.length === 0) {
+      return;
+    }
+    if (initialScrollThreadRef.current === threadId) {
+      return;
+    }
+    if (messageFocusTarget?.threadId === threadId) {
+      return;
+    }
+
+    initialScrollThreadRef.current = threadId;
+
+    let raf2 = 0;
+    const raf1 = window.requestAnimationFrame(() => {
+      scrollViewportToBottom("auto");
+      raf2 = window.requestAnimationFrame(() => {
+        scrollViewportToBottom("auto");
+      });
+    });
+
+    return () => {
+      window.cancelAnimationFrame(raf1);
+      if (raf2 !== 0) {
+        window.cancelAnimationFrame(raf2);
+      }
+    };
+  }, [threadId, messages.length, messageFocusTarget?.threadId, scrollViewportToBottom]);
+
+  useEffect(() => {
+    if (messages.length === 0 || autoScrollLockedRef.current) {
+      return;
+    }
+
+    const rafId = window.requestAnimationFrame(() => {
+      scrollViewportToBottom("auto");
+    });
+    return () => {
+      window.cancelAnimationFrame(rafId);
+    };
+  }, [messages, scrollViewportToBottom, streaming]);
+
+  useEffect(() => {
+    maybeLoadOlderMessages();
+  }, [maybeLoadOlderMessages, messages.length]);
+
+  useEffect(() => {
+    if (!messageFocusTarget || messageFocusTarget.threadId !== threadId) {
+      return;
+    }
+
+    const targetIndex = messages.findIndex(
+      (message) => message.id === messageFocusTarget.messageId,
+    );
+    if (targetIndex < 0) {
+      if (hasOlderMessages && !loadingOlderMessages && !prependLoadInFlightRef.current) {
+        prependLoadInFlightRef.current = true;
+        void loadOlderMessages().finally(() => {
+          prependLoadInFlightRef.current = false;
+        });
+      }
+      return;
+    }
+
+    const viewport = viewportRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    const targetMessageId = messages[targetIndex].id;
+    const targetHeight =
+      messageHeightsRef.current.get(targetMessageId) ??
+      MESSAGE_ESTIMATED_ROW_HEIGHT;
+    const targetTopOffset = estimateMessageOffset(
+      messages,
+      targetIndex,
+      messageHeightsRef.current,
+    );
+    const centeredTop = Math.max(
+      0,
+      targetTopOffset - Math.max((viewport.clientHeight - targetHeight) / 2, 0),
+    );
+
+    viewport.scrollTo({ top: centeredTop, behavior: "smooth" });
+    window.setTimeout(() => {
+      const targetElement = viewport.querySelector<HTMLElement>(
+        `[data-message-id="${targetMessageId}"]`,
+      );
+      if (targetElement) {
+        targetElement.scrollIntoView({ block: "center", behavior: "smooth" });
+      }
+    }, 120);
+    setHighlightedMessageId(targetMessageId);
+
+    if (highlightTimeoutRef.current !== null) {
+      window.clearTimeout(highlightTimeoutRef.current);
+    }
+    highlightTimeoutRef.current = window.setTimeout(() => {
+      setHighlightedMessageId((current) =>
+        current === targetMessageId ? null : current,
+      );
+      highlightTimeoutRef.current = null;
+    }, 2400);
+
+    clearMessageFocusTarget();
+  }, [
+    clearMessageFocusTarget,
+    hasOlderMessages,
+    loadOlderMessages,
+    loadingOlderMessages,
+    messageFocusTarget,
+    messages,
+    threadId,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      if (highlightTimeoutRef.current !== null) {
+        window.clearTimeout(highlightTimeoutRef.current);
+      }
+      if (layoutVersionRafRef.current !== null) {
+        window.cancelAnimationFrame(layoutVersionRafRef.current);
+      }
+      messageAnimationTimeoutsRef.current.forEach((timeoutId) => {
+        window.clearTimeout(timeoutId);
+      });
+    };
+  }, []);
+
+  const onMessageRowHeightChange = useCallback(
+    (messageId: string, height: number) => {
+      const normalizedHeight = Math.max(56, Math.ceil(height));
+      const previousHeight = messageHeightsRef.current.get(messageId);
+      if (
+        previousHeight !== undefined &&
+        Math.abs(previousHeight - normalizedHeight) < 2
+      ) {
+        return;
+      }
+
+      messageHeightsRef.current.set(messageId, normalizedHeight);
+      scheduleListLayoutVersionBump();
+    },
+    [scheduleListLayoutVersionBump],
+  );
+
+  const visibleMessages = useMemo(() => {
+    if (!virtualizationEnabled || !virtualWindow) {
+      return messages;
+    }
+
+    return messages.slice(virtualWindow.startIndex, virtualWindow.endIndexExclusive);
+  }, [messages, virtualWindow, virtualizationEnabled]);
+
+  const assistantIdentityByMessageId = useMemo(() => {
+    const identityByMessageId = new Map<string, { label: string; engineId: string }>();
+    for (const message of visibleMessages) {
+      if (message.role !== "assistant") {
+        continue;
+      }
+      identityByMessageId.set(message.id, renderAssistantIdentity(message));
+    }
+    return identityByMessageId;
+  }, [renderAssistantIdentity, visibleMessages]);
+
+  return (
+    <div
+      ref={viewportRef}
+      style={{
+        position: "relative",
+        flex: 1,
+        overflow: "auto",
+        padding: "20px 24px",
+      }}
+    >
+      {messages.length === 0 ? (
+        <div
+          className="animate-fade-in"
+          style={{
+            height: "100%",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 16,
+            color: "var(--text-3)",
+            textAlign: "center",
+          }}
+        >
+          <div
+            style={{
+              width: 56,
+              height: 56,
+              borderRadius: "var(--radius-lg)",
+              background: "var(--bg-3)",
+              border: "1px solid var(--border)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <Send size={22} style={{ color: "var(--text-2)", opacity: 0.5 }} />
+          </div>
+          <div>
+            <p style={{ margin: "0 0 4px", fontSize: 14, fontWeight: 500, color: "var(--text-2)" }}>
+              {t("panel.startConversation")}
+            </p>
+            <p style={{ margin: 0, fontSize: 12.5 }}>
+              {t("panel.emptyHint")}
+            </p>
+            {showCodexEmptyHint && (
+              <p style={{ margin: "8px 0 0", fontSize: 12, color: "var(--text-3)" }}>
+                {t("panel.emptyCodexSidebarHint")}
+              </p>
+            )}
+          </div>
+        </div>
+      ) : virtualizationEnabled && virtualWindow ? (
+        <div style={{ display: "flex", flexDirection: "column" }}>
+          {virtualWindow.topSpacerHeight > 0 && (
+            <div style={{ height: virtualWindow.topSpacerHeight }} />
+          )}
+
+          <div style={{ display: "flex", flexDirection: "column", gap: MESSAGE_ROW_GAP }}>
+            {visibleMessages.map((message, relativeIndex) => {
+              const absoluteIndex = virtualWindow.startIndex + relativeIndex;
+              const assistantIdentity = assistantIdentityByMessageId.get(message.id);
+              return (
+                <MeasuredMessageRow
+                  key={message.id}
+                  messageId={message.id}
+                  onHeightChange={onMessageRowHeightChange}
+                >
+                  <MessageRow
+                    message={message}
+                    index={absoluteIndex}
+                    isHighlighted={message.id === highlightedMessageId}
+                    animateOnMount={animatedMessageIds.has(message.id)}
+                    assistantLabel={assistantIdentity?.label ?? ""}
+                    assistantEngineId={assistantIdentity?.engineId ?? ""}
+                    onApproval={onApproval}
+                    onLoadActionOutput={onLoadActionOutput}
+                    canEditUserMessage={canEditUserMessages && isEditableUserMessage(message)}
+                    onEditUserMessage={onEditUserMessage}
+                  />
+                </MeasuredMessageRow>
+              );
+            })}
+          </div>
+
+          {virtualWindow.bottomSpacerHeight > 0 && (
+            <div style={{ height: virtualWindow.bottomSpacerHeight }} />
+          )}
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: MESSAGE_ROW_GAP }}>
+          {visibleMessages.map((message, index) => {
+            const assistantIdentity = assistantIdentityByMessageId.get(message.id);
+            return (
+              <MessageRow
+                key={message.id}
+                message={message}
+                index={index}
+                isHighlighted={message.id === highlightedMessageId}
+                animateOnMount={animatedMessageIds.has(message.id)}
+                assistantLabel={assistantIdentity?.label ?? ""}
+                assistantEngineId={assistantIdentity?.engineId ?? ""}
+                onApproval={onApproval}
+                onLoadActionOutput={onLoadActionOutput}
+                canEditUserMessage={canEditUserMessages && isEditableUserMessage(message)}
+                onEditUserMessage={onEditUserMessage}
+              />
+            );
+          })}
+        </div>
+      )}
+
+      {autoScrollLocked && messages.length > 0 && (
+        <button
+          type="button"
+          onClick={() => {
+            autoScrollLockedRef.current = false;
+            setAutoScrollLocked(false);
+            scrollViewportToBottom("smooth");
+          }}
+          style={{
+            position: "sticky",
+            left: "100%",
+            bottom: 10,
+            marginLeft: "auto",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "6px 10px",
+            borderRadius: "var(--radius-sm)",
+            border: streaming
+              ? "1px solid color-mix(in srgb, var(--accent) 24%, transparent)"
+              : "1px solid var(--border)",
+            background: streaming
+              ? "color-mix(in srgb, var(--accent) 8%, transparent)"
+              : "var(--bg-2)",
+            color: streaming ? "var(--accent-2)" : "var(--text-2)",
+            fontSize: 11.5,
+            cursor: "pointer",
+            boxShadow: "0 8px 24px rgba(0,0,0,0.28)",
+            zIndex: 2,
+          }}
+        >
+          {streaming && (
+            <span
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: "50%",
+                background: "var(--accent-2)",
+                animation: "pulse-soft 1.5s ease-in-out infinite",
+                flexShrink: 0,
+              }}
+            />
+          )}
+          {streaming ? t("panel.newActivity") : t("panel.jumpToLatest")}
+        </button>
+      )}
+    </div>
+  );
+}
+
+const ConversationViewport = memo(
+  ConversationViewportView,
+  (prev, next) =>
+    prev.messages === next.messages &&
+    prev.threadId === next.threadId &&
+    prev.streaming === next.streaming &&
+    prev.hasOlderMessages === next.hasOlderMessages &&
+    prev.loadingOlderMessages === next.loadingOlderMessages &&
+    prev.loadOlderMessages === next.loadOlderMessages &&
+    prev.showCodexEmptyHint === next.showCodexEmptyHint &&
+    prev.renderAssistantIdentity === next.renderAssistantIdentity &&
+    prev.onApproval === next.onApproval &&
+    prev.onLoadActionOutput === next.onLoadActionOutput &&
+    prev.canEditUserMessages === next.canEditUserMessages &&
+    prev.onEditUserMessage === next.onEditUserMessage,
 );
 
 function formatFileSize(bytes: number): string {
@@ -1516,6 +2503,108 @@ function usagePercentToWidth(percent: number | null): string {
   return `${Math.max(0, Math.min(100, Math.round(percent)))}%`;
 }
 
+function isSteerUserMessage(message: Message): boolean {
+  return (message.blocks ?? []).some(
+    (block) => block.type === "text" && block.isSteer === true,
+  );
+}
+
+function isEditableUserMessage(message: Message): boolean {
+  return message.role === "user" && !isSteerUserMessage(message);
+}
+
+function countEditableUserTurnsFromMessage(messages: Message[], messageId: string): number {
+  const messageIndex = messages.findIndex((message) => message.id === messageId);
+  if (messageIndex < 0) {
+    return 0;
+  }
+
+  return messages
+    .slice(messageIndex)
+    .filter((message) => isEditableUserMessage(message)).length;
+}
+
+function editableInputItemKey(item: ChatInputItem): string | null {
+  if (item.type === "text") {
+    return null;
+  }
+  return `${item.type}:${item.path}`;
+}
+
+function mergeEditedMessageInputItems(
+  preservedItems: ChatInputItem[],
+  resolvedItems?: ChatInputItem[],
+): ChatInputItem[] | undefined {
+  const merged: ChatInputItem[] = [];
+  const seenStructuredItems = new Set<string>();
+
+  const pushItem = (item: ChatInputItem) => {
+    const key = editableInputItemKey(item);
+    if (key) {
+      if (seenStructuredItems.has(key)) {
+        return;
+      }
+      seenStructuredItems.add(key);
+    }
+    merged.push(item);
+  };
+
+  for (const item of preservedItems) {
+    pushItem(item);
+  }
+  for (const item of resolvedItems ?? []) {
+    pushItem(item);
+  }
+
+  return merged.length > 0 ? merged : undefined;
+}
+
+function extractEditableMessageDraft(message: Message): EditableMessageDraft | null {
+  if (!isEditableUserMessage(message)) {
+    return null;
+  }
+
+  const blocks = Array.isArray(message.blocks) ? message.blocks : [];
+  const textBlocks = blocks.filter(
+    (block): block is Extract<ContentBlock, { type: "text" }> =>
+      block.type === "text" && block.isSteer !== true,
+  );
+  const text =
+    textBlocks.length > 0
+      ? textBlocks.map((block) => block.content).join("\n")
+      : typeof message.content === "string"
+        ? message.content
+        : "";
+  const attachments = blocks
+    .filter((block): block is Extract<ContentBlock, { type: "attachment" }> =>
+      block.type === "attachment",
+    )
+    .map<ChatAttachment>((block, index) => ({
+      id: crypto.randomUUID?.() ?? `${message.id}:attachment:${index}`,
+      fileName: block.fileName,
+      filePath: block.filePath,
+      sizeBytes: block.sizeBytes,
+      mimeType: block.mimeType,
+    }));
+  const inputItems = blocks.flatMap<ChatInputItem>((block) => {
+    if (block.type === "skill") {
+      return [{ type: "skill", name: block.name, path: block.path }];
+    }
+    if (block.type === "mention") {
+      return [{ type: "mention", name: block.name, path: block.path }];
+    }
+    return [];
+  });
+  const planMode = textBlocks.some((block) => Boolean(block.planMode));
+
+  return {
+    text,
+    attachments,
+    inputItems,
+    planMode,
+  };
+}
+
 export function ChatPanel() {
   const { t } = useTranslation("chat");
   const renderStartedAtRef = useRef(performance.now());
@@ -1554,9 +2643,6 @@ export function ChatPanel() {
   const [selectedServiceTier, setSelectedServiceTier] = useState<CodexServiceTierValue>("inherit");
   const [outputSchemaText, setOutputSchemaText] = useState("");
   const [customApprovalPolicyText, setCustomApprovalPolicyText] = useState("");
-  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(
-    null,
-  );
   const {
     messages,
     hasOlderMessages,
@@ -1592,8 +2678,6 @@ export function ChatPanel() {
       threadId: state.threadId,
     })),
   );
-  const messageFocusTarget = useUiStore((s) => s.messageFocusTarget);
-  const clearMessageFocusTarget = useUiStore((s) => s.clearMessageFocusTarget);
   const engines = useEngineStore((s) => s.engines);
   const health = useEngineStore((s) => s.health);
   const onboardingOpen = useOnboardingStore((s) => s.open);
@@ -1691,25 +2775,19 @@ export function ChatPanel() {
   const codexProfiles = useCodexProfileStore((s) => s.profiles);
   const activeCodexProfileId = useCodexProfileStore((s) => s.activeProfileId);
   const setActiveCodexProfile = useCodexProfileStore((s) => s.setActiveProfile);
-  const viewportRef = useRef<HTMLDivElement>(null);
   const chatSectionRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const recentClipboardImageSignaturesRef = useRef<Map<string, number>>(new Map());
   const effortSyncKeyRef = useRef<string | null>(null);
   const manuallyOverrodeThreadSelectionRef = useRef(false);
   const lastSyncedThreadIdRef = useRef<string | null>(null);
-  const highlightTimeoutRef = useRef<number | null>(null);
-  const prependLoadInFlightRef = useRef(false);
   const creatingProjectTabRef = useRef(false);
-  const threadActivatedAtRef = useRef(0);
-  const initialScrollThreadRef = useRef<string | null>(null);
-  const messageHeightsRef = useRef<Map<string, number>>(new Map());
   const [creatingProjectTab, setCreatingProjectTab] = useState(false);
-  const layoutVersionRafRef = useRef<number | null>(null);
+  const [codexProfileSwitchState, setCodexProfileSwitchState] = useState<{
+    targetProfileId: string;
+    targetProfileName: string;
+  } | null>(null);
   const threadExecutionPolicyRequestIdsRef = useRef<Record<string, number>>({});
-  const [listLayoutVersion, setListLayoutVersion] = useState(0);
-  const [viewportScrollTop, setViewportScrollTop] = useState(0);
-  const [viewportHeight, setViewportHeight] = useState(0);
-  const [autoScrollLocked, setAutoScrollLocked] = useState(false);
   const [workspaceOptInPrompt, setWorkspaceOptInPrompt] = useState<{
     repoNames: string;
     workspaceId: string;
@@ -1728,6 +2806,8 @@ export function ChatPanel() {
     outputSchemaText: string;
     customApprovalPolicyText: string;
   } | null>(null);
+  const [editingMessageState, setEditingMessageState] =
+    useState<EditingMessageState | null>(null);
 
   const trustLevelOptions = useMemo(() => getTrustLevelOptions(t), [t]);
   const codexThreadApprovalPolicyOptions = useMemo(
@@ -2252,6 +3332,65 @@ export function ChatPanel() {
   const pendingToolInputSupportsCancel =
     activeThreadApprovalDecisionCapabilities.includes("cancel");
 
+  const appendResolvedAttachments = useCallback((nextAttachments: ChatAttachment[]) => {
+    const attachmentFilterConfig = getAttachmentFilterConfig(t, selectedEngineId);
+    if (attachmentFilterConfig) {
+      const supportedExtensions = new Set(attachmentFilterConfig.supportedExtensions);
+      const supportedAttachments = nextAttachments.filter((attachment) =>
+        isSupportedAttachmentName(attachment.fileName, supportedExtensions),
+      );
+      const skippedCount = nextAttachments.length - supportedAttachments.length;
+      if (skippedCount > 0) {
+        toast.warning(attachmentFilterConfig.warningMessage);
+      }
+      nextAttachments = supportedAttachments;
+    }
+
+    if (nextAttachments.length === 0) {
+      return;
+    }
+
+    setAttachments((prev) => {
+      const knownPaths = new Set(prev.map((attachment) => attachment.filePath));
+      const knownKeys = new Set(
+        prev.map((attachment) => attachment.id?.trim() || attachment.filePath),
+      );
+      const merged = [...prev];
+      for (const attachment of nextAttachments) {
+        const attachmentKey = attachment.id?.trim() || attachment.filePath;
+        if (knownKeys.has(attachmentKey) || knownPaths.has(attachment.filePath)) {
+          continue;
+        }
+        knownKeys.add(attachmentKey);
+        knownPaths.add(attachment.filePath);
+        merged.push(attachment);
+      }
+      return merged;
+    });
+  }, [selectedEngineId, t]);
+
+  const shouldHandleClipboardImagePaste = useCallback((files: File[]) => {
+    const signature = buildClipboardImageSignature(files);
+    if (!signature) {
+      return false;
+    }
+
+    const now = Date.now();
+    const seen = recentClipboardImageSignaturesRef.current;
+    for (const [knownSignature, seenAt] of seen.entries()) {
+      if (now - seenAt > CLIPBOARD_IMAGE_PASTE_DEDUPE_WINDOW_MS) {
+        seen.delete(knownSignature);
+      }
+    }
+
+    if (seen.has(signature)) {
+      return false;
+    }
+
+    seen.set(signature, now);
+    return true;
+  }, []);
+
   const appendAttachmentsFromPaths = useCallback((paths: string[]) => {
     if (!activeWorkspaceId || paths.length === 0) {
       return;
@@ -2273,36 +3412,63 @@ export function ChatPanel() {
       });
     }
 
-    const attachmentFilterConfig = getAttachmentFilterConfig(t, selectedEngineId);
-    if (attachmentFilterConfig) {
-      const supportedExtensions = new Set(attachmentFilterConfig.supportedExtensions);
-      const supportedAttachments = nextAttachments.filter((attachment) =>
-        isSupportedAttachmentName(attachment.fileName, supportedExtensions),
+    appendResolvedAttachments(nextAttachments);
+  }, [activeWorkspaceId, appendResolvedAttachments]);
+
+  const appendClipboardImageAttachments = useCallback(
+    async (files: File[]) => {
+      if (!activeWorkspaceId || files.length === 0) {
+        return;
+      }
+
+      try {
+        const pastedAttachments = await Promise.all(
+          files.map(async (file) => {
+            const arrayBuffer = await file.arrayBuffer();
+            return ipc.persistPastedImage(
+              file.type || "image/png",
+              Array.from(new Uint8Array(arrayBuffer)),
+            );
+          }),
+        );
+        appendResolvedAttachments(pastedAttachments);
+      } catch (error) {
+        toast.error(
+          t("panel.toasts.attachFilesFailed", {
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+    },
+    [activeWorkspaceId, appendResolvedAttachments, t],
+  );
+
+  useEffect(() => {
+    const handleNativeComposerImagePaste = (event: Event) => {
+      const detail = (event as CustomEvent<ChatComposerNativeImagePasteDetail>).detail;
+      const files = detail?.files ?? [];
+      if (
+        document.activeElement !== inputRef.current ||
+        files.length === 0 ||
+        !shouldHandleClipboardImagePaste(files)
+      ) {
+        return;
+      }
+
+      void appendClipboardImageAttachments(files);
+    };
+
+    window.addEventListener(
+      CHAT_COMPOSER_NATIVE_IMAGE_PASTE_EVENT,
+      handleNativeComposerImagePaste,
+    );
+    return () => {
+      window.removeEventListener(
+        CHAT_COMPOSER_NATIVE_IMAGE_PASTE_EVENT,
+        handleNativeComposerImagePaste,
       );
-      const skippedCount = nextAttachments.length - supportedAttachments.length;
-      if (skippedCount > 0) {
-        toast.warning(attachmentFilterConfig.warningMessage);
-      }
-      nextAttachments = supportedAttachments;
-    }
-
-    if (nextAttachments.length === 0) {
-      return;
-    }
-
-    setAttachments((prev) => {
-      const knownPaths = new Set(prev.map((attachment) => attachment.filePath));
-      const merged = [...prev];
-      for (const attachment of nextAttachments) {
-        if (knownPaths.has(attachment.filePath)) {
-          continue;
-        }
-        knownPaths.add(attachment.filePath);
-        merged.push(attachment);
-      }
-      return merged;
-    });
-  }, [activeWorkspaceId, selectedEngineId, t]);
+    };
+  }, [appendClipboardImageAttachments, shouldHandleClipboardImagePaste]);
 
   useEffect(() => {
     const attachmentFilterConfig = getAttachmentFilterConfig(t, selectedEngineId);
@@ -2330,16 +3496,6 @@ export function ChatPanel() {
     }
     const rect = container.getBoundingClientRect();
     return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
-  }, []);
-
-  const scheduleListLayoutVersionBump = useCallback(() => {
-    if (layoutVersionRafRef.current !== null) {
-      return;
-    }
-    layoutVersionRafRef.current = window.requestAnimationFrame(() => {
-      layoutVersionRafRef.current = null;
-      setListLayoutVersion((version) => version + 1);
-    });
   }, []);
 
   useEffect(() => {
@@ -2409,78 +3565,6 @@ export function ChatPanel() {
       setIsFileDropOver(false);
     }
   }, [activeWorkspaceId]);
-
-  useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) {
-      return;
-    }
-
-    let rafId = 0;
-    const updateScroll = () => {
-      setViewportScrollTop(viewport.scrollTop);
-      const nearBottom =
-        viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 120;
-      setAutoScrollLocked(!nearBottom);
-    };
-    const updateHeight = () => {
-      setViewportHeight(viewport.clientHeight);
-    };
-
-    updateScroll();
-    updateHeight();
-
-    const onScroll = () => {
-      if (rafId !== 0) {
-        return;
-      }
-      rafId = window.requestAnimationFrame(() => {
-        rafId = 0;
-        updateScroll();
-      });
-    };
-
-    viewport.addEventListener("scroll", onScroll, { passive: true });
-
-    let resizeObserver: ResizeObserver | null = null;
-    if (typeof ResizeObserver !== "undefined") {
-      resizeObserver = new ResizeObserver(() => updateHeight());
-      resizeObserver.observe(viewport);
-    } else {
-      window.addEventListener("resize", updateHeight);
-    }
-
-    return () => {
-      viewport.removeEventListener("scroll", onScroll);
-      if (rafId !== 0) {
-        window.cancelAnimationFrame(rafId);
-      }
-      if (resizeObserver) {
-        resizeObserver.disconnect();
-      } else {
-        window.removeEventListener("resize", updateHeight);
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    messageHeightsRef.current.clear();
-    scheduleListLayoutVersionBump();
-  }, [activeThread?.id, scheduleListLayoutVersionBump]);
-
-  useEffect(() => {
-    const existingIds = new Set(messages.map((message) => message.id));
-    let changed = false;
-    for (const messageId of messageHeightsRef.current.keys()) {
-      if (!existingIds.has(messageId)) {
-        messageHeightsRef.current.delete(messageId);
-        changed = true;
-      }
-    }
-    if (changed) {
-      scheduleListLayoutVersionBump();
-    }
-  }, [messages, scheduleListLayoutVersionBump]);
 
   useEffect(() => {
     if (!engines.length) {
@@ -2858,192 +3942,6 @@ export function ChatPanel() {
     setActiveThreadInStore,
   ]);
 
-  const scrollViewportToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
-    const viewport = viewportRef.current;
-    if (!viewport) {
-      return;
-    }
-
-    viewport.scrollTo({ top: viewport.scrollHeight, behavior });
-  }, []);
-
-  useEffect(() => {
-    threadActivatedAtRef.current = performance.now();
-    prependLoadInFlightRef.current = false;
-  }, [threadId]);
-
-  useEffect(() => {
-    if (!threadId) {
-      initialScrollThreadRef.current = null;
-      setAutoScrollLocked(false);
-      return;
-    }
-
-    if (messages.length === 0) {
-      return;
-    }
-
-    if (initialScrollThreadRef.current === threadId) {
-      return;
-    }
-
-    if (messageFocusTarget?.threadId === threadId) {
-      return;
-    }
-
-    initialScrollThreadRef.current = threadId;
-
-    let raf2 = 0;
-    const raf1 = window.requestAnimationFrame(() => {
-      scrollViewportToBottom("auto");
-      raf2 = window.requestAnimationFrame(() => {
-        scrollViewportToBottom("auto");
-      });
-    });
-
-    return () => {
-      window.cancelAnimationFrame(raf1);
-      if (raf2 !== 0) {
-        window.cancelAnimationFrame(raf2);
-      }
-    };
-  }, [threadId, messages.length, messageFocusTarget?.threadId, scrollViewportToBottom]);
-
-  useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) return;
-    if (!autoScrollLocked) {
-      scrollViewportToBottom("smooth");
-    }
-  }, [messages, autoScrollLocked, scrollViewportToBottom]);
-
-  useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport || !threadId || !hasOlderMessages || loadingOlderMessages) {
-      return;
-    }
-    if (performance.now() - threadActivatedAtRef.current < 700) {
-      return;
-    }
-    if (viewportScrollTop > 80 || prependLoadInFlightRef.current) {
-      return;
-    }
-
-    prependLoadInFlightRef.current = true;
-    const previousScrollHeight = viewport.scrollHeight;
-    void loadOlderMessages()
-      .then(() => {
-        window.requestAnimationFrame(() => {
-          const latestViewport = viewportRef.current;
-          if (!latestViewport) {
-            return;
-          }
-          const nextScrollHeight = latestViewport.scrollHeight;
-          const delta = nextScrollHeight - previousScrollHeight;
-          if (delta > 0) {
-            latestViewport.scrollTop = latestViewport.scrollTop + delta;
-          }
-        });
-      })
-      .finally(() => {
-        prependLoadInFlightRef.current = false;
-      });
-  }, [
-    hasOlderMessages,
-    loadOlderMessages,
-    loadingOlderMessages,
-    threadId,
-    viewportScrollTop,
-  ]);
-
-  useEffect(() => {
-    if (!messageFocusTarget) {
-      return;
-    }
-    if (messageFocusTarget.threadId !== threadId) {
-      return;
-    }
-
-    const targetIndex = messages.findIndex(
-      (message) => message.id === messageFocusTarget.messageId,
-    );
-    if (targetIndex < 0) {
-      if (hasOlderMessages && !loadingOlderMessages && !prependLoadInFlightRef.current) {
-        prependLoadInFlightRef.current = true;
-        void loadOlderMessages().finally(() => {
-          prependLoadInFlightRef.current = false;
-        });
-      }
-      return;
-    }
-
-    const viewport = viewportRef.current;
-    if (!viewport) {
-      return;
-    }
-
-    const targetMessageId = messages[targetIndex].id;
-    const targetHeight =
-      messageHeightsRef.current.get(targetMessageId) ??
-      MESSAGE_ESTIMATED_ROW_HEIGHT;
-    const targetTopOffset = estimateMessageOffset(
-      messages,
-      targetIndex,
-      messageHeightsRef.current,
-    );
-    const centeredTop = Math.max(
-      0,
-      targetTopOffset - Math.max((viewport.clientHeight - targetHeight) / 2, 0),
-    );
-
-    viewport.scrollTo({ top: centeredTop, behavior: "smooth" });
-    window.setTimeout(() => {
-      const targetElement = viewport.querySelector<HTMLElement>(
-        `[data-message-id="${targetMessageId}"]`,
-      );
-      if (targetElement) {
-        targetElement.scrollIntoView({ block: "center", behavior: "smooth" });
-      }
-    }, 120);
-    setHighlightedMessageId(targetMessageId);
-
-    if (highlightTimeoutRef.current !== null) {
-      window.clearTimeout(highlightTimeoutRef.current);
-    }
-    highlightTimeoutRef.current = window.setTimeout(() => {
-      setHighlightedMessageId((current) =>
-        current === targetMessageId ? null : current,
-      );
-      highlightTimeoutRef.current = null;
-    }, 2400);
-
-    clearMessageFocusTarget();
-  }, [
-    clearMessageFocusTarget,
-    hasOlderMessages,
-    loadOlderMessages,
-    loadingOlderMessages,
-    messageFocusTarget,
-    messages,
-    threadId,
-  ]);
-
-  useEffect(() => {
-    return () => {
-      if (highlightTimeoutRef.current !== null) {
-        window.clearTimeout(highlightTimeoutRef.current);
-      }
-      if (layoutVersionRafRef.current !== null) {
-        window.cancelAnimationFrame(layoutVersionRafRef.current);
-        layoutVersionRafRef.current = null;
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    setHighlightedMessageId(null);
-  }, [activeThread?.id]);
-
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key === ".") {
@@ -3351,25 +4249,65 @@ export function ChatPanel() {
     activeThread.engineId === "codex" &&
     !!activeThread.engineThreadId &&
     !!activeWorkspaceId;
-  const activeCodexProfileName =
-    codexProfiles.find((profile) => profile.id === activeCodexProfileId)?.name ?? "Codex profile";
+  const activeThreadCodexProfileId =
+    activeThread?.engineId === "codex" ? readThreadCodexProfileId(activeThread) : null;
+  const selectedCodexProfileId = activeThreadCodexProfileId ?? activeCodexProfileId ?? "";
+  const selectedCodexProfileName =
+    codexProfiles.find((profile) => profile.id === selectedCodexProfileId)?.name ?? "Codex profile";
+  const codexProfileSwitching = codexProfileSwitchState !== null;
+  const codexProfileSwitchTargetName =
+    codexProfileSwitchState?.targetProfileName ?? selectedCodexProfileName;
+  const sendBlockedByCodexProfileSwitch = codexProfileSwitching && selectedEngineId === "codex";
 
   const isCodexEngine = selectedEngineId === "codex";
 
   async function onActiveCodexProfileChange(profileId: string) {
-    if (!profileId || profileId === activeCodexProfileId) {
+    const normalizedProfileId = profileId.trim();
+    if (
+      !normalizedProfileId ||
+      normalizedProfileId === selectedCodexProfileId ||
+      codexProfileSwitching
+    ) {
       return;
     }
 
+    const nextProfileName =
+      codexProfiles.find((profile) => profile.id === normalizedProfileId)?.name ??
+      normalizedProfileId;
+
     try {
-      await setActiveCodexProfile(profileId);
-      toast.success(
-        `Switched Codex profile to ${
-          codexProfiles.find((profile) => profile.id === profileId)?.name ?? profileId
-        }.`,
-      );
+      setCodexProfileSwitchState({
+        targetProfileId: normalizedProfileId,
+        targetProfileName: nextProfileName,
+      });
+
+      const updatedThreadPromise =
+        activeThread?.engineId === "codex"
+          ? ipc.setThreadCodexProfile(activeThread.id, normalizedProfileId)
+          : Promise.resolve(null);
+
+      const [, updatedThread] = await Promise.all([
+        setActiveCodexProfile(normalizedProfileId),
+        updatedThreadPromise,
+      ]);
+
+      if (updatedThread) {
+        applyThreadUpdateLocal(updatedThread);
+      }
+
+      try {
+        await ipc.prewarmEngine("codex");
+      } catch (error) {
+        console.warn("Failed to prewarm Codex after profile switch:", error);
+      }
+
+      toast.success(`Switched Codex profile to ${nextProfileName}.`);
     } catch (error) {
       toast.error(String(error));
+    } finally {
+      setCodexProfileSwitchState((current) =>
+        current?.targetProfileId === normalizedProfileId ? null : current,
+      );
     }
   }
 
@@ -3824,9 +4762,196 @@ export function ChatPanel() {
     }
   }
 
+  function startEditingUserMessage(message: Message) {
+    if (!activeThread || activeThread.id !== message.threadId || !canUseNativeCodexHistoryTools) {
+      toast.error(t("panel.toasts.editMessageUnavailable"));
+      return;
+    }
+
+    if (streaming) {
+      toast.error(t("panel.toasts.editMessageUnavailable"));
+      return;
+    }
+
+    const draft = extractEditableMessageDraft(message);
+    const turnsToRollback = countEditableUserTurnsFromMessage(messages, message.id);
+    if (!draft || turnsToRollback < 1) {
+      toast.error(t("panel.toasts.editMessageUnavailable"));
+      return;
+    }
+
+    setEditingMessageState({
+      messageId: message.id,
+      sourceThreadId: message.threadId,
+      turnsToRollback,
+      inputItems: draft.inputItems,
+      previousInput: input,
+      previousAttachments: attachments,
+      previousPlanMode: planMode,
+    });
+    setInput(draft.text);
+    setAttachments(draft.attachments);
+    setPlanMode(draft.planMode);
+    setComposerTrigger(null);
+    setActiveCommandPanel(null);
+    setCommandPanelError(null);
+
+    window.requestAnimationFrame(() => {
+      inputRef.current?.focus();
+      const length = draft.text.length;
+      inputRef.current?.setSelectionRange(length, length);
+    });
+  }
+
+  function cancelEditingUserMessage() {
+    if (!editingMessageState) {
+      return;
+    }
+    setInput(editingMessageState.previousInput);
+    setAttachments(editingMessageState.previousAttachments);
+    setPlanMode(editingMessageState.previousPlanMode);
+    setEditingMessageState(null);
+    setComposerTrigger(null);
+  }
+
+  async function submitEditedUserMessage() {
+    const editState = editingMessageState;
+    if (!editState || sendBlockedByCodexProfileSwitch || !activeWorkspaceId) {
+      return;
+    }
+
+    const text = input.trim();
+    const currentAttachments = [...attachments];
+    if (!text && currentAttachments.length === 0 && editState.inputItems.length === 0) {
+      return;
+    }
+
+    if (
+      streaming ||
+      !activeThread ||
+      activeThread.id !== editState.sourceThreadId ||
+      activeThread.engineId !== "codex" ||
+      !activeThread.engineThreadId ||
+      activeThread.engineMetadata?.codexTranscriptImported === false
+    ) {
+      toast.error(t("panel.toasts.editMessageUnavailable"));
+      return;
+    }
+
+    const composerRuntime = resolveComposerRuntimeSelection();
+    if (!composerRuntime || composerRuntime.engineId !== "codex") {
+      toast.error(t("panel.toasts.editMessageUnavailable"));
+      return;
+    }
+
+    const submitEngineId = composerRuntime.engineId;
+    const submitModelId = composerRuntime.modelId;
+    const submitReasoningEffort = composerRuntime.reasoningEffort;
+    const shellCommand =
+      currentAttachments.length === 0 && !planMode ? extractShellCommand(text) : null;
+    const resolvedInputItems = shellCommand
+      ? undefined
+      : await resolveCodexInputItems(text, submitEngineId);
+    const inputItems = shellCommand
+      ? undefined
+      : mergeEditedMessageInputItems(editState.inputItems, resolvedInputItems);
+
+    try {
+      const rolledBackThread = await rollbackCodexThread(
+        editState.sourceThreadId,
+        editState.turnsToRollback,
+      );
+      if (!rolledBackThread) {
+        throw new Error(t("panel.toasts.codexThreadRollbackFailed"));
+      }
+
+      await switchProjectThread(rolledBackThread);
+      setEditingMessageState(null);
+
+      if (
+        rolledBackThread.repoId === null &&
+        repos.length > 1 &&
+        readThreadSandboxModeValue(rolledBackThread) !== "read-only"
+      ) {
+        const availableRepoPaths = repos.map((repo) => repo.path);
+        const optIn = Boolean(rolledBackThread.engineMetadata?.workspaceWriteOptIn);
+        const confirmedWritableRoots = readThreadWorkspaceWritableRoots(rolledBackThread);
+        const hasValidConfirmedRoots = confirmedWritableRoots.some((root) =>
+          availableRepoPaths.includes(root),
+        );
+        if (!optIn || !hasValidConfirmedRoots) {
+          const repoNames = repos.map((repo) => repo.name).join(", ");
+          setWorkspaceOptInPrompt({
+            repoNames,
+            workspaceId: activeWorkspaceId,
+            threadId: rolledBackThread.id,
+            threadPaths: availableRepoPaths,
+            text,
+            shellCommand,
+            attachments: currentAttachments,
+            inputItems: inputItems ?? null,
+            planMode,
+            engineId: submitEngineId,
+            modelId: submitModelId,
+            effort: submitReasoningEffort,
+            personality: selectedPersonality,
+            serviceTier: selectedServiceTier,
+            outputSchemaText,
+            customApprovalPolicyText,
+          });
+          return;
+        }
+      }
+
+      await ipc.setThreadReasoningEffort(
+        rolledBackThread.id,
+        submitReasoningEffort,
+        submitModelId,
+      );
+      setThreadReasoningEffortLocal(rolledBackThread.id, submitReasoningEffort);
+      if (!(await applyCodexConfigToThread(rolledBackThread.id))) {
+        return;
+      }
+      setThreadLastModelLocal(rolledBackThread.id, submitModelId);
+
+      const sent = shellCommand
+        ? await runCodexShellCommand(shellCommand, {
+            threadIdOverride: rolledBackThread.id,
+            engineId: submitEngineId,
+            modelId: submitModelId,
+            reasoningEffort: submitReasoningEffort,
+          })
+        : await send(text, {
+            threadIdOverride: rolledBackThread.id,
+            engineId: submitEngineId,
+            modelId: submitModelId,
+            reasoningEffort: submitReasoningEffort,
+            attachments: currentAttachments.length > 0 ? currentAttachments : undefined,
+            inputItems,
+            planMode,
+          });
+
+      if (sent) {
+        setInput("");
+        setAttachments([]);
+        toast.success(t("panel.toasts.editMessageSubmitted"));
+      }
+    } catch (error) {
+      toast.error(
+        t("panel.toasts.editMessageFailed", {
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    }
+  }
+
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
-    if (!input.trim() || !activeWorkspaceId) return;
+    if (editingMessageState) {
+      await submitEditedUserMessage();
+      return;
+    }
+    if (sendBlockedByCodexProfileSwitch || !input.trim() || !activeWorkspaceId) return;
     const text = input.trim();
     const currentAttachments = [...attachments];
     const activeShellCommand =
@@ -4212,25 +5337,52 @@ export function ChatPanel() {
     setAttachments((prev) => prev.filter((a) => a.id !== id));
   }
 
-  const onMessageRowHeightChange = useCallback(
-    (messageId: string, height: number) => {
-      const normalizedHeight = Math.max(56, Math.ceil(height));
-      const previousHeight = messageHeightsRef.current.get(messageId);
-      if (
-        previousHeight !== undefined &&
-        Math.abs(previousHeight - normalizedHeight) < 2
-      ) {
+  function extractClipboardImageFiles(clipboardData?: DataTransfer | null): File[] {
+    const imageFiles: File[] = [];
+    const knownFiles = new Set<string>();
+
+    const appendFile = (file: File | null) => {
+      if (!(file instanceof File) || !file.type.startsWith("image/")) {
         return;
       }
 
-      messageHeightsRef.current.set(messageId, normalizedHeight);
-      scheduleListLayoutVersionBump();
-    },
-    [scheduleListLayoutVersionBump],
-  );
+      const fileKey = [file.name, file.type, file.size, file.lastModified].join(":");
+      if (knownFiles.has(fileKey)) {
+        return;
+      }
+
+      knownFiles.add(fileKey);
+      imageFiles.push(file);
+    };
+
+    Array.from(clipboardData?.items ?? []).forEach((item) => {
+      if (item.kind !== "file") {
+        return;
+      }
+      appendFile(item.getAsFile());
+    });
+
+    Array.from(clipboardData?.files ?? []).forEach((file) => appendFile(file));
+
+    return imageFiles;
+  }
+
+  function handleComposerPaste(event: ClipboardEvent<HTMLElement>) {
+    const imageFiles = extractClipboardImageFiles(event.clipboardData);
+
+    if (imageFiles.length === 0) {
+      return;
+    }
+
+    event.preventDefault();
+    if (!shouldHandleClipboardImagePaste(imageFiles)) {
+      return;
+    }
+    void appendClipboardImageAttachments(imageFiles);
+  }
 
   const virtualizationEnabled =
-    messages.length >= MESSAGE_VIRTUALIZATION_THRESHOLD;
+    messages.length >= MESSAGE_VIRTUALIZATION_THRESHOLD && !streaming;
 
   useEffect(() => {
     recordPerfMetric("chat.render.commit.ms", performance.now() - renderStartedAtRef.current, {
@@ -4252,101 +5404,6 @@ export function ChatPanel() {
     (messageId: string, actionId: string) => hydrateActionOutput(messageId, actionId),
     [hydrateActionOutput],
   );
-
-  const virtualizedLayout = useMemo(() => {
-    if (!virtualizationEnabled || messages.length === 0) {
-      return null;
-    }
-
-    const rowCount = messages.length;
-    const offsets = new Array<number>(rowCount + 1);
-    offsets[0] = 0;
-
-    for (let index = 0; index < rowCount; index += 1) {
-      const messageId = messages[index].id;
-      const measuredHeight = messageHeightsRef.current.get(messageId);
-      const rowHeight = measuredHeight ?? MESSAGE_ESTIMATED_ROW_HEIGHT;
-      offsets[index + 1] =
-        offsets[index] + rowHeight + (index < rowCount - 1 ? MESSAGE_ROW_GAP : 0);
-    }
-
-    return {
-      offsets,
-      rowCount,
-    };
-  }, [messages, virtualizationEnabled, listLayoutVersion]);
-
-  const virtualWindow = useMemo(() => {
-    if (!virtualizedLayout) {
-      return null;
-    }
-
-    const { offsets, rowCount } = virtualizedLayout;
-
-    const visibleStart = Math.max(0, viewportScrollTop - MESSAGE_OVERSCAN_PX);
-    const visibleEnd =
-      viewportScrollTop + viewportHeight + MESSAGE_OVERSCAN_PX;
-
-    // Binary search: find first row whose bottom edge (offsets[i+1]) >= visibleStart
-    let lo = 0;
-    let hi = rowCount;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if (offsets[mid + 1] < visibleStart) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    const startIndex = lo;
-
-    // Binary search: find first row whose top edge (offsets[i]) > visibleEnd
-    lo = startIndex;
-    hi = rowCount;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if (offsets[mid] <= visibleEnd) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    let endIndexExclusive = lo;
-
-    if (endIndexExclusive <= startIndex) {
-      endIndexExclusive = Math.min(rowCount, startIndex + 1);
-    }
-
-    return {
-      startIndex,
-      endIndexExclusive,
-      topSpacerHeight: offsets[startIndex],
-      bottomSpacerHeight: offsets[rowCount] - offsets[endIndexExclusive],
-    };
-  }, [
-    virtualizedLayout,
-    viewportHeight,
-    viewportScrollTop,
-  ]);
-
-  const visibleMessages = useMemo(() => {
-    if (!virtualizationEnabled || !virtualWindow) {
-      return messages;
-    }
-
-    return messages.slice(virtualWindow.startIndex, virtualWindow.endIndexExclusive);
-  }, [messages, virtualWindow, virtualizationEnabled]);
-
-  const assistantIdentityByMessageId = useMemo(() => {
-    const identityByMessageId = new Map<string, { label: string; engineId: string }>();
-    for (const message of visibleMessages) {
-      if (message.role !== "assistant") {
-        continue;
-      }
-      identityByMessageId.set(message.id, renderAssistantIdentity(message));
-    }
-    return identityByMessageId;
-  }, [renderAssistantIdentity, visibleMessages]);
 
   const workspaceName = activeWorkspace?.name || activeWorkspace?.rootPath.split("/").pop() || "";
   const layoutMode: LayoutMode = activeWorkspaceId
@@ -4557,6 +5614,15 @@ export function ChatPanel() {
     resizeCleanupRef.current = onUp;
   }, [activeWorkspaceId, setTerminalPanelSize]);
 
+  const hasComposerPayload = editingMessageState
+    ? input.trim().length > 0 ||
+      attachments.length > 0 ||
+      editingMessageState.inputItems.length > 0
+    : input.trim().length > 0;
+  const canSubmitComposer = Boolean(
+    activeWorkspaceId && hasComposerPayload && !sendBlockedByCodexProfileSwitch,
+  );
+
   return (
     <div
       style={{
@@ -4619,157 +5685,20 @@ export function ChatPanel() {
               </div>
             )}
             {/* ── Messages ── */}
-            <div
-              ref={viewportRef}
-              style={{
-                position: "relative",
-                flex: 1,
-                overflow: "auto",
-                padding: "20px 24px",
-              }}
-            >
-        {messages.length === 0 ? (
-          <div
-            className="animate-fade-in"
-            style={{
-              height: "100%",
-              display: "flex",
-              flexDirection: "column",
-              alignItems: "center",
-              justifyContent: "center",
-              gap: 16,
-              color: "var(--text-3)",
-              textAlign: "center",
-            }}
-          >
-            <div
-              style={{
-                width: 56,
-                height: 56,
-                borderRadius: "var(--radius-lg)",
-                background: "var(--bg-3)",
-                border: "1px solid var(--border)",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-              }}
-            >
-              <Send size={22} style={{ color: "var(--text-2)", opacity: 0.5 }} />
-            </div>
-            <div>
-              <p style={{ margin: "0 0 4px", fontSize: 14, fontWeight: 500, color: "var(--text-2)" }}>
-                {t("panel.startConversation")}
-              </p>
-              <p style={{ margin: 0, fontSize: 12.5 }}>
-                {t("panel.emptyHint")}
-              </p>
-              {selectedEngineId === "codex" && activeWorkspaceId && (
-                <p style={{ margin: "8px 0 0", fontSize: 12, color: "var(--text-3)" }}>
-                  {t("panel.emptyCodexSidebarHint")}
-                </p>
-              )}
-            </div>
-          </div>
-        ) : virtualizationEnabled && virtualWindow ? (
-          <div style={{ display: "flex", flexDirection: "column" }}>
-            {virtualWindow.topSpacerHeight > 0 && (
-              <div style={{ height: virtualWindow.topSpacerHeight }} />
-            )}
-
-            <div style={{ display: "flex", flexDirection: "column", gap: MESSAGE_ROW_GAP }}>
-              {visibleMessages.map((message, relativeIndex) => {
-                  const absoluteIndex = virtualWindow.startIndex + relativeIndex;
-                  const assistantIdentity = assistantIdentityByMessageId.get(message.id);
-                  return (
-                    <MeasuredMessageRow
-                      key={message.id}
-                      messageId={message.id}
-                      onHeightChange={onMessageRowHeightChange}
-                    >
-                      <MessageRow
-                        message={message}
-                        index={absoluteIndex}
-                        isHighlighted={message.id === highlightedMessageId}
-                        assistantLabel={assistantIdentity?.label ?? ""}
-                        assistantEngineId={assistantIdentity?.engineId ?? ""}
-                        onApproval={handleApproval}
-                        onLoadActionOutput={handleLoadActionOutput}
-                      />
-                    </MeasuredMessageRow>
-                  );
-                })}
-            </div>
-
-            {virtualWindow.bottomSpacerHeight > 0 && (
-              <div style={{ height: virtualWindow.bottomSpacerHeight }} />
-            )}
-          </div>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: MESSAGE_ROW_GAP }}>
-            {visibleMessages.map((message, index) => {
-              const assistantIdentity = assistantIdentityByMessageId.get(message.id);
-              return (
-                <MessageRow
-                  key={message.id}
-                  message={message}
-                  index={index}
-                  isHighlighted={message.id === highlightedMessageId}
-                  assistantLabel={assistantIdentity?.label ?? ""}
-                  assistantEngineId={assistantIdentity?.engineId ?? ""}
-                  onApproval={handleApproval}
-                  onLoadActionOutput={handleLoadActionOutput}
-                />
-              );
-            })}
-          </div>
-        )}
-
-        {autoScrollLocked && messages.length > 0 && (
-          <button
-            type="button"
-            onClick={() => {
-              setAutoScrollLocked(false);
-              scrollViewportToBottom("smooth");
-            }}
-            style={{
-              position: "sticky",
-              left: "100%",
-              bottom: 10,
-              marginLeft: "auto",
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 6,
-              padding: "6px 10px",
-              borderRadius: "var(--radius-sm)",
-              border: streaming
-                ? "1px solid color-mix(in srgb, var(--accent) 24%, transparent)"
-                : "1px solid var(--border)",
-              background: streaming
-                ? "color-mix(in srgb, var(--accent) 8%, transparent)"
-                : "var(--bg-2)",
-              color: streaming ? "var(--accent-2)" : "var(--text-2)",
-              fontSize: 11.5,
-              cursor: "pointer",
-              boxShadow: "0 8px 24px rgba(0,0,0,0.28)",
-              zIndex: 2,
-            }}
-          >
-            {streaming && (
-              <span
-                style={{
-                  width: 6,
-                  height: 6,
-                  borderRadius: "50%",
-                  background: "var(--accent-2)",
-                  animation: "pulse-soft 1.5s ease-in-out infinite",
-                  flexShrink: 0,
-                }}
-              />
-            )}
-            {streaming ? t("panel.newActivity") : t("panel.jumpToLatest")}
-          </button>
-        )}
-            </div>
+            <ConversationViewport
+              messages={messages}
+              threadId={threadId}
+              streaming={streaming}
+              hasOlderMessages={hasOlderMessages}
+              loadingOlderMessages={loadingOlderMessages}
+              loadOlderMessages={loadOlderMessages}
+              showCodexEmptyHint={selectedEngineId === "codex" && Boolean(activeWorkspaceId)}
+              renderAssistantIdentity={renderAssistantIdentity}
+              onApproval={handleApproval}
+              onLoadActionOutput={handleLoadActionOutput}
+              canEditUserMessages={canUseNativeCodexHistoryTools}
+              onEditUserMessage={startEditingUserMessage}
+            />
 
             {/* ── Input Area ── */}
             <div
@@ -5044,6 +5973,7 @@ export function ChatPanel() {
           {/* Input container */}
           <div
             className={`chat-input-box ${planMode && !showPendingToolInputComposer ? "chat-input-box-plan" : ""} ${showPendingToolInputComposer ? "chat-input-box-tool-input" : ""}`.trim()}
+            onPasteCapture={handleComposerPaste}
           >
             {showPendingToolInputComposer && pendingToolInputApproval ? (
               <ToolInputQuestionnaire
@@ -5070,6 +6000,42 @@ export function ChatPanel() {
               />
             ) : (
               <>
+                {codexProfileSwitching && (
+                  <div
+                    className="chat-plan-mode-banner"
+                    style={{
+                      borderColor: "color-mix(in srgb, var(--accent) 26%, transparent)",
+                      background: "color-mix(in srgb, var(--accent) 10%, transparent)",
+                      color: "var(--text-2)",
+                    }}
+                  >
+                    <Loader2 size={12} className="git-spin" />
+                    <span>
+                      {`Switching Codex profile to ${codexProfileSwitchTargetName}. You can keep typing, sending is temporarily paused.`}
+                    </span>
+                  </div>
+                )}
+
+                {editingMessageState && (
+                  <div className="chat-edit-message-banner">
+                    <FilePen size={12} />
+                    <span className="chat-edit-message-banner-text">
+                      {t("panel.editingPreviousMessage", {
+                        count: editingMessageState.turnsToRollback,
+                      })}
+                    </span>
+                    <button
+                      type="button"
+                      className="chat-edit-message-cancel"
+                      title={t("panel.cancelEditMessage")}
+                      aria-label={t("panel.cancelEditMessage")}
+                      onClick={cancelEditingUserMessage}
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                )}
+
                 {/* Plan mode indicator banner */}
                 {planMode && (
                   <div className="chat-plan-mode-banner">
@@ -5145,6 +6111,7 @@ export function ChatPanel() {
 
                 <textarea
                   ref={inputRef}
+                  {...{ [CHAT_COMPOSER_DATA_ATTRIBUTE]: CHAT_COMPOSER_DATA_VALUE }}
                   rows={3}
                   value={input}
                   onChange={(e) => {
@@ -5352,14 +6319,22 @@ export function ChatPanel() {
                       value: profile.id,
                       label: profile.name,
                     }))}
-                    value={activeCodexProfileId ?? ""}
+                    value={selectedCodexProfileId}
                     onChange={(value) => {
                       void onActiveCodexProfileChange(value);
                     }}
-                    disabled={codexProfiles.length <= 1}
+                    disabled={codexProfiles.length <= 1 || codexProfileSwitching}
                     preferredDirection="top"
-                    title={`${t("runtimePicker.fields.profile")}: ${activeCodexProfileName}`}
-                    selectedLabel={`${t("runtimePicker.fields.profile")}: ${activeCodexProfileName}`}
+                    title={
+                      codexProfileSwitching
+                        ? `Switching Codex profile to ${codexProfileSwitchTargetName}...`
+                        : `${t("runtimePicker.fields.profile")}: ${selectedCodexProfileName}`
+                    }
+                    selectedLabel={
+                      codexProfileSwitching
+                        ? `Switching: ${codexProfileSwitchTargetName}`
+                        : `${t("runtimePicker.fields.profile")}: ${selectedCodexProfileName}`
+                    }
                     selectedIcon={<UserCircle size={12} />}
                     triggerStyle={{
                       background: "transparent",
@@ -5542,28 +6517,43 @@ export function ChatPanel() {
                 {(!streaming || canSteerActiveTurn) && !showPendingToolInputComposer && (
                 <button
                   type="submit"
-                  disabled={!activeWorkspaceId || !input.trim()}
-                  title={streaming ? t("panel.sendFollowUp") : undefined}
-                  aria-label={streaming ? t("panel.sendFollowUp") : undefined}
+                  disabled={!canSubmitComposer}
+                  title={
+                    sendBlockedByCodexProfileSwitch
+                      ? `Switching Codex profile to ${codexProfileSwitchTargetName}...`
+                      : streaming
+                        ? t("panel.sendFollowUp")
+                        : undefined
+                  }
+                  aria-label={
+                    sendBlockedByCodexProfileSwitch
+                      ? `Switching Codex profile to ${codexProfileSwitchTargetName}`
+                      : streaming
+                        ? t("panel.sendFollowUp")
+                        : undefined
+                  }
                   style={{
                     width: 30,
                     height: 30,
                     borderRadius: "50%",
                     background:
-                      activeWorkspaceId && input.trim()
+                      canSubmitComposer
                         ? "var(--accent)"
                         : "var(--bg-4)",
                     color:
-                      activeWorkspaceId && input.trim()
+                      canSubmitComposer
                         ? "var(--bg-0)"
                         : "var(--text-3)",
-                    cursor: activeWorkspaceId && input.trim() ? "pointer" : "default",
+                    cursor:
+                      canSubmitComposer
+                        ? "pointer"
+                        : "default",
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
                     transition: "all var(--duration-fast) var(--ease-out)",
                     boxShadow:
-                      activeWorkspaceId && input.trim()
+                      canSubmitComposer
                         ? "var(--accent-glow)"
                         : "none",
                   }}

@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use crate::{
     config::app_config::{AppConfig, CodexProfileConfig},
     engines::codex::CodexRuntimeProfile,
-    models::WorkspaceDto,
+    models::{ThreadDto, WorkspaceDto},
     path_utils, runtime_env,
 };
 
@@ -100,6 +100,17 @@ pub fn codex_profile_id_from_metadata(metadata: Option<&Value>) -> Option<String
         .map(str::to_string)
 }
 
+pub fn codex_profile_id_for_thread(thread: &ThreadDto) -> String {
+    codex_profile_id_from_metadata(thread.engine_metadata.as_ref())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+pub fn thread_uses_codex_profile(thread: &ThreadDto, profile_id: &str) -> bool {
+    let normalized_profile_id = profile_id.trim();
+    !normalized_profile_id.is_empty()
+        && codex_profile_id_for_thread(thread) == normalized_profile_id
+}
+
 pub fn set_codex_profile_id(metadata: &mut Value, profile_id: &str) {
     if !metadata.is_object() {
         *metadata = json!({});
@@ -113,14 +124,72 @@ pub fn set_codex_profile_id(metadata: &mut Value, profile_id: &str) {
     }
 }
 
+pub fn codex_profile_continuation_pending(metadata: Option<&Value>) -> bool {
+    metadata
+        .and_then(|value| value.get("codexProfileContinuationPending"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub fn clear_codex_profile_continuation_pending(metadata: &mut Value) {
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+
+    if let Some(object) = metadata.as_object_mut() {
+        object.remove("codexProfileContinuationPending");
+        object.remove("codexProfileContinuationSourceEngineThreadId");
+    }
+}
+
+pub fn codex_profile_continuation_source_engine_thread_id(
+    metadata: Option<&Value>,
+) -> Option<String> {
+    metadata
+        .and_then(|value| value.get("codexProfileContinuationSourceEngineThreadId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+pub fn set_codex_profile_continuation_pending(
+    metadata: &mut Value,
+    source_engine_thread_id: Option<&str>,
+) {
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            "codexProfileContinuationPending".to_string(),
+            Value::Bool(true),
+        );
+        match source_engine_thread_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(engine_thread_id) => {
+                object.insert(
+                    "codexProfileContinuationSourceEngineThreadId".to_string(),
+                    Value::String(engine_thread_id.to_string()),
+                );
+            }
+            None => {
+                object.remove("codexProfileContinuationSourceEngineThreadId");
+            }
+        }
+    }
+}
+
 pub fn detect_codex_projects(
     config: &AppConfig,
     workspaces: &[WorkspaceDto],
 ) -> anyhow::Result<Vec<DetectedCodexProject>> {
-    let workspace_ids_by_root = workspaces
-        .iter()
-        .map(|workspace| (workspace.root_path.clone(), workspace.id.clone()))
-        .collect::<HashMap<_, _>>();
+    let workspace_ids_by_root = workspace_ids_by_canonical_root(workspaces);
+    let home_dir =
+        runtime_env::home_dir().and_then(|home| path_utils::canonicalize_path(&home).ok());
     let mut aggregated = HashMap::<String, AggregatedProject>::new();
 
     for profile in &config.codex.profiles {
@@ -131,6 +200,9 @@ pub fn detect_codex_projects(
             let rendered_path = canonical_path.to_string_lossy().to_string();
             let project_name = project_name_from_path(&canonical_path);
             let workspace_id = workspace_ids_by_root.get(&rendered_path).cloned();
+            if workspace_id.is_none() && home_dir.as_ref() == Some(&canonical_path) {
+                continue;
+            }
             let normalized_title = normalize_detected_thread_title(
                 &row.title,
                 &row.first_user_message,
@@ -146,7 +218,7 @@ pub fn detect_codex_projects(
                         name: project_name,
                         thread_count: 0,
                         last_updated_at: row.last_updated_at,
-                        workspace_id,
+                        workspace_id: workspace_id.clone(),
                         profiles: HashMap::new(),
                         threads: Vec::new(),
                     });
@@ -156,7 +228,7 @@ pub fn detect_codex_projects(
                 entry.last_updated_at = row.last_updated_at;
             }
             if entry.workspace_id.is_none() {
-                entry.workspace_id = workspace_ids_by_root.get(&rendered_path).cloned();
+                entry.workspace_id = workspace_id.clone();
             }
             entry.threads.push(DetectedCodexProjectThread {
                 engine_thread_id: row.engine_thread_id,
@@ -221,6 +293,25 @@ pub fn detect_codex_projects(
             }
         })
         .collect())
+}
+
+fn workspace_ids_by_canonical_root(workspaces: &[WorkspaceDto]) -> HashMap<String, String> {
+    workspaces
+        .iter()
+        .filter_map(|workspace| {
+            let root_path = workspace.root_path.trim();
+            if root_path.is_empty() {
+                return None;
+            }
+
+            let canonical_path = path_utils::canonicalize_path(Path::new(root_path))
+                .unwrap_or_else(|_| PathBuf::from(root_path));
+            Some((
+                canonical_path.to_string_lossy().to_string(),
+                workspace.id.clone(),
+            ))
+        })
+        .collect()
 }
 
 pub fn build_codex_resume_command(profile: &CodexProfileConfig, engine_thread_id: &str) -> String {
@@ -345,11 +436,7 @@ fn normalize_existing_project_dir(raw_cwd: &str) -> Option<PathBuf> {
         return None;
     }
 
-    let canonical = path_utils::canonicalize_path(path).ok()?;
-    if runtime_env::home_dir().is_some_and(|home| home == canonical) {
-        return None;
-    }
-    Some(canonical)
+    path_utils::canonicalize_path(path).ok()
 }
 
 fn project_name_from_path(path: &Path) -> String {

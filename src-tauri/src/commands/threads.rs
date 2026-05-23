@@ -4,8 +4,9 @@ use tauri::State;
 
 use crate::{
     codex_profiles::{
-        codex_profile_id_from_metadata, runtime_profile_by_id, runtime_profile_from_config,
-        set_codex_profile_id,
+        clear_codex_profile_continuation_pending, codex_profile_id_from_metadata,
+        runtime_profile_by_id, runtime_profile_from_config, set_codex_profile_continuation_pending,
+        set_codex_profile_id, thread_uses_codex_profile,
     },
     config::app_config::AppConfig,
     db,
@@ -88,6 +89,7 @@ pub async fn list_codex_remote_threads(
     archived: Option<bool>,
 ) -> Result<CodexRemoteThreadPageDto, String> {
     let db = state.db.clone();
+    let active_profile_id = state.engines.active_codex_profile().await.id;
     let (workspace_root, repos) = run_db(db.clone(), {
         let workspace_id = workspace_id.clone();
         move |db| {
@@ -125,12 +127,16 @@ pub async fn list_codex_remote_threads(
         let threads = page_threads
             .into_iter()
             .map(|thread| {
-                let local_thread_id = db::threads::find_thread_by_engine_thread_id(
+                let local_thread_id = db::threads::list_threads_by_engine_thread_id(
                     db,
                     "codex",
                     &thread.engine_thread_id,
                 )?
-                .filter(|local| local.workspace_id == workspace_id)
+                .into_iter()
+                .find(|local| {
+                    local.workspace_id == workspace_id
+                        && thread_uses_codex_profile(local, &active_profile_id)
+                })
                 .map(|local| local.id);
                 Ok(map_codex_remote_thread_dto(thread, local_thread_id))
             })
@@ -189,8 +195,12 @@ pub async fn attach_codex_remote_thread(
 
     run_db(db, move |db| {
         if let Some(existing) =
-            db::threads::find_thread_by_engine_thread_id(db, "codex", &engine_thread_id)?
-                .filter(|thread| thread.workspace_id == workspace_id)
+            db::threads::list_threads_by_engine_thread_id(db, "codex", &engine_thread_id)?
+                .into_iter()
+                .find(|thread| {
+                    thread.workspace_id == workspace_id
+                        && thread_uses_codex_profile(thread, &active_profile_id)
+                })
         {
             let thread = match db::threads::restore_thread(db, &existing.id) {
                 Ok(restored) => restored,
@@ -590,6 +600,53 @@ pub async fn set_thread_reasoning_effort(
         db::threads::update_engine_metadata(db, &thread_id, &metadata)
     })
     .await
+}
+
+#[tauri::command]
+pub async fn set_thread_pinned(
+    state: State<'_, AppState>,
+    thread_id: String,
+    pinned: bool,
+) -> Result<ThreadDto, String> {
+    let db = state.db.clone();
+    let thread = run_db(db.clone(), {
+        let thread_id = thread_id.clone();
+        move |db| db::threads::get_thread(db, &thread_id)
+    })
+    .await?
+    .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+
+    let mut metadata = thread.engine_metadata.unwrap_or_else(|| json!({}));
+    if !metadata.is_object() {
+        metadata = json!({});
+    }
+
+    if let Some(object) = metadata.as_object_mut() {
+        if pinned {
+            object.insert("pinned".to_string(), json!(true));
+            object.insert(
+                "pinnedAt".to_string(),
+                json!(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
+            );
+        } else {
+            object.remove("pinned");
+            object.remove("pinnedAt");
+        }
+    }
+
+    run_db(db.clone(), {
+        let thread_id = thread_id.clone();
+        let metadata = metadata.clone();
+        move |db| db::threads::update_engine_metadata(db, &thread_id, &metadata)
+    })
+    .await?;
+
+    run_db(db, {
+        let thread_id = thread_id.clone();
+        move |db| db::threads::get_thread(db, &thread_id)
+    })
+    .await?
+    .ok_or_else(|| format!("thread not found after pin update: {thread_id}"))
 }
 
 #[tauri::command]
@@ -1137,6 +1194,85 @@ pub async fn set_thread_codex_config(
         output_schema,
     )
     .await
+}
+
+#[tauri::command]
+pub async fn set_thread_codex_profile(
+    state: State<'_, AppState>,
+    thread_id: String,
+    profile_id: String,
+) -> Result<ThreadDto, String> {
+    set_thread_codex_profile_inner(state.inner(), thread_id, profile_id).await
+}
+
+async fn set_thread_codex_profile_inner(
+    state: &AppState,
+    thread_id: String,
+    profile_id: String,
+) -> Result<ThreadDto, String> {
+    let normalized_profile_id = profile_id.trim().to_string();
+    if normalized_profile_id.is_empty() {
+        return Err("Codex profile id cannot be empty".to_string());
+    }
+
+    let db = state.db.clone();
+    let thread = run_db(db.clone(), {
+        let thread_id = thread_id.clone();
+        move |db| db::threads::get_thread(db, &thread_id)
+    })
+    .await?
+    .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+
+    if thread.engine_id != "codex" {
+        return Err("Codex profile is only available for Codex threads".to_string());
+    }
+
+    let config = tokio::task::spawn_blocking(AppConfig::load_or_create)
+        .await
+        .map_err(err_to_string)?
+        .map_err(err_to_string)?;
+    let runtime_profile = runtime_profile_by_id(&config, &normalized_profile_id)
+        .ok_or_else(|| format!("unknown Codex profile: {normalized_profile_id}"))?;
+    let current_profile_id = codex_profile_id_from_metadata(thread.engine_metadata.as_ref())
+        .unwrap_or_else(|| "default".to_string());
+
+    if current_profile_id == normalized_profile_id {
+        state
+            .engines
+            .set_codex_profile(runtime_profile)
+            .await
+            .map_err(err_to_string)?;
+        return Ok(thread);
+    }
+
+    let updated = run_db(db, {
+        let thread_id = thread_id.clone();
+        let profile_id = normalized_profile_id.clone();
+        move |db| {
+            let thread = db::threads::get_thread(db, &thread_id)?
+                .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
+            let mut metadata = thread.engine_metadata.unwrap_or_else(|| json!({}));
+            set_codex_profile_id(&mut metadata, &profile_id);
+            if let Some(engine_thread_id) = thread.engine_thread_id.as_deref() {
+                set_codex_profile_continuation_pending(&mut metadata, Some(engine_thread_id));
+            } else {
+                clear_codex_profile_continuation_pending(&mut metadata);
+            }
+            db::threads::update_engine_metadata(db, &thread_id, &metadata)?;
+            db::threads::get_thread(db, &thread_id)?.ok_or_else(|| {
+                anyhow::anyhow!("thread not found after profile update: {thread_id}")
+            })
+        }
+    })
+    .await?;
+
+    state
+        .engines
+        .set_codex_profile(runtime_profile)
+        .await
+        .map_err(err_to_string)?;
+
+    Ok(updated)
 }
 
 async fn set_thread_codex_config_inner(
@@ -2202,7 +2338,7 @@ fn normalize_workspace_confirmation_roots(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Arc};
+    use std::{ffi::OsString, fs, path::PathBuf, sync::Arc};
 
     use super::*;
     use crate::{
@@ -2215,6 +2351,51 @@ mod tests {
         terminal_notifications::TerminalNotificationManager,
     };
     use uuid::Uuid;
+
+    const APP_DATA_ENV_VARS: [&str; 4] = ["HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA"];
+
+    struct TempAppDataEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Vec<(&'static str, Option<OsString>)>,
+        root: PathBuf,
+    }
+
+    impl Drop for TempAppDataEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.previous.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn temp_app_data_env() -> TempAppDataEnv {
+        let guard = crate::config::app_config::app_data_env_lock()
+            .lock()
+            .expect("env lock poisoned");
+        let previous = APP_DATA_ENV_VARS
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        let root =
+            std::env::temp_dir().join(format!("supacodex-threads-app-config-{}", Uuid::new_v4()));
+        let local_app_data = root.join("AppData").join("Local");
+        let roaming_app_data = root.join("AppData").join("Roaming");
+        fs::create_dir_all(&local_app_data).expect("temp local app data should exist");
+        fs::create_dir_all(&roaming_app_data).expect("temp roaming app data should exist");
+        std::env::set_var("HOME", &root);
+        std::env::set_var("USERPROFILE", &root);
+        std::env::set_var("LOCALAPPDATA", &local_app_data);
+        std::env::set_var("APPDATA", &roaming_app_data);
+        TempAppDataEnv {
+            _guard: guard,
+            previous,
+            root,
+        }
+    }
 
     fn test_app_state() -> AppState {
         let root = std::env::temp_dir().join(format!("supacodex-threads-cmd-{}", Uuid::new_v4()));
@@ -2781,5 +2962,98 @@ mod tests {
         .expect_err("expected non-codex thread to be rejected");
 
         assert!(error.contains("Codex thread config is only available for Codex threads"));
+    }
+
+    #[tokio::test]
+    async fn set_thread_codex_profile_persists_profile_for_unstarted_thread() {
+        let _env = temp_app_data_env();
+        let default_home = std::env::var("HOME").expect("home should exist");
+        let work_home = PathBuf::from(&default_home).join(".codex-work");
+        fs::create_dir_all(&work_home).expect("work profile home should exist");
+
+        let mut config = AppConfig::default();
+        config.codex.active_profile_id = "default".to_string();
+        config.codex.profiles = vec![
+            crate::config::app_config::CodexProfileConfig {
+                id: "default".to_string(),
+                name: "Default".to_string(),
+                codex_home: PathBuf::from(&default_home)
+                    .join(".codex")
+                    .to_string_lossy()
+                    .to_string(),
+            },
+            crate::config::app_config::CodexProfileConfig {
+                id: "work".to_string(),
+                name: "Work".to_string(),
+                codex_home: work_home.to_string_lossy().to_string(),
+            },
+        ];
+        config.save().expect("config should save");
+
+        let state = test_app_state();
+        let thread = test_thread(&state, "codex", "gpt-5.4");
+
+        let updated = set_thread_codex_profile_inner(&state, thread.id.clone(), "work".to_string())
+            .await
+            .expect("expected Codex profile update to succeed");
+
+        let metadata = updated
+            .engine_metadata
+            .expect("expected engine metadata to be present");
+        assert_eq!(metadata.get("codexProfileId"), Some(&json!("work")));
+
+        let active_profile = state.engines.active_codex_profile().await;
+        assert_eq!(active_profile.id, "work");
+        assert_eq!(active_profile.name, "Work");
+        assert_eq!(active_profile.codex_home, work_home);
+    }
+
+    #[tokio::test]
+    async fn set_thread_codex_profile_marks_started_threads_for_cross_profile_continuation() {
+        let _env = temp_app_data_env();
+        let default_home = std::env::var("HOME").expect("home should exist");
+        let work_home = PathBuf::from(&default_home).join(".codex-work");
+        fs::create_dir_all(&work_home).expect("work profile home should exist");
+
+        let mut config = AppConfig::default();
+        config.codex.active_profile_id = "default".to_string();
+        config.codex.profiles = vec![
+            crate::config::app_config::CodexProfileConfig {
+                id: "default".to_string(),
+                name: "Default".to_string(),
+                codex_home: PathBuf::from(&default_home)
+                    .join(".codex")
+                    .to_string_lossy()
+                    .to_string(),
+            },
+            crate::config::app_config::CodexProfileConfig {
+                id: "work".to_string(),
+                name: "Work".to_string(),
+                codex_home: work_home.to_string_lossy().to_string(),
+            },
+        ];
+        config.save().expect("config should save");
+
+        let state = test_app_state();
+        let thread = test_thread(&state, "codex", "gpt-5.4");
+        crate::db::threads::set_engine_thread_id(&state.db, &thread.id, "thread-started")
+            .expect("engine thread id should persist");
+
+        let updated = set_thread_codex_profile_inner(&state, thread.id.clone(), "work".to_string())
+            .await
+            .expect("expected started thread profile update to succeed");
+
+        let metadata = updated
+            .engine_metadata
+            .expect("expected engine metadata to be present");
+        assert_eq!(metadata.get("codexProfileId"), Some(&json!("work")));
+        assert_eq!(
+            metadata.get("codexProfileContinuationPending"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            metadata.get("codexProfileContinuationSourceEngineThreadId"),
+            Some(&json!("thread-started"))
+        );
     }
 }

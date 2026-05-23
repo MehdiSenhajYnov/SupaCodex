@@ -167,8 +167,8 @@ export const useCodexProfileStore = create<CodexProfileStoreState>((set, get) =>
     try {
       const state = await ipc.setActiveCodexProfile(normalized);
       normalizeProfilesState(set, state);
-      await get().refreshDetectedProjects();
-      await useEngineStore.getState().load();
+      void get().refreshDetectedProjects();
+      void useEngineStore.getState().load();
       return state;
     } catch (error) {
       set({

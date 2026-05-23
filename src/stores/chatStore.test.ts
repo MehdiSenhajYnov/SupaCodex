@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ApprovalResponse, StreamEvent } from "../types";
 
 const mockIpc = vi.hoisted(() => ({
+  cancelTurn: vi.fn(),
   sendMessage: vi.fn(),
   steerMessage: vi.fn(),
   getThreadMessagesWindow: vi.fn(),
@@ -42,6 +43,7 @@ describe("chatStore send", () => {
       messages: [],
       nextCursor: null,
     });
+    mockIpc.cancelTurn.mockResolvedValue(undefined);
     mockIpc.getActionOutput.mockResolvedValue({
       found: true,
       outputChunks: [],
@@ -1214,6 +1216,132 @@ describe("chatStore send", () => {
         decision: "decline",
       },
     ]);
+  });
+
+  it("marks the active assistant as interrupted immediately and drops transient thinking on cancel", async () => {
+    useChatStore.setState({
+      threadId: "thread-1",
+      messages: [
+        {
+          id: "user-1",
+          threadId: "thread-1",
+          role: "user",
+          status: "completed",
+          schemaVersion: 1,
+          blocks: [{ type: "text", content: "hello" }],
+          createdAt: new Date().toISOString(),
+          hydration: "full",
+          hasDeferredContent: false,
+        },
+        {
+          id: "assistant-1",
+          threadId: "thread-1",
+          role: "assistant",
+          status: "streaming",
+          schemaVersion: 1,
+          blocks: [
+            { type: "text", content: "partial answer" },
+            { type: "thinking", content: "thinking..." },
+          ],
+          createdAt: new Date().toISOString(),
+          hydration: "full",
+          hasDeferredContent: false,
+        },
+      ],
+      olderCursor: null,
+      hasOlderMessages: false,
+      loadingOlderMessages: false,
+      olderLoadBlockedUntil: 0,
+      status: "streaming",
+      streaming: true,
+      usageLimits: null,
+      error: undefined,
+      unlisten: undefined,
+    });
+
+    await useChatStore.getState().cancel();
+
+    expect(mockIpc.cancelTurn).toHaveBeenCalledWith("thread-1");
+    expect(useChatStore.getState()).toMatchObject({
+      status: "idle",
+      streaming: false,
+      messages: [
+        expect.objectContaining({ id: "user-1", role: "user" }),
+        expect.objectContaining({
+          id: "assistant-1",
+          role: "assistant",
+          status: "interrupted",
+          blocks: [{ type: "text", content: "partial answer" }],
+        }),
+      ],
+    });
+  });
+
+  it("ignores late streamed deltas after cancel until interrupted completion settles", async () => {
+    vi.useFakeTimers();
+
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      streamHandler = onEvent;
+      return () => {};
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    mockIpc.sendMessage.mockResolvedValueOnce("assistant-message-id");
+    await expect(
+      useChatStore.getState().send("hello", {
+        engineId: "codex",
+        modelId: "gpt-5.3-codex",
+      }),
+    ).resolves.toBe(true);
+
+    const assistantMessageId = useChatStore
+      .getState()
+      .messages.find((message) => message.role === "assistant")?.id;
+    expect(streamHandler).not.toBeNull();
+
+    await useChatStore.getState().cancel();
+
+    streamHandler!({
+      type: "ThinkingDelta",
+      content: "late thinking",
+    });
+    streamHandler!({
+      type: "TextDelta",
+      content: "late answer",
+    });
+
+    await vi.advanceTimersByTimeAsync(20);
+
+    expect(useChatStore.getState()).toMatchObject({
+      status: "idle",
+      streaming: false,
+      messages: [
+        expect.objectContaining({ role: "user" }),
+        expect.objectContaining({
+          id: assistantMessageId,
+          role: "assistant",
+          status: "interrupted",
+          blocks: [],
+        }),
+      ],
+    });
+
+    streamHandler!({
+      type: "TurnCompleted",
+      status: "interrupted",
+    });
+
+    await vi.advanceTimersByTimeAsync(20);
+
+    expect(useChatStore.getState().messages[1]).toMatchObject({
+      id: assistantMessageId,
+      status: "interrupted",
+      blocks: [],
+    });
+
+    vi.useRealTimers();
   });
 
 });

@@ -24,7 +24,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use rusqlite::OptionalExtension;
 
-use codex_profiles::runtime_profile_from_config;
+use codex_profiles::{runtime_profile_from_config, thread_uses_codex_profile};
 use config::app_config::AppConfig;
 use db::Database;
 use engines::{CodexRuntimeEvent, EngineManager};
@@ -277,6 +277,7 @@ pub fn run() {
             commands::app::set_active_codex_profile,
             commands::app::list_codex_detected_projects,
             commands::app::build_codex_resume_command_for_thread,
+            commands::app::persist_pasted_image,
             commands::files::list_dir,
             commands::files::read_file,
             commands::files::write_file,
@@ -296,7 +297,9 @@ pub fn run() {
             commands::threads::rename_thread,
             commands::threads::confirm_workspace_thread,
             commands::threads::set_thread_reasoning_effort,
+            commands::threads::set_thread_pinned,
             commands::threads::set_thread_execution_policy,
+            commands::threads::set_thread_codex_profile,
             commands::threads::set_thread_codex_config,
             commands::threads::archive_thread,
             commands::threads::restore_thread,
@@ -328,9 +331,11 @@ pub fn run() {
 
     app.run(|app_handle, event| match event {
         RunEvent::ExitRequested { .. } | RunEvent::Exit => {
+            let engines = app_handle.state::<AppState>().engines.clone();
             let terminals = app_handle.state::<AppState>().terminals.clone();
             let keep_awake = app_handle.state::<AppState>().keep_awake.clone();
             tauri::async_runtime::block_on(async move {
+                engines.shutdown().await;
                 if let Err(error) = keep_awake.shutdown().await {
                     log::warn!("failed to release keep awake on shutdown: {error}");
                 }
@@ -677,9 +682,17 @@ async fn apply_codex_runtime_thread_update(
     sync_required: Option<bool>,
     sync_reason: Option<&str>,
 ) -> Option<ThreadDto> {
+    let active_profile_id = state.engines.active_codex_profile().await.id;
     let thread = run_db(state.db.clone(), {
         let engine_thread_id = engine_thread_id.to_string();
-        move |db| db::threads::find_thread_by_engine_thread_id(db, "codex", &engine_thread_id)
+        let active_profile_id = active_profile_id.clone();
+        move |db| {
+            Ok(
+                db::threads::list_threads_by_engine_thread_id(db, "codex", &engine_thread_id)?
+                    .into_iter()
+                    .find(|thread| thread_uses_codex_profile(thread, &active_profile_id)),
+            )
+        }
     })
     .await
     .ok()??;
@@ -723,9 +736,17 @@ async fn archive_codex_runtime_thread(
     state: &AppState,
     engine_thread_id: &str,
 ) -> Option<(String, String)> {
+    let active_profile_id = state.engines.active_codex_profile().await.id;
     let thread = run_db(state.db.clone(), {
         let engine_thread_id = engine_thread_id.to_string();
-        move |db| db::threads::find_thread_by_engine_thread_id(db, "codex", &engine_thread_id)
+        let active_profile_id = active_profile_id.clone();
+        move |db| {
+            Ok(
+                db::threads::list_threads_by_engine_thread_id(db, "codex", &engine_thread_id)?
+                    .into_iter()
+                    .find(|thread| thread_uses_codex_profile(thread, &active_profile_id)),
+            )
+        }
     })
     .await
     .ok()??;
@@ -748,9 +769,17 @@ async fn restore_codex_runtime_thread(
     state: &AppState,
     engine_thread_id: &str,
 ) -> Option<ThreadDto> {
+    let active_profile_id = state.engines.active_codex_profile().await.id;
     let thread = run_db(state.db.clone(), {
         let engine_thread_id = engine_thread_id.to_string();
-        move |db| db::threads::find_thread_by_engine_thread_id(db, "codex", &engine_thread_id)
+        let active_profile_id = active_profile_id.clone();
+        move |db| {
+            Ok(
+                db::threads::list_threads_by_engine_thread_id(db, "codex", &engine_thread_id)?
+                    .into_iter()
+                    .find(|thread| thread_uses_codex_profile(thread, &active_profile_id)),
+            )
+        }
     })
     .await
     .ok()??;

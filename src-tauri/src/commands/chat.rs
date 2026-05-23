@@ -12,7 +12,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     codex_profiles::{
-        codex_profile_id_from_metadata, runtime_profile_by_id, runtime_profile_from_config,
+        clear_codex_profile_continuation_pending, codex_profile_continuation_pending,
+        codex_profile_continuation_source_engine_thread_id, codex_profile_id_from_metadata,
+        runtime_profile_by_id, runtime_profile_from_config,
     },
     config::app_config::AppConfig,
     db,
@@ -39,6 +41,17 @@ const MAX_ATTACHMENTS_PER_TURN: usize = 10;
 const MESSAGE_WINDOW_DEFAULT_LIMIT: usize = 120;
 const MESSAGE_WINDOW_MAX_LIMIT: usize = 400;
 const MAX_CHAT_NOTIFICATION_PREVIEW_CHARS: usize = 240;
+const CODEX_PROFILE_CONTINUATION_MESSAGE_MAX_CHARS: usize = 2_000;
+const CODEX_PROFILE_CONTINUATION_TRANSCRIPT_MAX_CHARS: usize = 32_000;
+
+fn engine_error_text(error: &anyhow::Error) -> String {
+    let detailed = format!("{error:#}");
+    if detailed.trim().is_empty() {
+        error.to_string()
+    } else {
+        detailed
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -168,6 +181,8 @@ struct ChatTurnFinishedEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatAttachmentPayload {
+    #[serde(default)]
+    pub id: Option<String>,
     pub file_name: String,
     pub file_path: String,
     #[serde(default)]
@@ -242,11 +257,38 @@ async fn ensure_codex_profile_for_thread(
         .map_err(err_to_string)
 }
 
+fn openai_api_key_configured() -> bool {
+    std::env::var_os("OPENAI_API_KEY").is_some_and(|value| !value.is_empty())
+}
+
+async fn ensure_codex_profile_authenticated(
+    state: &AppState,
+    thread: &ThreadDto,
+) -> Result<(), String> {
+    if thread.engine_id != "codex" {
+        return Ok(());
+    }
+
+    let profile = state.engines.active_codex_profile().await;
+    if profile.codex_home.join("auth.json").is_file() || openai_api_key_configured() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Codex profile `{}` is using CODEX_HOME `{}` but no auth.json was found there and OPENAI_API_KEY is not set. Run `env CODEX_HOME={} codex login` first.",
+        profile.name,
+        profile.codex_home.display(),
+        profile.codex_home.display(),
+    ))
+}
+
 struct PreparedThreadExecution {
     thread: ThreadDto,
     engine_thread_id: String,
     effective_model_id: String,
     reasoning_effort: Option<String>,
+    continuation_prompt: Option<String>,
+    clear_continuation_pending_on_success: bool,
 }
 
 async fn prepare_thread_execution(
@@ -299,6 +341,10 @@ async fn prepare_thread_execution(
     let workspace_root = workspace.root_path.clone();
     let requested_reasoning_effort = normalize_reasoning_effort_value(reasoning_effort);
     let stored_reasoning_effort = thread_reasoning_effort(thread.engine_metadata.as_ref());
+    let continuation_pending = thread.engine_id == "codex"
+        && codex_profile_continuation_pending(thread.engine_metadata.as_ref());
+    let continuation_source_engine_thread_id =
+        codex_profile_continuation_source_engine_thread_id(thread.engine_metadata.as_ref());
     let configured_reasoning_effort = requested_reasoning_effort
         .clone()
         .or_else(|| stored_reasoning_effort.clone());
@@ -463,6 +509,7 @@ async fn prepare_thread_execution(
     };
 
     ensure_codex_profile_for_thread(state, &thread).await?;
+    ensure_codex_profile_authenticated(state, &thread).await?;
 
     let engine_thread_id = state
         .engines
@@ -480,11 +527,30 @@ async fn prepare_thread_execution(
         thread.engine_thread_id = Some(engine_thread_id.clone());
     }
 
+    let mut continuation_prompt = None;
+    let mut clear_continuation_pending_on_success = false;
+    if continuation_pending {
+        if continuation_source_engine_thread_id.as_deref() == Some(engine_thread_id.as_str()) {
+            clear_continuation_pending_on_success = true;
+        } else {
+            let existing_messages = run_db(state.db.clone(), {
+                let thread_id = thread.id.clone();
+                move |db| db::messages::get_thread_messages(db, &thread_id)
+            })
+            .await?;
+            continuation_prompt = build_codex_profile_continuation_prompt(&existing_messages);
+            clear_continuation_pending_on_success =
+                continuation_prompt.is_some() || existing_messages.is_empty();
+        }
+    }
+
     Ok(PreparedThreadExecution {
         thread,
         engine_thread_id,
         effective_model_id,
         reasoning_effort,
+        continuation_prompt,
+        clear_continuation_pending_on_success,
     })
 }
 
@@ -522,6 +588,8 @@ pub async fn send_message(
         engine_thread_id,
         effective_model_id,
         reasoning_effort,
+        continuation_prompt,
+        clear_continuation_pending_on_success,
     } = prepare_thread_execution(
         state.inner(),
         &thread_id,
@@ -585,7 +653,10 @@ pub async fn send_message(
     let state_cloned = state.inner().clone();
     let app_handle = app.clone();
     let assistant_message_id = assistant_message.id.clone();
-    let turn_input_for_task = turn_input.clone();
+    let turn_input_for_task = prepend_codex_profile_continuation_prompt(
+        turn_input.clone(),
+        continuation_prompt.as_deref(),
+    );
     let thread_for_task = thread.clone();
     let initial_turn_model_id = effective_model_id.clone();
 
@@ -598,6 +669,7 @@ pub async fn send_message(
             assistant_message_id,
             initial_turn_model_id,
             turn_input_for_task,
+            clear_continuation_pending_on_success,
             client_turn_id,
             cancellation,
         )
@@ -650,6 +722,8 @@ pub async fn run_codex_shell_command(
         engine_thread_id,
         effective_model_id,
         reasoning_effort,
+        clear_continuation_pending_on_success,
+        ..
     } = prepare_thread_execution(state.inner(), &thread_id, None, None).await?;
 
     let assistant_message = run_db(db.clone(), {
@@ -710,6 +784,7 @@ pub async fn run_codex_shell_command(
             assistant_message_id,
             initial_turn_model_id,
             shell_command,
+            clear_continuation_pending_on_success,
             client_turn_id,
             cancellation,
         )
@@ -1096,6 +1171,227 @@ fn normalize_input_items(
     Ok(merged)
 }
 
+fn prepend_codex_profile_continuation_prompt(input: TurnInput, prompt: Option<&str>) -> TurnInput {
+    let Some(prompt) = prompt.map(str::trim).filter(|value| !value.is_empty()) else {
+        return input;
+    };
+
+    let mut input_items = Vec::with_capacity(input.input_items.len().saturating_add(1));
+    input_items.push(TurnInputItem::Text {
+        text: prompt.to_string(),
+    });
+    input_items.extend(input.input_items);
+
+    TurnInput {
+        input_items,
+        ..input
+    }
+}
+
+async fn clear_codex_profile_continuation_pending_for_thread(
+    state: &AppState,
+    thread_id: &str,
+) -> Result<(), String> {
+    run_db(state.db.clone(), {
+        let thread_id = thread_id.to_string();
+        move |db| {
+            let thread = db::threads::get_thread(db, &thread_id)?
+                .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
+            let mut metadata = thread
+                .engine_metadata
+                .unwrap_or_else(|| serde_json::json!({}));
+            clear_codex_profile_continuation_pending(&mut metadata);
+            db::threads::update_engine_metadata(db, &thread_id, &metadata)
+        }
+    })
+    .await
+}
+
+fn build_codex_profile_continuation_prompt(messages: &[MessageDto]) -> Option<String> {
+    let mut entries = Vec::new();
+    for message in messages {
+        let Some(content) = summarize_message_for_codex_profile_continuation(message) else {
+            continue;
+        };
+
+        let role = match message.role.as_str() {
+            "assistant" => "Assistant",
+            "user" => "User",
+            other if !other.trim().is_empty() => other,
+            _ => "Message",
+        };
+        entries.push(format!("{role}:\n{content}"));
+    }
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut kept = Vec::new();
+    let mut transcript_chars = 0usize;
+    for entry in entries.into_iter().rev() {
+        let entry_len = entry.chars().count();
+        let separator_len = if kept.is_empty() { 0 } else { 2 };
+        if !kept.is_empty()
+            && transcript_chars
+                .saturating_add(separator_len)
+                .saturating_add(entry_len)
+                > CODEX_PROFILE_CONTINUATION_TRANSCRIPT_MAX_CHARS
+        {
+            break;
+        }
+        transcript_chars = transcript_chars
+            .saturating_add(separator_len)
+            .saturating_add(entry_len);
+        kept.push(entry);
+    }
+
+    kept.reverse();
+    if kept.is_empty() {
+        return None;
+    }
+
+    let mut prompt = String::from(
+        "This conversation is being continued from another Codex profile.\n\
+If the original remote thread could not be resumed, treat the following locally mirrored transcript as the authoritative prior context.\n\
+Continue naturally from it. The user's new message follows after this context.\n\nTranscript:\n",
+    );
+    prompt.push_str(&kept.join("\n\n"));
+    Some(prompt)
+}
+
+fn summarize_message_for_codex_profile_continuation(message: &MessageDto) -> Option<String> {
+    let mut parts = Vec::new();
+
+    if let Some(blocks) = message.blocks.as_ref() {
+        if let Ok(content_blocks) = serde_json::from_value::<Vec<ContentBlock>>(blocks.clone()) {
+            for block in content_blocks {
+                match block {
+                    ContentBlock::Text {
+                        content, is_steer, ..
+                    } => {
+                        let normalized = trim_message_for_codex_profile_continuation(&content);
+                        if normalized.is_empty() {
+                            continue;
+                        }
+                        if is_steer.unwrap_or(false) {
+                            parts.push(format!("[Steer] {normalized}"));
+                        } else {
+                            parts.push(normalized);
+                        }
+                    }
+                    ContentBlock::Notice { title, message, .. } => {
+                        let normalized = trim_message_for_codex_profile_continuation(&message);
+                        if normalized.is_empty() {
+                            continue;
+                        }
+                        let prefix = trim_message_for_codex_profile_continuation(&title);
+                        if prefix.is_empty() {
+                            parts.push(format!("[Notice] {normalized}"));
+                        } else {
+                            parts.push(format!("[{prefix}] {normalized}"));
+                        }
+                    }
+                    ContentBlock::Error { message } => {
+                        let normalized = trim_message_for_codex_profile_continuation(&message);
+                        if !normalized.is_empty() {
+                            parts.push(format!("[Error] {normalized}"));
+                        }
+                    }
+                    ContentBlock::Attachment { file_name, .. } => {
+                        let normalized = trim_message_for_codex_profile_continuation(&file_name);
+                        if !normalized.is_empty() {
+                            parts.push(format!("[Attachment] {normalized}"));
+                        }
+                    }
+                    ContentBlock::Skill { name, path } => {
+                        let normalized_name = trim_message_for_codex_profile_continuation(&name);
+                        let normalized_path = trim_message_for_codex_profile_continuation(&path);
+                        if !normalized_name.is_empty() && !normalized_path.is_empty() {
+                            parts.push(format!("[Skill] {normalized_name} ({normalized_path})"));
+                        }
+                    }
+                    ContentBlock::Mention { name, path } => {
+                        let normalized_name = trim_message_for_codex_profile_continuation(&name);
+                        let normalized_path = trim_message_for_codex_profile_continuation(&path);
+                        if !normalized_name.is_empty() && !normalized_path.is_empty() {
+                            parts.push(format!("[Mention] {normalized_name} ({normalized_path})"));
+                        }
+                    }
+                    ContentBlock::Action {
+                        action_type,
+                        summary,
+                        status,
+                        ..
+                    } => {
+                        let normalized_summary =
+                            trim_message_for_codex_profile_continuation(&summary);
+                        if !normalized_summary.is_empty() {
+                            parts.push(format!(
+                                "[Action:{action_type}:{status}] {normalized_summary}"
+                            ));
+                        }
+                    }
+                    ContentBlock::Approval {
+                        action_type,
+                        summary,
+                        status,
+                        decision,
+                        ..
+                    } => {
+                        let normalized_summary =
+                            trim_message_for_codex_profile_continuation(&summary);
+                        if !normalized_summary.is_empty() {
+                            let suffix = decision
+                                .as_deref()
+                                .map(trim_message_for_codex_profile_continuation)
+                                .filter(|value| !value.is_empty())
+                                .map(|value| format!(" [{value}]"))
+                                .unwrap_or_default();
+                            parts.push(format!(
+                                "[Approval:{action_type}:{status}] {normalized_summary}{suffix}"
+                            ));
+                        }
+                    }
+                    ContentBlock::Diff { .. } | ContentBlock::Thinking { .. } => {}
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return message
+            .content
+            .as_deref()
+            .map(trim_message_for_codex_profile_continuation)
+            .filter(|value| !value.is_empty());
+    }
+
+    Some(parts.join("\n"))
+}
+
+fn trim_message_for_codex_profile_continuation(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let mut chars = trimmed.chars();
+    for _ in 0..CODEX_PROFILE_CONTINUATION_MESSAGE_MAX_CHARS {
+        let Some(ch) = chars.next() else {
+            return out;
+        };
+        out.push(ch);
+    }
+
+    if chars.next().is_some() {
+        out.push_str("...");
+    }
+
+    out
+}
+
 fn normalize_attachments(
     attachments: Option<Vec<ChatAttachmentPayload>>,
 ) -> Result<Vec<TurnAttachment>, String> {
@@ -1459,6 +1755,7 @@ async fn run_turn(
     assistant_message_id: String,
     initial_turn_model_id: String,
     turn_input: TurnInput,
+    clear_continuation_pending_on_success: bool,
     client_turn_id: Option<String>,
     cancellation: CancellationToken,
 ) {
@@ -1811,11 +2108,12 @@ async fn run_turn(
         .await;
     }
 
-    match engine_task.await {
-        Ok(Ok(())) => {}
+    let engine_succeeded = match engine_task.await {
+        Ok(Ok(())) => true,
         Ok(Err(error)) => {
+            let error_message = engine_error_text(&error);
             blocks.push(ContentBlock::Error {
-                message: format!("Engine error: {error}"),
+                message: format!("Engine error: {error_message}"),
             });
             blocks_dirty = true;
             if message_status != MessageStatusDto::Error {
@@ -1829,10 +2127,11 @@ async fn run_turn(
             let _ = app.emit(
                 &stream_event_topic,
                 EngineEvent::Error {
-                    message: format!("{error}"),
+                    message: error_message,
                     recoverable: false,
                 },
             );
+            false
         }
         Err(error) => {
             blocks.push(ContentBlock::Error {
@@ -1847,8 +2146,9 @@ async fn run_turn(
                 thread_status = ThreadStatusDto::Error;
                 thread_status_dirty = true;
             }
+            false
         }
-    }
+    };
 
     if cancellation.is_cancelled() && matches!(message_status, MessageStatusDto::Streaming) {
         message_status = MessageStatusDto::Interrupted;
@@ -1907,6 +2207,14 @@ async fn run_turn(
         }
     }
 
+    if clear_continuation_pending_on_success && engine_succeeded {
+        if let Err(error) =
+            clear_codex_profile_continuation_pending_for_thread(&state, &thread.id).await
+        {
+            log::warn!("failed to clear Codex profile continuation state: {error}");
+        }
+    }
+
     let _ =
         maybe_update_thread_title(&state, &thread, &engine_thread_id, &turn_input.message).await;
 
@@ -1937,6 +2245,7 @@ async fn run_codex_shell_command_turn(
     assistant_message_id: String,
     initial_turn_model_id: String,
     shell_command: String,
+    clear_continuation_pending_on_success: bool,
     client_turn_id: Option<String>,
     cancellation: CancellationToken,
 ) {
@@ -2287,11 +2596,12 @@ async fn run_codex_shell_command_turn(
         .await;
     }
 
-    match engine_task.await {
-        Ok(Ok(())) => {}
+    let engine_succeeded = match engine_task.await {
+        Ok(Ok(())) => true,
         Ok(Err(error)) => {
+            let error_message = engine_error_text(&error);
             blocks.push(ContentBlock::Error {
-                message: format!("Engine error: {error}"),
+                message: format!("Engine error: {error_message}"),
             });
             blocks_dirty = true;
             if message_status != MessageStatusDto::Error {
@@ -2305,10 +2615,11 @@ async fn run_codex_shell_command_turn(
             let _ = app.emit(
                 &stream_event_topic,
                 EngineEvent::Error {
-                    message: format!("{error}"),
+                    message: error_message,
                     recoverable: false,
                 },
             );
+            false
         }
         Err(error) => {
             blocks.push(ContentBlock::Error {
@@ -2323,8 +2634,9 @@ async fn run_codex_shell_command_turn(
                 thread_status = ThreadStatusDto::Error;
                 thread_status_dirty = true;
             }
+            false
         }
-    }
+    };
 
     if cancellation.is_cancelled() && matches!(message_status, MessageStatusDto::Streaming) {
         message_status = MessageStatusDto::Interrupted;
@@ -2380,6 +2692,14 @@ async fn run_codex_shell_command_turn(
         .await
         {
             log::warn!("failed to bump thread counters: {error}");
+        }
+    }
+
+    if clear_continuation_pending_on_success && engine_succeeded {
+        if let Err(error) =
+            clear_codex_profile_continuation_pending_for_thread(&state, &thread.id).await
+        {
+            log::warn!("failed to clear Codex profile continuation state: {error}");
         }
     }
 
@@ -2838,8 +3158,9 @@ async fn run_codex_review_turn(
     match engine_task.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
+            let error_message = engine_error_text(&error);
             blocks.push(ContentBlock::Error {
-                message: format!("Engine error: {error}"),
+                message: format!("Engine error: {error_message}"),
             });
             blocks_dirty = true;
             if message_status != MessageStatusDto::Error {
@@ -2853,7 +3174,7 @@ async fn run_codex_review_turn(
             let _ = app.emit(
                 &stream_event_topic,
                 EngineEvent::Error {
-                    message: format!("{error}"),
+                    message: error_message,
                     recoverable: false,
                 },
             );

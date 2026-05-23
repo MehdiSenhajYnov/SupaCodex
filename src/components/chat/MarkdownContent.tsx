@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -141,7 +141,27 @@ interface MarkdownContentProps {
   style?: CSSProperties;
 }
 
-export default function MarkdownContent({
+function areStylePropsEqual(
+  previous: CSSProperties | undefined,
+  next: CSSProperties | undefined,
+): boolean {
+  if (previous === next) {
+    return true;
+  }
+  if (!previous || !next) {
+    return false;
+  }
+
+  const previousKeys = Object.keys(previous);
+  const nextKeys = Object.keys(next);
+  if (previousKeys.length !== nextKeys.length) {
+    return false;
+  }
+
+  return previousKeys.every((key) => previous[key as keyof CSSProperties] === next[key as keyof CSSProperties]);
+}
+
+function MarkdownContentView({
   content,
   className,
   style,
@@ -234,3 +254,11 @@ export default function MarkdownContent({
     </div>
   );
 }
+
+export default memo(
+  MarkdownContentView,
+  (prev, next) =>
+    prev.content === next.content &&
+    prev.className === next.className &&
+    areStylePropsEqual(prev.style, next.style),
+);

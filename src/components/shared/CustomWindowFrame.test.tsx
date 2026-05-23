@@ -20,6 +20,11 @@ vi.mock("../../lib/windowActions", () => ({
   toggleWindowFullscreen: vi.fn(),
 }));
 
+vi.mock("../../stores/shortcutStore", () => ({
+  useShortcutStore: (selector: (state: { overrides: Record<string, unknown> }) => unknown) =>
+    selector({ overrides: {} }),
+}));
+
 describe("CustomWindowFrame", () => {
   function findElement(
     node: ReactNode,

@@ -1,6 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import type { LucideIcon } from "lucide-react";
+import {
+  normalizeClientRectForFixedPosition,
+  readFixedViewportSize,
+} from "../shared/anchoredPopoverPosition";
 
 export interface ChatComposerMenuItem {
   id: string;
@@ -88,7 +92,9 @@ function measureTextareaCaretPosition(
   mirror.appendChild(marker);
   document.body.appendChild(mirror);
 
-  const textareaRect = textarea.getBoundingClientRect();
+  const textareaRect = normalizeClientRectForFixedPosition(
+    textarea.getBoundingClientRect(),
+  );
   const top = textareaRect.top + marker.offsetTop - textarea.scrollTop;
   const left = textareaRect.left + marker.offsetLeft - textarea.scrollLeft;
   const width = Math.min(360, Math.max(240, textareaRect.width));
@@ -114,10 +120,11 @@ export function ChatComposerMenu({
   useLayoutEffect(() => {
     if (!visible || !anchorRef.current) return;
     const anchor = measureTextareaCaretPosition(anchorRef.current, caretIndex);
-    const width = Math.min(anchor.width, window.innerWidth - 16);
+    const viewport = readFixedViewportSize();
+    const width = Math.min(anchor.width, viewport.width - 16);
     setPos({
-      bottom: window.innerHeight - anchor.top + 10,
-      left: Math.max(8, Math.min(anchor.left, window.innerWidth - width - 8)),
+      bottom: viewport.height - anchor.top + 10,
+      left: Math.max(8, Math.min(anchor.left, viewport.width - width - 8)),
       width,
     });
   }, [anchorRef, caretIndex, queryKey, visible]);

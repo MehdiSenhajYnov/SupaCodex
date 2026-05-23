@@ -27,6 +27,17 @@ pub struct CodexTransport {
     next_request_id: std::sync::atomic::AtomicU64,
 }
 
+const CODEX_PARENT_ENV_REMOVE: &[&str] = &[
+    "CODEX_CI",
+    "CODEX_MANAGED_BY_NPM",
+    "CODEX_PARENT_THREAD_ID",
+    "CODEX_SANDBOX",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+    "CODEX_SOURCE",
+    "CODEX_THREAD_ID",
+    "CODEX_TURN_ID",
+];
+
 impl CodexTransport {
     pub async fn spawn(
         codex_executable: &str,
@@ -34,6 +45,7 @@ impl CodexTransport {
     ) -> anyhow::Result<Self> {
         let mut command = Command::new(codex_executable);
         process_utils::configure_tokio_command(&mut command);
+        sanitize_codex_child_env(&mut command);
         if let Some(augmented_path) = codex_augmented_path(codex_executable) {
             command.env("PATH", augmented_path);
         }
@@ -259,6 +271,12 @@ impl CodexTransport {
             anyhow::bail!("codex app-server exited with status {status}");
         }
         Ok(())
+    }
+}
+
+pub(super) fn sanitize_codex_child_env(command: &mut Command) {
+    for key in CODEX_PARENT_ENV_REMOVE {
+        command.env_remove(key);
     }
 }
 

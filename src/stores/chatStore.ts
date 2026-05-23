@@ -99,6 +99,7 @@ interface AssistantMessageTarget {
 
 const pendingTurnMetaByThread = new Map<string, PendingTurnMeta>();
 const inflightActionOutputHydration = new Map<string, Promise<void>>();
+const interruptedThreads = new Set<string>();
 
 function isCodexThreadSyncRequired(metadata: Record<string, unknown> | undefined): boolean {
   return metadata?.codexSyncRequired === true;
@@ -812,6 +813,36 @@ function ensureAssistantMessage(
   };
 }
 
+function interruptActiveAssistantMessage(messages: Message[], threadId: string): Message[] {
+  const assistantIndex = resolveAssistantMessageIndex(
+    messages,
+    resolveActiveAssistantTarget(threadId),
+  );
+  if (assistantIndex < 0) {
+    return messages;
+  }
+
+  const assistant = messages[assistantIndex];
+  if (assistant.role !== "assistant" || assistant.status !== "streaming") {
+    return messages;
+  }
+
+  const nextBlocks = (assistant.blocks ?? []).filter((block) => block.type !== "thinking");
+  const nextAssistant: Message = {
+    ...assistant,
+    status: "interrupted",
+    blocks: nextBlocks,
+    hydration: "full",
+    hasDeferredContent: hasDeferredActionOutput(nextBlocks),
+  };
+
+  return [
+    ...messages.slice(0, assistantIndex),
+    nextAssistant,
+    ...messages.slice(assistantIndex + 1),
+  ];
+}
+
 function upsertBlock(blocks: ContentBlock[], block: ContentBlock): ContentBlock[] {
   if (block.type === "action") {
     const idx = blocks.findIndex(
@@ -1127,6 +1158,77 @@ function resolveAssistantTargetFromEvent(
   };
 }
 
+function coalesceStreamEvents(events: StreamEvent[]): StreamEvent[] {
+  if (events.length <= 1) {
+    return events;
+  }
+
+  const coalesced: StreamEvent[] = [];
+  for (const event of events) {
+    const previous = coalesced[coalesced.length - 1];
+    if (!previous) {
+      coalesced.push(event);
+      continue;
+    }
+
+    if (previous.type === "TextDelta" && event.type === "TextDelta") {
+      coalesced[coalesced.length - 1] = {
+        ...previous,
+        content: `${String(previous.content ?? "")}${String(event.content ?? "")}`,
+      };
+      continue;
+    }
+
+    if (previous.type === "ThinkingDelta" && event.type === "ThinkingDelta") {
+      coalesced[coalesced.length - 1] = {
+        ...previous,
+        content: `${String(previous.content ?? "")}${String(event.content ?? "")}`,
+      };
+      continue;
+    }
+
+    if (
+      previous.type === "ActionOutputDelta" &&
+      event.type === "ActionOutputDelta" &&
+      String(previous.action_id ?? "") === String(event.action_id ?? "") &&
+      normalizeActionOutputStream(previous.stream) === normalizeActionOutputStream(event.stream)
+    ) {
+      coalesced[coalesced.length - 1] = {
+        ...previous,
+        content: `${String(previous.content ?? "")}${String(event.content ?? "")}`,
+      };
+      continue;
+    }
+
+    if (
+      previous.type === "ActionProgressUpdated" &&
+      event.type === "ActionProgressUpdated" &&
+      String(previous.action_id ?? "") === String(event.action_id ?? "")
+    ) {
+      coalesced[coalesced.length - 1] = event;
+      continue;
+    }
+
+    if (
+      previous.type === "DiffUpdated" &&
+      event.type === "DiffUpdated" &&
+      String(previous.scope ?? "turn") === String(event.scope ?? "turn")
+    ) {
+      coalesced[coalesced.length - 1] = event;
+      continue;
+    }
+
+    if (previous.type === "UsageLimitsUpdated" && event.type === "UsageLimitsUpdated") {
+      coalesced[coalesced.length - 1] = event;
+      continue;
+    }
+
+    coalesced.push(event);
+  }
+
+  return coalesced;
+}
+
 function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: string): Message[] {
   if (event.type === "UsageLimitsUpdated") {
     return messages;
@@ -1396,6 +1498,7 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
       assistant.status = "error";
     } else if (status === "interrupted") {
       assistant.status = "interrupted";
+      assistant.blocks = (assistant.blocks ?? []).filter((block) => block.type !== "thinking");
     } else {
       assistant.status = "completed";
     }
@@ -1516,6 +1619,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       const queuedStreamEvents: StreamEvent[] = [];
       let streamFlushTimer: ReturnType<typeof setTimeout> | null = null;
+      let streamFlushRafId: number | null = null;
       let streamFlushInProgress = false;
       let eventRateWindowStartedAt = performance.now();
       let eventRateWindowCount = 0;
@@ -1537,20 +1641,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
         eventRateWindowCount = 0;
       };
 
-      const flushQueuedStreamEvents = () => {
-        if (streamFlushInProgress) {
-          return;
-        }
+      const clearScheduledStreamFlush = () => {
         if (streamFlushTimer !== null) {
           globalThis.clearTimeout(streamFlushTimer);
           streamFlushTimer = null;
         }
+        if (
+          streamFlushRafId !== null &&
+          typeof globalThis.cancelAnimationFrame === "function"
+        ) {
+          globalThis.cancelAnimationFrame(streamFlushRafId);
+          streamFlushRafId = null;
+        }
+      };
+
+      const flushQueuedStreamEvents = () => {
+        if (streamFlushInProgress) {
+          return;
+        }
+        clearScheduledStreamFlush();
         if (queuedStreamEvents.length === 0) {
           return;
         }
 
         streamFlushInProgress = true;
         const batch = queuedStreamEvents.splice(0, queuedStreamEvents.length);
+        const coalescedBatch = coalesceStreamEvents(batch);
         const flushStartedAt = performance.now();
         try {
           set((state) => {
@@ -1563,9 +1679,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
             let nextStatus = state.status;
             let nextUsageLimits = state.usageLimits;
             let hydrationRecalcRequired = false;
-            for (const queuedEvent of batch) {
+            for (const queuedEvent of coalescedBatch) {
               if (queuedEvent.type === "UsageLimitsUpdated") {
                 nextUsageLimits = mapUsageLimitsFromEvent(queuedEvent);
+                continue;
+              }
+              if (interruptedThreads.has(threadId) && queuedEvent.type !== "TurnCompleted") {
                 continue;
               }
               const previousLength = nextMessages.length;
@@ -1582,6 +1701,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
               nextStreaming = nextRuntimeState.streaming;
               if (queuedEvent.type === "TurnCompleted") {
                 pendingTurnMetaByThread.delete(threadId);
+                interruptedThreads.delete(threadId);
               }
             }
             if (hydrationRecalcRequired) {
@@ -1611,6 +1731,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         recordPerfMetric("chat.stream.flush.ms", performance.now() - flushStartedAt, {
           threadId,
           batchSize: batch.length,
+          coalescedBatchSize: coalescedBatch.length,
         });
 
         if (queuedStreamEvents.length > 0) {
@@ -1619,13 +1740,28 @@ export const useChatStore = create<ChatState>((set, get) => ({
       };
 
       const scheduleStreamFlush = () => {
-        if (streamFlushTimer !== null) {
+        if (streamFlushTimer !== null || streamFlushRafId !== null) {
           return;
         }
-        streamFlushTimer = globalThis.setTimeout(() => {
-          streamFlushTimer = null;
+        const runScheduledFlush = () => {
+          clearScheduledStreamFlush();
           flushQueuedStreamEvents();
-        }, STREAM_EVENT_BATCH_WINDOW_MS);
+        };
+        if (typeof globalThis.requestAnimationFrame === "function") {
+          streamFlushRafId = globalThis.requestAnimationFrame(() => {
+            streamFlushRafId = null;
+            runScheduledFlush();
+          });
+          streamFlushTimer = globalThis.setTimeout(
+            runScheduledFlush,
+            STREAM_EVENT_BATCH_WINDOW_MS * 2,
+          );
+          return;
+        }
+        streamFlushTimer = globalThis.setTimeout(
+          runScheduledFlush,
+          STREAM_EVENT_BATCH_WINDOW_MS,
+        );
       };
 
       const unlistenStream = await listenThreadEvents(threadId, (event) => {
@@ -1664,10 +1800,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       });
 
       const unlisten = () => {
-        if (streamFlushTimer !== null) {
-          globalThis.clearTimeout(streamFlushTimer);
-          streamFlushTimer = null;
-        }
+        clearScheduledStreamFlush();
         queuedStreamEvents.length = 0;
         emitEventRateMetric(performance.now());
         unlistenStream();
@@ -1794,6 +1927,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const startedAt = performance.now();
     const clientTurnId = crypto.randomUUID();
     const optimisticAssistantMessageId = crypto.randomUUID();
+    interruptedThreads.delete(threadId);
     pendingTurnMetaByThread.set(threadId, {
       turnEngineId: options?.engineId ?? null,
       turnModelId: options?.modelId ?? null,
@@ -1886,6 +2020,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const startedAt = performance.now();
     const clientTurnId = crypto.randomUUID();
     const optimisticAssistantMessageId = crypto.randomUUID();
+    interruptedThreads.delete(threadId);
     pendingTurnMetaByThread.set(threadId, {
       turnEngineId: options?.engineId ?? "codex",
       turnModelId: options?.modelId ?? null,
@@ -1991,11 +2126,38 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
 
+    pendingTurnMetaByThread.delete(threadId);
+    interruptedThreads.add(threadId);
+    set((state) => {
+      if (state.threadId !== threadId) {
+        return state;
+      }
+
+      const nextMessages = applyHydrationWindow(
+        interruptActiveAssistantMessage(state.messages, threadId),
+      );
+      if (
+        nextMessages === state.messages &&
+        state.status === "idle" &&
+        state.streaming === false &&
+        state.error === undefined
+      ) {
+        return state;
+      }
+
+      return {
+        ...state,
+        messages: nextMessages,
+        status: "idle",
+        streaming: false,
+        error: undefined,
+      };
+    });
+
     try {
       await ipc.cancelTurn(threadId);
-      pendingTurnMetaByThread.delete(threadId);
-      set({ status: "idle", streaming: false });
     } catch (error) {
+      interruptedThreads.delete(threadId);
       set({ error: String(error) });
     }
   },

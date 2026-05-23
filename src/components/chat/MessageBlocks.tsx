@@ -118,7 +118,7 @@ function MessageDiffBlock({ block, defaultExpanded }: { block: DiffBlock; defaul
           </span>
         )}
         {(adds > 0 || dels > 0) && (
-          <span style={{ fontSize: 10, fontFamily: '"JetBrains Mono", monospace', display: "flex", gap: 5, flexShrink: 0 }}>
+          <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", display: "flex", gap: 5, flexShrink: 0 }}>
             {adds > 0 && <span style={{ color: "var(--success)" }}>+{adds}</span>}
             {dels > 0 && <span style={{ color: "var(--danger)" }}>-{dels}</span>}
           </span>
@@ -536,7 +536,7 @@ function ActionBlockView({
                 background: "var(--code-bg)",
                 fontSize: 11.5,
                 lineHeight: 1.5,
-                fontFamily: '"JetBrains Mono", monospace',
+                fontFamily: "var(--font-mono)",
                 whiteSpace: "pre-wrap",
                 overflow: "auto",
                 maxHeight: 160,
@@ -574,7 +574,7 @@ function ActionBlockView({
                 background: "rgba(248, 113, 113, 0.06)",
                 fontSize: 11.5,
                 lineHeight: 1.5,
-                fontFamily: '"JetBrains Mono", monospace',
+                fontFamily: "var(--font-mono)",
                 whiteSpace: "pre-wrap",
                 overflow: "auto",
                 maxHeight: 120,
@@ -1129,7 +1129,7 @@ function MessageBlocksView({ blocks = [], status, engineId, onApproval, onLoadAc
                   borderBottom: "1px solid var(--border)",
                   fontSize: 11,
                   color: "var(--text-3)",
-                  fontFamily: '"JetBrains Mono", monospace',
+                  fontFamily: "var(--font-mono)",
                 }}
               >
                 <FileCode2 size={12} style={{ opacity: 0.5 }} />
@@ -1141,7 +1141,7 @@ function MessageBlocksView({ blocks = [], status, engineId, onApproval, onLoadAc
                   padding: "12px 14px",
                   fontSize: 12.5,
                   lineHeight: 1.6,
-                  fontFamily: '"JetBrains Mono", monospace',
+                  fontFamily: "var(--font-mono)",
                   whiteSpace: "pre-wrap",
                   wordBreak: "break-word",
                   overflow: "auto",
@@ -1196,6 +1196,9 @@ function MessageBlocksView({ blocks = [], status, engineId, onApproval, onLoadAc
 
         /* ── Thinking ── */
         if (block.type === "thinking") {
+          if (status === "interrupted") {
+            return null;
+          }
           const isLastBlock = index === safeBlocks.length - 1;
           const thinkingActive = status === "streaming" && isLastBlock;
           return <ThinkingBlockView key={blockKey} block={block} isStreaming={thinkingActive} />;

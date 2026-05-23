@@ -23,6 +23,10 @@ import { handleDragMouseDown } from "../../lib/windowDrag";
 import { toast } from "../../stores/toastStore";
 import { Dropdown } from "../shared/Dropdown";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
+import {
+  normalizeClientRectForFixedPosition,
+  readFixedViewportSize,
+} from "../shared/anchoredPopoverPosition";
 import type { GitInitRepoStatus } from "../../types";
 import { GitChangesView } from "./GitChangesView";
 import { GitBranchesView } from "./GitBranchesView";
@@ -510,9 +514,14 @@ export function GitPanel() {
               closeMoreMenu();
               return;
             }
-            const rect = moreTriggerRef.current?.getBoundingClientRect();
-            if (rect) {
-              setMoreMenuPos({ top: rect.bottom + 4, left: rect.right - moreMenuWidth });
+            const rawRect = moreTriggerRef.current?.getBoundingClientRect();
+            if (rawRect) {
+              const rect = normalizeClientRectForFixedPosition(rawRect);
+              const viewport = readFixedViewportSize();
+              setMoreMenuPos({
+                top: rect.bottom + 4,
+                left: Math.max(8, Math.min(rect.right - moreMenuWidth, viewport.width - moreMenuWidth - 8)),
+              });
             }
             setMoreMenuOpen(true);
           }}

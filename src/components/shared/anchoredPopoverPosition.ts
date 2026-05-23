@@ -44,11 +44,54 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
-function readViewportSize(): { width: number; height: number } {
-  const visualViewport = window.visualViewport;
+export function readAppZoomScale(): number {
+  const zoomValue =
+    document.documentElement.style.getPropertyValue("zoom") ||
+    getComputedStyle(document.documentElement).getPropertyValue("zoom") ||
+    "1";
+  const parsed = Number.parseFloat(zoomValue);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 1;
+  }
+  return parsed > 10 ? parsed / 100 : parsed;
+}
+
+export function normalizeClientRectForFixedPosition(
+  rect: AnchoredPopoverRect,
+): AnchoredPopoverRect {
+  const scale = readAppZoomScale();
+  if (scale === 1) {
+    return rect;
+  }
   return {
-    width: visualViewport?.width ?? window.innerWidth,
-    height: visualViewport?.height ?? window.innerHeight,
+    top: rect.top / scale,
+    left: rect.left / scale,
+    right: rect.right / scale,
+    bottom: rect.bottom / scale,
+    width: rect.width / scale,
+    height: rect.height / scale,
+  };
+}
+
+export function normalizeClientPointForFixedPosition(
+  point: { x: number; y: number },
+): { x: number; y: number } {
+  const scale = readAppZoomScale();
+  if (scale === 1) {
+    return point;
+  }
+  return {
+    x: point.x / scale,
+    y: point.y / scale,
+  };
+}
+
+export function readFixedViewportSize(): { width: number; height: number } {
+  const visualViewport = window.visualViewport;
+  const scale = readAppZoomScale();
+  return {
+    width: (visualViewport?.width ?? window.innerWidth) / scale,
+    height: (visualViewport?.height ?? window.innerHeight) / scale,
   };
 }
 
@@ -134,9 +177,13 @@ export function useAnchoredPopoverPosition({
         return;
       }
 
-      const triggerRect = nextTrigger.getBoundingClientRect();
-      const popoverRect = nextPopover.getBoundingClientRect();
-      const viewport = readViewportSize();
+      const triggerRect = normalizeClientRectForFixedPosition(
+        nextTrigger.getBoundingClientRect(),
+      );
+      const popoverRect = normalizeClientRectForFixedPosition(
+        nextPopover.getBoundingClientRect(),
+      );
+      const viewport = readFixedViewportSize();
 
       setPosition(
         getAnchoredPopoverPosition({

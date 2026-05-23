@@ -185,7 +185,7 @@ function InstallLogView({
         padding: "10px 12px",
         fontSize: 11,
         lineHeight: 1.5,
-        fontFamily: '"JetBrains Mono", monospace',
+        fontFamily: "var(--font-mono)",
         background: "var(--bg-2)",
         borderRadius: "var(--radius-sm)",
         border: "1px solid var(--border)",
@@ -436,7 +436,7 @@ function ProviderRow({
           {description}
         </p>
         {harness.version ? (
-          <span style={{ fontSize: 10, color: "var(--text-3)", fontFamily: '"JetBrains Mono", monospace' }}>
+          <span style={{ fontSize: 10, color: "var(--text-3)", fontFamily: "var(--font-mono)" }}>
             {harness.version}
           </span>
         ) : null}
@@ -595,7 +595,7 @@ function ReadinessEngineRow({
           {health?.details ?? t("chatReadiness.status.pending")}
         </p>
         {health?.version ? (
-          <span style={{ fontSize: 10, color: "var(--text-3)", fontFamily: '"JetBrains Mono", monospace', marginTop: 4, display: "inline-block" }}>
+          <span style={{ fontSize: 10, color: "var(--text-3)", fontFamily: "var(--font-mono)", marginTop: 4, display: "inline-block" }}>
             v{health.version}
           </span>
         ) : null}
@@ -683,7 +683,7 @@ function WorkspaceRow({
           fontSize: 11,
           color: "var(--text-3)",
           lineHeight: 1.3,
-          fontFamily: '"JetBrains Mono", monospace',
+          fontFamily: "var(--font-mono)",
           wordBreak: "break-word",
         }}
       >

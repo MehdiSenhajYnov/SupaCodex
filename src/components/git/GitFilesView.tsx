@@ -318,7 +318,7 @@ export function GitFilesView({ repo }: Props) {
               outline: "none",
               fontSize: 12,
               color: "var(--text-1)",
-              fontFamily: '"JetBrains Mono", monospace',
+              fontFamily: "var(--font-mono)",
             }}
           />
           {filter && (
@@ -396,7 +396,7 @@ export function GitFilesView({ repo }: Props) {
                     cursor: "pointer",
                     fontSize: 12,
                     color: row.type === "dir" ? "var(--text-2)" : "var(--text-1)",
-                    fontFamily: '"JetBrains Mono", monospace',
+                    fontFamily: "var(--font-mono)",
                   }}
                   className="git-file-row"
                 >

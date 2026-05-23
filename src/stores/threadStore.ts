@@ -18,6 +18,10 @@ interface CreateThreadInput {
   title?: string;
 }
 
+interface AttachCodexRemoteThreadOptions {
+  activate?: boolean;
+}
+
 interface ThreadState {
   threads: Thread[];
   threadsByWorkspace: Record<string, Thread[]>;
@@ -33,6 +37,7 @@ interface ThreadState {
   refreshArchivedThreads: (workspaceId: string) => Promise<void>;
   refreshAllThreads: (workspaceIds: string[]) => Promise<void>;
   removeThread: (threadId: string) => Promise<void>;
+  deleteThread: (threadId: string) => Promise<void>;
   restoreThread: (threadId: string) => Promise<void>;
   forkCodexThread: (threadId: string) => Promise<Thread | null>;
   rollbackCodexThread: (threadId: string, numTurns: number) => Promise<Thread | null>;
@@ -41,11 +46,13 @@ interface ThreadState {
     workspaceId: string,
     engineThreadId: string,
     modelId: string,
+    options?: AttachCodexRemoteThreadOptions,
   ) => Promise<Thread | null>;
   setActiveThread: (threadId: string | null) => void;
   applyThreadUpdateLocal: (thread: Thread) => boolean;
   setThreadReasoningEffortLocal: (threadId: string, reasoningEffort: string | null) => void;
   setThreadLastModelLocal: (threadId: string, modelId: string | null) => void;
+  setThreadPinned: (threadId: string, pinned: boolean) => Promise<Thread | null>;
 }
 
 const DEFAULT_ENGINE = "codex";
@@ -352,6 +359,43 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       set({ loading: false, error: String(error) });
     }
   },
+  deleteThread: async (threadId) => {
+    set({ loading: true, error: undefined });
+    try {
+      await ipc.deleteThread(threadId);
+
+      const isActiveThread = get().activeThreadId === threadId;
+      if (isActiveThread) {
+        localStorage.removeItem(LAST_THREAD_KEY);
+      }
+
+      set((state) => {
+        const threadsByWorkspace = Object.entries(state.threadsByWorkspace).reduce<
+          Record<string, Thread[]>
+        >((acc, [workspaceId, threads]) => {
+          acc[workspaceId] = threads.filter((thread) => thread.id !== threadId);
+          return acc;
+        }, {});
+
+        const archivedThreadsByWorkspace = Object.entries(state.archivedThreadsByWorkspace).reduce<
+          Record<string, Thread[]>
+        >((acc, [workspaceId, threads]) => {
+          acc[workspaceId] = threads.filter((thread) => thread.id !== threadId);
+          return acc;
+        }, {});
+
+        return {
+          threadsByWorkspace,
+          archivedThreadsByWorkspace,
+          threads: flattenThreadsByWorkspace(threadsByWorkspace),
+          activeThreadId: isActiveThread ? null : state.activeThreadId,
+          loading: false,
+        };
+      });
+    } catch (error) {
+      set({ loading: false, error: String(error) });
+    }
+  },
   restoreThread: async (threadId) => {
     set({ loading: true, error: undefined });
     try {
@@ -475,11 +519,14 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       return null;
     }
   },
-  attachCodexRemoteThread: async (workspaceId, engineThreadId, modelId) => {
+  attachCodexRemoteThread: async (workspaceId, engineThreadId, modelId, options) => {
+    const activate = options?.activate !== false;
     set({ loading: true, error: undefined });
     try {
       const attached = await ipc.attachCodexRemoteThread(workspaceId, engineThreadId, modelId);
-      localStorage.setItem(LAST_THREAD_KEY, attached.id);
+      if (activate) {
+        localStorage.setItem(LAST_THREAD_KEY, attached.id);
+      }
       set((state) => {
         const workspaceThreads = state.threadsByWorkspace[workspaceId] ?? [];
         const nextWorkspaceThreads = [
@@ -501,7 +548,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
           threadsByWorkspace,
           archivedThreadsByWorkspace,
           threads: flattenThreadsByWorkspace(threadsByWorkspace),
-          activeThreadId: attached.id,
+          activeThreadId: activate ? attached.id : state.activeThreadId,
           loading: false,
         };
       });
@@ -596,4 +643,49 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
         threads: state.threads.map(updateThread),
       };
     }),
+  setThreadPinned: async (threadId, pinned) => {
+    set({ loading: true, error: undefined });
+    try {
+      const updated = await ipc.setThreadPinned(threadId, pinned);
+      set((state) => {
+        const workspaceThreads = state.threadsByWorkspace[updated.workspaceId] ?? [];
+        const archivedThreads = state.archivedThreadsByWorkspace[updated.workspaceId] ?? [];
+        const isActiveThreadKnown = workspaceThreads.some((thread) => thread.id === updated.id);
+        const isArchivedThreadKnown = archivedThreads.some((thread) => thread.id === updated.id);
+        if (!isActiveThreadKnown && !isArchivedThreadKnown) {
+          return {
+            ...state,
+            loading: false,
+          };
+        }
+
+        const nextThreadsByWorkspace = isActiveThreadKnown
+          ? mergeWorkspaceThreads(
+              state.threadsByWorkspace,
+              updated.workspaceId,
+              workspaceThreads.map((thread) => (thread.id === updated.id ? updated : thread)),
+            )
+          : state.threadsByWorkspace;
+        const nextArchivedThreadsByWorkspace = isArchivedThreadKnown
+          ? {
+              ...state.archivedThreadsByWorkspace,
+              [updated.workspaceId]: archivedThreads.map((thread) =>
+                thread.id === updated.id ? updated : thread,
+              ),
+            }
+          : state.archivedThreadsByWorkspace;
+
+        return {
+          threadsByWorkspace: nextThreadsByWorkspace,
+          archivedThreadsByWorkspace: nextArchivedThreadsByWorkspace,
+          threads: flattenThreadsByWorkspace(nextThreadsByWorkspace),
+          loading: false,
+        };
+      });
+      return updated;
+    } catch (error) {
+      set({ loading: false, error: String(error) });
+      return null;
+    }
+  },
 }));

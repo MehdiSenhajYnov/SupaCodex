@@ -41,7 +41,7 @@ const darkVoidTheme = EditorView.theme(
       height: "100%",
     },
     ".cm-scroller": {
-      fontFamily: '"JetBrains Mono", monospace',
+      fontFamily: "var(--font-mono)",
       fontSize: "13px",
       lineHeight: "1.6",
     },
@@ -112,7 +112,7 @@ const darkVoidTheme = EditorView.theme(
       background: "var(--bg-3)",
       color: "var(--text-1)",
       fontSize: "12px",
-      fontFamily: '"JetBrains Mono", monospace',
+      fontFamily: "var(--font-mono)",
       minWidth: "140px",
       outline: "none",
       transition: "border-color 120ms ease",

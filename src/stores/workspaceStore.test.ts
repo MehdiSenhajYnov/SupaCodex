@@ -157,6 +157,37 @@ describe("workspaceStore.openWorkspace", () => {
     expect(useWorkspaceStore.getState().workspaces).toEqual([openedWorkspace]);
   });
 
+  it("can import a workspace in background without switching the active workspace", async () => {
+    const activeWorkspace = makeWorkspace("ws-active", "/workspace/active");
+    const activeRepo = makeRepo("repo-active", activeWorkspace.id, "/workspace/active/repo");
+    const openedWorkspace = makeWorkspace("ws-opened", "/workspace/opened");
+
+    mockIpc.openWorkspace.mockResolvedValue(openedWorkspace);
+    useWorkspaceStore.setState({
+      workspaces: [activeWorkspace],
+      archivedWorkspaces: [],
+      activeWorkspaceId: activeWorkspace.id,
+      repos: [activeRepo],
+      activeRepoId: activeRepo.id,
+      reposLoading: false,
+      loading: false,
+      error: undefined,
+    });
+
+    const result = await useWorkspaceStore.getState().openWorkspace(
+      "./workspace/opened",
+      undefined,
+      { activate: false },
+    );
+
+    expect(result).toEqual(openedWorkspace);
+    expect(useWorkspaceStore.getState().activeWorkspaceId).toBe(activeWorkspace.id);
+    expect(useWorkspaceStore.getState().workspaces).toEqual([openedWorkspace, activeWorkspace]);
+    expect(useWorkspaceStore.getState().repos).toEqual([activeRepo]);
+    expect(mockTerminalStoreState.prepareWorkspaceActivation).not.toHaveBeenCalled();
+    expect(mockIpc.getRepos).not.toHaveBeenCalled();
+  });
+
   it("returns null when opening a workspace fails", async () => {
     mockIpc.openWorkspace.mockRejectedValue(new Error("open failed"));
 

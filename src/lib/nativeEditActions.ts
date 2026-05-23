@@ -5,6 +5,10 @@ import { useWorkspaceStore } from "../stores/workspaceStore";
 import {
   runFocusedEditorHistoryAction,
 } from "../components/editor/CodeMirrorEditor";
+import {
+  dispatchChatComposerNativeImagePaste,
+  isChatComposerElement,
+} from "./chatComposerClipboard";
 import { readTextFromClipboard } from "./clipboard";
 import { type EditMenuAction, shouldDispatchTerminalEditAction } from "./editMenu";
 import { isTerminalInputFocused } from "./windowActions";
@@ -45,6 +49,54 @@ function getFocusedEditableElement():
     return activeElement;
   }
   return null;
+}
+
+function extensionForMimeType(mimeType: string): string {
+  switch (mimeType) {
+    case "image/jpeg":
+      return "jpg";
+    case "image/webp":
+      return "webp";
+    case "image/gif":
+      return "gif";
+    case "image/svg+xml":
+      return "svg";
+    default:
+      return "png";
+  }
+}
+
+async function readImageFilesFromClipboard(): Promise<File[]> {
+  if (typeof navigator === "undefined" || typeof navigator.clipboard?.read !== "function") {
+    return [];
+  }
+
+  const items = await navigator.clipboard.read();
+  const imageFiles: File[] = [];
+  const knownFiles = new Set<string>();
+
+  for (const item of items) {
+    const imageType = item.types.find((type) => type.startsWith("image/"));
+    if (!imageType) {
+      continue;
+    }
+
+    const blob = await item.getType(imageType);
+    const fileKey = `${imageType}:${blob.size}`;
+    if (knownFiles.has(fileKey)) {
+      continue;
+    }
+
+    knownFiles.add(fileKey);
+    imageFiles.push(
+      new File([blob], `pasted-image.${extensionForMimeType(imageType)}`, {
+        type: imageType,
+        lastModified: Date.now(),
+      }),
+    );
+  }
+
+  return imageFiles;
 }
 
 function replaceTextInInput(
@@ -134,6 +186,17 @@ export async function runEditMenuAction(action: EditMenuAction): Promise<void> {
     case "edit-paste": {
       if (!activeElement) {
         return;
+      }
+      if (isChatComposerElement(activeElement)) {
+        try {
+          const imageFiles = await readImageFilesFromClipboard();
+          if (imageFiles.length > 0) {
+            dispatchChatComposerNativeImagePaste(imageFiles);
+            return;
+          }
+        } catch {
+          // Fall through to text paste when image clipboard access is unavailable.
+        }
       }
       let text = "";
       try {

@@ -1,6 +1,8 @@
+use std::{fs, path::PathBuf};
+
 #[cfg(target_os = "macos")]
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     process::{Child, Command, Stdio},
     sync::{Mutex, OnceLock},
 };
@@ -10,12 +12,14 @@ use crate::{
         build_codex_resume_command as build_codex_resume_command_string,
         codex_profile_id_from_metadata, detect_codex_projects, runtime_profile_from_config,
     },
+    commands::chat::ChatAttachmentPayload,
     config::app_config::AppConfig,
     locale::{normalize_app_locale, resolve_app_locale},
     models::{
         CodexDetectedProjectDto, CodexDetectedProjectProfileDto, CodexDetectedThreadDto,
         CodexProfileDto, CodexProfilesStateDto,
     },
+    runtime_env,
     state::AppState,
     terminal_notifications::{
         agent_notification_settings_status, install_terminal_notification_integration,
@@ -26,9 +30,22 @@ use crate::{
 use tauri::State;
 #[cfg(not(target_os = "macos"))]
 use tauri_plugin_notification::NotificationExt;
+use uuid::Uuid;
 
 fn err_to_string(error: impl ToString) -> String {
     error.to_string()
+}
+
+fn pasted_image_extension_for_mime(mime_type: &str) -> Option<(&'static str, &'static str)> {
+    match mime_type.trim().to_ascii_lowercase().as_str() {
+        "" | "image/png" => Some(("png", "image/png")),
+        "image/jpeg" | "image/jpg" => Some(("jpg", "image/jpeg")),
+        "image/gif" => Some(("gif", "image/gif")),
+        "image/webp" => Some(("webp", "image/webp")),
+        "image/bmp" => Some(("bmp", "image/bmp")),
+        "image/tiff" => Some(("tiff", "image/tiff")),
+        _ => None,
+    }
 }
 
 fn map_codex_profile_dto(
@@ -207,6 +224,38 @@ pub async fn set_terminal_accelerated_rendering(
         config.general.terminal_accelerated_rendering = if enabled { None } else { Some(false) };
         config.save().map_err(err_to_string)?;
         Ok(enabled)
+    })
+    .await
+    .map_err(err_to_string)?
+}
+
+#[tauri::command]
+pub async fn persist_pasted_image(
+    mime_type: String,
+    data: Vec<u8>,
+) -> Result<ChatAttachmentPayload, String> {
+    tokio::task::spawn_blocking(move || {
+        if data.is_empty() {
+            return Err("clipboard image is empty".to_string());
+        }
+
+        let (extension, normalized_mime_type) = pasted_image_extension_for_mime(&mime_type)
+            .ok_or_else(|| format!("unsupported pasted image type: {mime_type}"))?;
+
+        let directory = runtime_env::app_data_dir().join("pasted-images");
+        fs::create_dir_all(&directory).map_err(err_to_string)?;
+
+        let file_name = format!("pasted-image-{}.{}", Uuid::new_v4(), extension);
+        let file_path: PathBuf = directory.join(&file_name);
+        fs::write(&file_path, &data).map_err(err_to_string)?;
+
+        Ok(ChatAttachmentPayload {
+            id: Some(Uuid::new_v4().to_string()),
+            file_name,
+            file_path: file_path.to_string_lossy().to_string(),
+            size_bytes: data.len() as u64,
+            mime_type: Some(normalized_mime_type.to_string()),
+        })
     })
     .await
     .map_err(err_to_string)?

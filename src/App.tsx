@@ -34,6 +34,7 @@ import { toast } from "./stores/toastStore";
 import type { RuntimeToast, Thread } from "./types";
 import { CustomWindowFrame } from "./components/shared/CustomWindowFrame";
 import { useCustomWindowFrameState } from "./lib/customWindowFrame";
+import { isChatComposerPasteShortcut } from "./lib/chatComposerClipboard";
 import { runEditMenuAction } from "./lib/nativeEditActions";
 import {
   SHORTCUT_ACTION_DEFINITIONS,
@@ -64,6 +65,22 @@ const INTERFACE_ZOOM_MIN = 80;
 const INTERFACE_ZOOM_MAX = 160;
 const INTERFACE_ZOOM_STEP = 10;
 const INTERFACE_ZOOM_WHEEL_THRESHOLD = 120;
+
+function executeEditMenuAction(
+  action:
+    | "edit-undo"
+    | "edit-redo"
+    | "edit-cut"
+    | "edit-copy"
+    | "edit-paste"
+    | "edit-select-all",
+): void {
+  void runEditMenuAction(action).catch((error) => {
+    if (import.meta.env.DEV) {
+      console.warn("[App] Failed to execute edit menu action", action, error);
+    }
+  });
+}
 
 function fireShortcut(id: string, action: () => void) {
   const now = Date.now();
@@ -399,6 +416,14 @@ export function App() {
       if (!meta) return;
 
       const key = e.key.toLowerCase();
+      if (isChatComposerPasteShortcut(e, document.activeElement)) {
+        e.preventDefault();
+        fireShortcut("edit-paste", () => {
+          executeEditMenuAction("edit-paste");
+        });
+        return;
+      }
+
       if ((key === "=" || key === "+" || e.code === "NumpadAdd") && !e.altKey) {
         e.preventDefault();
         stepInterfaceZoom(INTERFACE_ZOOM_STEP);
@@ -557,12 +582,12 @@ export function App() {
         case "edit-redo":
         case "edit-cut":
         case "edit-copy":
-        case "edit-paste":
         case "edit-select-all":
-          void runEditMenuAction(action).catch((error) => {
-            if (import.meta.env.DEV) {
-              console.warn("[App] Failed to execute edit menu action", action, error);
-            }
+          executeEditMenuAction(action);
+          break;
+        case "edit-paste":
+          fireShortcut("edit-paste", () => {
+            executeEditMenuAction("edit-paste");
           });
           break;
       }

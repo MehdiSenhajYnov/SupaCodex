@@ -13,6 +13,10 @@ import {
   Scissors,
 } from "lucide-react";
 import { getActionMenuPosition } from "./actionMenuPosition";
+import {
+  normalizeClientRectForFixedPosition,
+  readFixedViewportSize,
+} from "../shared/anchoredPopoverPosition";
 import { toast } from "../../stores/toastStore";
 import { useGitStore } from "../../stores/gitStore";
 import type { Repo, GitWorktree } from "../../types";
@@ -124,12 +128,13 @@ export function GitWorktreesView({ repo, onError }: Props) {
 
   useLayoutEffect(() => {
     if (!actionMenu || !actionMenuRef.current) return;
+    const viewport = readFixedViewportSize();
     const next = getActionMenuPosition({
       triggerRect: actionMenu.triggerRect,
       menuWidth: actionMenuRef.current.offsetWidth,
       menuHeight: actionMenuRef.current.offsetHeight,
-      viewportWidth: window.innerWidth,
-      viewportHeight: window.innerHeight,
+      viewportWidth: viewport.width,
+      viewportHeight: viewport.height,
     });
     if (next.top === actionMenu.top && next.left === actionMenu.left) return;
     setActionMenu((current) =>
@@ -162,7 +167,10 @@ export function GitWorktreesView({ repo, onError }: Props) {
       closeMenu();
       return;
     }
-    const rect = e.currentTarget.getBoundingClientRect();
+    const rect = normalizeClientRectForFixedPosition(
+      e.currentTarget.getBoundingClientRect(),
+    );
+    const viewport = readFixedViewportSize();
     const actionCount = 2 + (worktree.branch ? 1 : 0);
     actionTriggerRef.current = e.currentTarget;
     const triggerRect = {
@@ -177,8 +185,8 @@ export function GitWorktreesView({ repo, onError }: Props) {
         triggerRect,
         menuWidth: 160,
         menuHeight: actionCount * 32 + 8,
-        viewportWidth: window.innerWidth,
-        viewportHeight: window.innerHeight,
+        viewportWidth: viewport.width,
+        viewportHeight: viewport.height,
       }),
     });
   }
@@ -514,7 +522,7 @@ export function GitWorktreesView({ repo, onError }: Props) {
                     {wt.headSha && (
                       <span
                         style={{
-                          fontFamily: '"JetBrains Mono", monospace',
+                          fontFamily: "var(--font-mono)",
                           fontSize: 11,
                           flexShrink: 0,
                         }}

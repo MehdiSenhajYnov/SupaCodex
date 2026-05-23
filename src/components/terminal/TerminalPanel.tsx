@@ -23,6 +23,11 @@ import {
   markPaneTerminalDetached,
   markWorkspaceTerminalDetached,
 } from "./terminalCacheLifecycle";
+import {
+  normalizeClientPointForFixedPosition,
+  normalizeClientRectForFixedPosition,
+  readFixedViewportSize,
+} from "../shared/anchoredPopoverPosition";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
@@ -1886,7 +1891,7 @@ function createCachedTerminal(
     convertEol: false,
     cursorBlink: true,
     cursorInactiveStyle: "none",
-    fontFamily: '"JetBrains Mono", monospace',
+    fontFamily: "var(--font-mono)",
     fontSize: 12,
     lineHeight: 1.3,
     scrollback: TERMINAL_SCROLLBACK_LINES,
@@ -2503,6 +2508,8 @@ function NewTabDropdown({
       return next;
     });
   };
+  const fixedAnchorRect = normalizeClientRectForFixedPosition(anchorRect);
+  const fixedViewport = readFixedViewportSize();
 
   return (
     <div
@@ -2510,8 +2517,8 @@ function NewTabDropdown({
       className="terminal-new-dropdown"
       style={{
         position: "fixed",
-        top: anchorRect.bottom + 4,
-        right: window.innerWidth - anchorRect.right,
+        top: fixedAnchorRect.bottom + 4,
+        right: Math.max(8, fixedViewport.width - fixedAnchorRect.right),
       }}
     >
       {mode === "default" ? (
@@ -2924,10 +2931,14 @@ export function TerminalPanel({ workspaceId }: TerminalPanelProps) {
       setCtxMenu(null);
 
       const cached = cachedTerminals.get(terminalCacheKey(workspaceId, sessionId));
-      setTerminalCtxMenu({
-        sessionId,
+      const point = normalizeClientPointForFixedPosition({
         x: event.clientX,
         y: event.clientY,
+      });
+      setTerminalCtxMenu({
+        sessionId,
+        x: point.x,
+        y: point.y,
         selectionText: cached?.terminal.getSelection() ?? "",
       });
     },
@@ -3824,7 +3835,11 @@ export function TerminalPanel({ workspaceId }: TerminalPanelProps) {
                 onContextMenu={(e) => {
                   e.preventDefault();
                   setTerminalCtxMenu(null);
-                  setCtxMenu({ groupId: group.id, x: e.clientX, y: e.clientY });
+                  const point = normalizeClientPointForFixedPosition({
+                    x: e.clientX,
+                    y: e.clientY,
+                  });
+                  setCtxMenu({ groupId: group.id, x: point.x, y: point.y });
                 }}
               >
                 {displayHarness.harnessId

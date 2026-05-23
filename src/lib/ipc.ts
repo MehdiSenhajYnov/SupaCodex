@@ -194,6 +194,8 @@ export const ipc = {
     invoke<CodexDetectedProject[]>("list_codex_detected_projects"),
   buildCodexResumeCommandForThread: (threadId: string) =>
     invoke<string | null>("build_codex_resume_command_for_thread", { threadId }),
+  persistPastedImage: (mimeType: string, data: number[]) =>
+    invoke<ChatAttachment>("persist_pasted_image", { mimeType, data }),
   createThread: (
     workspaceId: string,
     repoId: string | null,
@@ -221,6 +223,8 @@ export const ipc = {
     modelId?: string | null,
   ) =>
     invoke<void>("set_thread_reasoning_effort", { threadId, reasoningEffort, modelId: modelId ?? null }),
+  setThreadPinned: (threadId: string, pinned: boolean) =>
+    invoke<Thread>("set_thread_pinned", { threadId, pinned }),
   setThreadExecutionPolicy: (
     threadId: string,
     patch: {
@@ -238,6 +242,8 @@ export const ipc = {
       updateAllowNetwork: Object.prototype.hasOwnProperty.call(patch, "allowNetwork"),
       allowNetwork: patch.allowNetwork ?? null,
     }),
+  setThreadCodexProfile: (threadId: string, profileId: string) =>
+    invoke<Thread>("set_thread_codex_profile", { threadId, profileId }),
   setThreadCodexConfig: (
     threadId: string,
     patch: {

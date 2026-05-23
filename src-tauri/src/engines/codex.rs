@@ -32,12 +32,13 @@ use crate::models::{
 use crate::{process_utils, runtime_env};
 
 use super::{
-    codex_event_mapper::TurnEventMapper, codex_protocol::IncomingMessage,
-    codex_transport::CodexTransport, ActionResult, ApprovalRequestRoute, CodexRemoteThreadSummary,
-    CodexThreadTranscriptSnapshot, Engine, EngineEvent, EngineThread, ModelAvailabilityNux,
-    ModelInfo, ModelUpgradeInfo, ReasoningEffortOption, SandboxPolicy, ThreadScope,
-    ThreadSyncSnapshot, ThreadTranscriptMessage, ThreadTranscriptMessageRole, TurnAttachment,
-    TurnCompletionStatus, TurnInput, TurnInputItem,
+    codex_event_mapper::TurnEventMapper,
+    codex_protocol::IncomingMessage,
+    codex_transport::{sanitize_codex_child_env, CodexTransport},
+    ActionResult, ApprovalRequestRoute, CodexRemoteThreadSummary, CodexThreadTranscriptSnapshot,
+    Engine, EngineEvent, EngineThread, ModelAvailabilityNux, ModelInfo, ModelUpgradeInfo,
+    ReasoningEffortOption, SandboxPolicy, ThreadScope, ThreadSyncSnapshot, ThreadTranscriptMessage,
+    ThreadTranscriptMessageRole, TurnAttachment, TurnCompletionStatus, TurnInput, TurnInputItem,
 };
 
 const INITIALIZE_METHODS: &[&str] = &["initialize"];
@@ -1101,6 +1102,10 @@ impl CodexEngine {
 
     pub async fn prewarm(&self) -> anyhow::Result<()> {
         self.ensure_ready_transport().await.map(|_| ())
+    }
+
+    pub async fn shutdown(&self) {
+        self.invalidate_transport("application shutdown").await;
     }
 
     pub async fn list_skills(&self, cwd: &str) -> anyhow::Result<Vec<CodexSkillDto>> {
@@ -3623,6 +3628,7 @@ fn codex_augmented_path(executable: &Path) -> Option<OsString> {
 fn codex_command(executable: &Path, profile: &CodexRuntimeProfile) -> Command {
     let mut command = Command::new(executable);
     process_utils::configure_tokio_command(&mut command);
+    sanitize_codex_child_env(&mut command);
     if let Some(augmented_path) = codex_augmented_path(executable) {
         command.env("PATH", augmented_path);
     }
@@ -4284,11 +4290,6 @@ fn sandbox_policy_to_json(
             _ => serde_json::json!({
               "type": "workspaceWrite",
               "writableRoots": sandbox.writable_roots.clone(),
-              "readOnlyAccess": {
-                "type": "restricted",
-                "includePlatformDefaults": true,
-                "readableRoots": sandbox.writable_roots.clone(),
-              },
               "networkAccess": sandbox.allow_network,
               "excludeTmpdirEnvVar": false,
               "excludeSlashTmp": false,
@@ -6515,6 +6516,35 @@ fn is_known_codex_notification_method(normalized_method: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn workspace_write_sandbox_policy_omits_deprecated_read_only_access() {
+        let policy = sandbox_policy_to_json(
+            &SandboxPolicy {
+                writable_roots: vec!["/tmp/workspace".to_string()],
+                allow_network: false,
+                approval_policy: Some(json!("on-request")),
+                reasoning_effort: None,
+                sandbox_mode: Some("workspace-write".to_string()),
+                service_tier: None,
+                personality: None,
+                output_schema: None,
+            },
+            false,
+        );
+
+        assert_eq!(
+            policy,
+            json!({
+                "type": "workspaceWrite",
+                "writableRoots": ["/tmp/workspace"],
+                "networkAccess": false,
+                "excludeTmpdirEnvVar": false,
+                "excludeSlashTmp": false,
+            })
+        );
+        assert!(policy.get("readOnlyAccess").is_none());
+    }
 
     #[test]
     fn normalize_modern_accept_with_execpolicy_from_top_level() {

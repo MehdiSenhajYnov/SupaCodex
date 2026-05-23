@@ -4,6 +4,10 @@ import { useTranslation } from "react-i18next";
 import { Plus, X, MoreHorizontal, GitBranch, GitBranchPlus, Pencil, Trash2, Loader2, Search } from "lucide-react";
 import { formatDateTime } from "../../lib/formatters";
 import { getActionMenuPosition } from "./actionMenuPosition";
+import {
+  normalizeClientRectForFixedPosition,
+  readFixedViewportSize,
+} from "../shared/anchoredPopoverPosition";
 import { toast } from "../../stores/toastStore";
 import { useGitStore } from "../../stores/gitStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
@@ -138,12 +142,13 @@ export function GitBranchesView({ repo, onError }: Props) {
 
   useLayoutEffect(() => {
     if (!actionMenu || !actionMenuRef.current) return;
+    const viewport = readFixedViewportSize();
     const next = getActionMenuPosition({
       triggerRect: actionMenu.triggerRect,
       menuWidth: actionMenuRef.current.offsetWidth,
       menuHeight: actionMenuRef.current.offsetHeight,
-      viewportWidth: window.innerWidth,
-      viewportHeight: window.innerHeight,
+      viewportWidth: viewport.width,
+      viewportHeight: viewport.height,
     });
     if (next.top === actionMenu.top && next.left === actionMenu.left) return;
     setActionMenu((current) =>
@@ -158,7 +163,10 @@ export function GitBranchesView({ repo, onError }: Props) {
       closeMenu();
       return;
     }
-    const rect = e.currentTarget.getBoundingClientRect();
+    const rect = normalizeClientRectForFixedPosition(
+      e.currentTarget.getBoundingClientRect(),
+    );
+    const viewport = readFixedViewportSize();
     const branch = branches.find((item) => item.name === branchName);
     const actionCount =
       (branch && !branch.isCurrent ? 1 : 0) +
@@ -178,8 +186,8 @@ export function GitBranchesView({ repo, onError }: Props) {
         triggerRect,
         menuWidth: 140,
         menuHeight: estimatedHeight,
-        viewportWidth: window.innerWidth,
-        viewportHeight: window.innerHeight,
+        viewportWidth: viewport.width,
+        viewportHeight: viewport.height,
       }),
     });
   }

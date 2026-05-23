@@ -4,7 +4,7 @@
   "version": "0.46.1",
   "identifier": "com.supacodex.app",
   "build": {
-    "beforeDevCommand": "pnpm run dev",
+    "beforeDevCommand": "node scripts/tauri-dev-vite.mjs",
     "beforeBuildCommand": "node scripts/build-desktop.mjs",
     "devUrl": "http://localhost:1420",
     "frontendDist": "../dist"

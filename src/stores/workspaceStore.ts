@@ -8,6 +8,10 @@ interface SetActiveRepoOptions {
   remember?: boolean;
 }
 
+interface OpenWorkspaceOptions {
+  activate?: boolean;
+}
+
 interface WorkspaceState {
   workspaces: Workspace[];
   archivedWorkspaces: Workspace[];
@@ -20,7 +24,11 @@ interface WorkspaceState {
   error?: string;
   loadWorkspaces: () => Promise<void>;
   refreshArchivedWorkspaces: () => Promise<void>;
-  openWorkspace: (path: string, scanDepth?: number) => Promise<Workspace | null>;
+  openWorkspace: (
+    path: string,
+    scanDepth?: number,
+    options?: OpenWorkspaceOptions,
+  ) => Promise<Workspace | null>;
   removeWorkspace: (workspaceId: string) => Promise<void>;
   restoreWorkspace: (workspaceId: string) => Promise<void>;
   loadRepos: (workspaceId: string) => Promise<void>;
@@ -166,20 +174,21 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       set({ error: String(error) });
     }
   },
-  openWorkspace: async (path, scanDepth) => {
+  openWorkspace: async (path, scanDepth, options) => {
     set({ loading: true, error: undefined });
     try {
       const workspace = await ipc.openWorkspace(path, scanDepth);
-      const current = get().workspaces.filter((item) => item.id !== workspace.id);
-      const workspaces = [workspace, ...current];
+      const shouldActivate = options?.activate !== false;
       set((state) => ({
-        workspaces,
+        workspaces: [workspace, ...state.workspaces.filter((item) => item.id !== workspace.id)],
         archivedWorkspaces: state.archivedWorkspaces.filter((item) => item.id !== workspace.id),
-        activeWorkspaceId: workspace.id,
+        activeWorkspaceId: shouldActivate ? workspace.id : state.activeWorkspaceId,
         loading: false,
       }));
-      await useTerminalStore.getState().prepareWorkspaceActivation(workspace.id);
-      await get().loadRepos(workspace.id);
+      if (shouldActivate) {
+        await useTerminalStore.getState().prepareWorkspaceActivation(workspace.id);
+        await get().loadRepos(workspace.id);
+      }
       return workspace;
     } catch (error) {
       set({ loading: false, error: String(error) });

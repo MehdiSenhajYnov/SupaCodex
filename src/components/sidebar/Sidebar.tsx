@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+} from "react";
 import { createPortal } from "react-dom";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useTranslation } from "react-i18next";
@@ -9,6 +17,7 @@ import {
   ChevronDown,
   ChevronRight,
   Archive,
+  MoreHorizontal,
   RotateCcw,
   Settings,
   Terminal,
@@ -20,6 +29,8 @@ import {
   Globe,
   Monitor,
   Keyboard,
+  Pin,
+  Trash2,
   UserCircle,
   X,
 } from "lucide-react";
@@ -55,37 +66,19 @@ import { handleDragMouseDown } from "../../lib/windowDrag";
 import { UpdateDialog } from "../onboarding/UpdateDialog";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
 import { WorkspaceMoreMenu } from "../workspace/WorkspaceMoreMenu";
+import {
+  normalizeClientRectForFixedPosition,
+  readFixedViewportSize,
+} from "../shared/anchoredPopoverPosition";
+import {
+  buildSidebarProjectEntries,
+  isProjectPinned,
+  isThreadPinned,
+  type ProjectGroup,
+  type SidebarPinnedProjects,
+  type UnifiedProjectGroup,
+} from "./sidebarProjectEntries";
 import type { CodexDetectedProject, Thread, Workspace } from "../../types";
-
-interface ProjectGroup {
-  workspace: Workspace;
-  threads: Thread[];
-}
-
-interface UnifiedProjectGroup {
-  key: string;
-  path: string;
-  name: string;
-  workspace: Workspace | null;
-  detectedCodexProject: CodexDetectedProject | null;
-  conversations: SidebarConversation[];
-  totalConversationCount: number;
-  latestActivityAt: string;
-}
-
-type SidebarConversation =
-  | {
-      kind: "local";
-      key: string;
-      updatedAt: string;
-      localThread: Thread;
-    }
-  | {
-      kind: "detected";
-      key: string;
-      updatedAt: string;
-      detectedThread: CodexDetectedProject["threads"][number];
-    };
 
 interface SidebarConversationRowProps {
   label: string;
@@ -97,11 +90,9 @@ interface SidebarConversationRowProps {
   className?: string;
   onClick: () => void;
   onMiddleClick?: () => void;
-  trailingAction?: {
-    title: string;
-    icon: ReactNode;
-    onClick: () => void;
-  };
+  leadingAction?: SidebarRowAction;
+  metaAction?: SidebarRowAction;
+  trailing?: ReactNode;
 }
 
 interface SidebarProjectRowProps {
@@ -112,6 +103,8 @@ interface SidebarProjectRowProps {
   disabled?: boolean;
   icon: ReactNode;
   wrapperClassName?: string;
+  leadingAction?: SidebarRowAction;
+  metaAction?: SidebarRowAction;
   onClick: () => void;
   onMiddleClick?: () => void;
   trailing?: ReactNode;
@@ -119,24 +112,39 @@ interface SidebarProjectRowProps {
 
 interface SidebarSectionHeaderProps {
   label: string;
-  count: number;
+  count?: number;
   expanded: boolean;
   controlsId: string;
   toggleTitle: string;
-  onToggle: () => void;
+  onToggle: (event: ReactMouseEvent<HTMLButtonElement>) => void;
   action?: ReactNode;
 }
 
 const MAX_VISIBLE_THREADS = 8;
 const LEGACY_SCAN_DEPTH_STORAGE_KEY = "supacodex.workspace.scanDepth";
-const SIDEBAR_SECTION_STATE_STORAGE_KEY = "supacodex:sidebarSections:v1";
+const SIDEBAR_PERSISTENCE_STORAGE_KEY = "supacodex:sidebar:v2";
 const LEGACY_SCAN_DEPTH_MIN = 0;
 const LEGACY_SCAN_DEPTH_MAX = 12;
 const DEFAULT_CODEX_MODEL = "gpt-5.3-codex";
 
-interface SidebarSectionState {
-  openProjectsCollapsed: boolean;
+interface SidebarPersistentState {
   projectLibraryCollapsed: boolean;
+  pinnedProjects: SidebarPinnedProjects;
+}
+
+interface SidebarRowAction {
+  title: string;
+  icon: ReactNode;
+  active?: boolean;
+  onClick: () => void;
+}
+
+interface SidebarMenuAction {
+  key: string;
+  label: string;
+  icon: ReactNode;
+  danger?: boolean;
+  onSelect: () => void;
 }
 
 function SidebarProjectRow({
@@ -147,14 +155,38 @@ function SidebarProjectRow({
   disabled = false,
   icon,
   wrapperClassName,
+  leadingAction,
+  metaAction,
   onClick,
   onMiddleClick,
   trailing,
 }: SidebarProjectRowProps) {
+  const hasCount = typeof count === "number" && count > 0;
+
   return (
     <div
-      className={`sb-project-row ${active ? "sb-project-row-active" : ""}${disabled ? " sb-project-row-disabled" : ""}${wrapperClassName ? ` ${wrapperClassName}` : ""}`}
+      className={`sb-project-row ${active ? "sb-project-row-active" : ""}${leadingAction?.active ? " sb-project-row-pinned" : ""}${disabled ? " sb-project-row-disabled" : ""}${wrapperClassName ? ` ${wrapperClassName}` : ""}`}
     >
+      <div className="sb-project-leading-slot">
+        {leadingAction ? (
+          <button
+            type="button"
+            aria-label={leadingAction.title}
+            title={leadingAction.title}
+            className={`sb-project-icon-action sb-project-pin${leadingAction.active ? " sb-project-icon-action-active" : ""}`}
+            disabled={disabled}
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              leadingAction.onClick();
+            }}
+          >
+            {leadingAction.icon}
+          </button>
+        ) : (
+          <span className="sb-project-action-placeholder" aria-hidden="true" />
+        )}
+      </div>
       <button
         type="button"
         className="sb-project"
@@ -172,20 +204,40 @@ function SidebarProjectRow({
           }
         }}
       >
-        {collapsed ? (
-          <ChevronRight size={12} style={{ flexShrink: 0, opacity: 0.4 }} />
-        ) : (
-          <ChevronDown size={12} style={{ flexShrink: 0, opacity: 0.4 }} />
-        )}
-        {icon}
+        <span className="sb-project-prefix" aria-hidden="true">
+          {collapsed ? (
+            <ChevronRight size={12} className="sb-project-caret" />
+          ) : (
+            <ChevronDown size={12} className="sb-project-caret" />
+          )}
+          <span className="sb-project-folder-icon">{icon}</span>
+        </span>
         <span className="sb-project-name">{label}</span>
       </button>
       <div className="sb-project-row-meta">
-        {typeof count === "number" && count > 0 ? (
-          <span className="sb-project-count">{count}</span>
+        {hasCount ? (
+          <span className={`sb-project-count${metaAction ? " sb-project-count-swap" : ""}`}>
+            {count}
+          </span>
         ) : (
           <span className="sb-project-count-placeholder" aria-hidden="true" />
         )}
+        {metaAction ? (
+          <button
+            type="button"
+            aria-label={metaAction.title}
+            title={metaAction.title}
+            className={`sb-project-meta-action${metaAction.active ? " sb-project-meta-action-active" : ""}`}
+            disabled={disabled}
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              metaAction.onClick();
+            }}
+          >
+            {metaAction.icon}
+          </button>
+        ) : null}
       </div>
       <div className="sb-project-row-action">
         {trailing ?? <span className="sb-project-row-action-placeholder" aria-hidden="true" />}
@@ -204,16 +256,38 @@ function SidebarConversationRow({
   className,
   onClick,
   onMiddleClick,
-  trailingAction,
+  leadingAction,
+  metaAction,
+  trailing,
 }: SidebarConversationRowProps) {
   return (
     <div
-      className={`sb-thread sb-thread-animate ${active ? "sb-thread-active" : ""}${disabled ? " sb-thread-disabled" : ""}${className ? ` ${className}` : ""}`}
+      className={`sb-thread sb-thread-animate ${active ? "sb-thread-active" : ""}${leadingAction?.active ? " sb-thread-pinned" : ""}${disabled ? " sb-thread-disabled" : ""}${className ? ` ${className}` : ""}`}
       style={{
         animationDelay: `${animationDelayMs}ms`,
         ...(opacity === undefined ? {} : { opacity }),
       }}
     >
+      <div className="sb-thread-leading-slot">
+        {leadingAction ? (
+          <button
+            type="button"
+            aria-label={leadingAction.title}
+            title={leadingAction.title}
+            className={`sb-thread-icon-action sb-thread-pin${leadingAction.active ? " sb-thread-icon-action-active" : ""}`}
+            disabled={disabled}
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              leadingAction.onClick();
+            }}
+          >
+            {leadingAction.icon}
+          </button>
+        ) : (
+          <span className="sb-thread-action-placeholder" aria-hidden="true" />
+        )}
+      </div>
       <button
         type="button"
         className="sb-thread-trigger"
@@ -233,30 +307,146 @@ function SidebarConversationRow({
       >
         <span className="sb-thread-title">{label}</span>
       </button>
-      <span className={`sb-thread-time-slot${timeLabel ? "" : " sb-thread-time-slot-empty"}`}>
-        {timeLabel ?? ""}
-      </span>
-      <div className="sb-thread-action-slot">
-        {trailingAction ? (
+      <div className="sb-thread-row-meta">
+        {metaAction ? (
           <button
             type="button"
-            aria-label={trailingAction.title}
-            title={trailingAction.title}
-            className="sb-thread-archive"
+            aria-label={metaAction.title}
+            title={metaAction.title}
+            className={`sb-thread-meta-action sb-thread-archive${metaAction.active ? " sb-thread-meta-action-active" : ""}`}
             disabled={disabled}
             onMouseDown={(event) => event.stopPropagation()}
             onClick={(event) => {
               event.stopPropagation();
-              trailingAction.onClick();
+              metaAction.onClick();
             }}
           >
-            {trailingAction.icon}
+            {metaAction.icon}
           </button>
         ) : (
-          <span className="sb-thread-action-placeholder" aria-hidden="true" />
+          <span className="sb-thread-meta-action-placeholder" aria-hidden="true" />
         )}
       </div>
+      <div className="sb-thread-row-action">
+        <span className={`sb-thread-time-slot${timeLabel ? "" : " sb-thread-time-slot-empty"}${trailing ? " sb-thread-time-slot-swap" : ""}`}>
+          {timeLabel ?? ""}
+        </span>
+        {trailing ?? <span className="sb-thread-row-action-placeholder" aria-hidden="true" />}
+      </div>
     </div>
+  );
+}
+
+function SidebarConversationMoreMenu({
+  actions,
+  disabled = false,
+}: {
+  actions: SidebarMenuAction[];
+  disabled?: boolean;
+}) {
+  const { t } = useTranslation("app");
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuPos, setMenuPos] = useState({ top: 0, left: 0 });
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  const closeMenu = useCallback(() => setMenuOpen(false), []);
+
+  useEffect(() => {
+    if (!menuOpen) {
+      return;
+    }
+
+    function onPointerDown(event: PointerEvent) {
+      const target = event.target as Node;
+      if (triggerRef.current?.contains(target) || menuRef.current?.contains(target)) {
+        return;
+      }
+      closeMenu();
+    }
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        closeMenu();
+      }
+    }
+
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+    };
+  }, [closeMenu, menuOpen]);
+
+  if (actions.length === 0) {
+    return <span className="sb-thread-row-action-placeholder" aria-hidden="true" />;
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        ref={triggerRef}
+        aria-label={t("sidebar.conversationOptions")}
+        title={t("sidebar.conversationOptions")}
+        className={`sb-project-more sb-thread-more${menuOpen ? " sb-project-more-active sb-thread-more-active" : ""}`}
+        disabled={disabled}
+        onMouseDown={(event) => event.stopPropagation()}
+        onClick={(event) => {
+          event.stopPropagation();
+          if (menuOpen) {
+            closeMenu();
+            return;
+          }
+
+          const rawRect = triggerRef.current?.getBoundingClientRect();
+          if (!rawRect) {
+            return;
+          }
+          const rect = normalizeClientRectForFixedPosition(rawRect);
+          const viewport = readFixedViewportSize();
+
+          setMenuPos({
+            top: rect.bottom + 4,
+            left: Math.max(8, Math.min(rect.right - 196, viewport.width - 204)),
+          });
+          setMenuOpen(true);
+        }}
+      >
+        <MoreHorizontal size={12} />
+      </button>
+
+      {menuOpen &&
+        createPortal(
+          <div
+            ref={menuRef}
+            className="git-action-menu"
+            style={{
+              position: "fixed",
+              top: menuPos.top,
+              left: menuPos.left,
+              minWidth: 196,
+            }}
+          >
+            {actions.map((action) => (
+              <button
+                key={action.key}
+                type="button"
+                className={`git-action-menu-item${action.danger ? " git-action-menu-item-danger" : ""}`}
+                onClick={() => {
+                  closeMenu();
+                  action.onSelect();
+                }}
+              >
+                {action.icon}
+                {action.label}
+              </button>
+            ))}
+          </div>,
+          document.body,
+        )}
+    </>
   );
 }
 
@@ -269,6 +459,8 @@ function SidebarSectionHeader({
   onToggle,
   action,
 }: SidebarSectionHeaderProps) {
+  const hasCount = typeof count === "number" && count > 0;
+
   return (
     <div className="sb-section-label">
       <button
@@ -276,7 +468,7 @@ function SidebarSectionHeader({
         className="sb-section-toggle"
         aria-expanded={expanded}
         aria-controls={controlsId}
-        onClick={onToggle}
+        onClick={(event) => onToggle(event)}
         title={toggleTitle}
       >
         {expanded ? (
@@ -287,7 +479,11 @@ function SidebarSectionHeader({
         <span>{label}</span>
       </button>
       <div className="sb-section-meta">
-        <span className="sb-project-count">{count}</span>
+        {hasCount ? (
+          <span className="sb-project-count">{count}</span>
+        ) : (
+          <span className="sb-project-count-placeholder" aria-hidden="true" />
+        )}
       </div>
       <div className="sb-section-action">
         {action ?? <span className="sb-section-action-placeholder" aria-hidden="true" />}
@@ -307,36 +503,66 @@ function readLegacyDefaultScanDepth(): number | undefined {
   return parsed;
 }
 
-function readSidebarSectionState(): SidebarSectionState {
+function normalizePinnedProjects(
+  input: unknown,
+): SidebarPinnedProjects {
+  if (!input || typeof input !== "object") {
+    return {};
+  }
+
+  return Object.entries(input as Record<string, unknown>).reduce<SidebarPinnedProjects>(
+    (acc, [projectKey, pinnedAt]) => {
+      if (typeof pinnedAt !== "string") {
+        return acc;
+      }
+
+      const normalizedKey = projectKey.trim();
+      if (!normalizedKey) {
+        return acc;
+      }
+
+      const parsed = Date.parse(pinnedAt);
+      if (!Number.isFinite(parsed)) {
+        return acc;
+      }
+
+      acc[normalizedKey] = new Date(parsed).toISOString();
+      return acc;
+    },
+    {},
+  );
+}
+
+function readSidebarPersistentState(): SidebarPersistentState {
   try {
-    const raw = window.localStorage.getItem(SIDEBAR_SECTION_STATE_STORAGE_KEY);
+    const raw = window.localStorage.getItem(SIDEBAR_PERSISTENCE_STORAGE_KEY);
     if (!raw) {
       return {
-        openProjectsCollapsed: false,
         projectLibraryCollapsed: false,
+        pinnedProjects: {},
       };
     }
 
-    const parsed = JSON.parse(raw) as Partial<SidebarSectionState> | null;
+    const parsed = JSON.parse(raw) as Partial<SidebarPersistentState> | null;
     if (!parsed || typeof parsed !== "object") {
-      throw new Error("invalid sidebar section state");
+      throw new Error("invalid sidebar persistent state");
     }
 
     return {
-      openProjectsCollapsed: parsed.openProjectsCollapsed === true,
       projectLibraryCollapsed: parsed.projectLibraryCollapsed === true,
+      pinnedProjects: normalizePinnedProjects(parsed.pinnedProjects),
     };
   } catch {
     return {
-      openProjectsCollapsed: false,
       projectLibraryCollapsed: false,
+      pinnedProjects: {},
     };
   }
 }
 
-function writeSidebarSectionState(state: SidebarSectionState): void {
+function writeSidebarPersistentState(state: SidebarPersistentState): void {
   try {
-    window.localStorage.setItem(SIDEBAR_SECTION_STATE_STORAGE_KEY, JSON.stringify(state));
+    window.localStorage.setItem(SIDEBAR_PERSISTENCE_STORAGE_KEY, JSON.stringify(state));
   } catch {
     // Ignore persistence failures.
   }
@@ -361,10 +587,12 @@ function SidebarContent() {
     activeThreadId,
     setActiveThread,
     removeThread,
+    deleteThread,
     restoreThread,
     createThread,
     refreshArchivedThreads,
     attachCodexRemoteThread,
+    setThreadPinned,
   } = useThreadStore();
   const openOnboarding = useOnboardingStore((state) => state.openOnboarding);
   const selectedChatEngines = useOnboardingStore((state) => state.selectedChatEngines);
@@ -392,17 +620,16 @@ function SidebarContent() {
   const refreshDetectedCodexProjects = useCodexProfileStore((s) => s.refreshDetectedProjects);
   const ensureActiveCodexProfile = useCodexProfileStore((s) => s.ensureActiveProfile);
   const openCodexProfilesModal = useCodexProfileStore((s) => s.openModal);
-  const openWorkspaceIds = useProjectTabsStore((s) => s.openWorkspaceIds);
-  const tabThreadIdsByWorkspace = useProjectTabsStore((s) => s.tabThreadIdsByWorkspace);
   const switchToWorkspaceTabs = useProjectTabsStore((s) => s.switchToWorkspace);
   const switchToThreadTabs = useProjectTabsStore((s) => s.switchToThread);
-  const closeProjectWorkspace = useProjectTabsStore((s) => s.closeWorkspace);
-  const closeProjectThreadTab = useProjectTabsStore((s) => s.closeThreadTab);
   const hasUpdate = updateStatus === "available" && !updateSnoozed;
   const keepAwakeAvailable = canToggleKeepAwake(keepAwakeState);
   const preferredOnboardingChatSelection = useMemo(
     () => resolvePreferredOnboardingChatSelection(selectedChatEngines, engines),
     [engines, selectedChatEngines],
+  );
+  const [sidebarPersistence, setSidebarPersistence] = useState<SidebarPersistentState>(() =>
+    readSidebarPersistentState(),
   );
 
   const workspaceProjects = useMemo<ProjectGroup[]>(
@@ -413,93 +640,30 @@ function SidebarContent() {
       })),
     [workspaces, threads],
   );
-  const detectedCodexProjectsByWorkspaceId = useMemo(
-    () =>
-      detectedCodexProjects.reduce<Record<string, CodexDetectedProject>>((acc, project) => {
-        if (project.workspaceId) {
-          acc[project.workspaceId] = project;
-        }
-        return acc;
-      }, {}),
-    [detectedCodexProjects],
-  );
   const projectEntries = useMemo<UnifiedProjectGroup[]>(() => {
-    const importedProjects = workspaceProjects.map((project) => {
-      const detectedCodexProject =
-        detectedCodexProjectsByWorkspaceId[project.workspace.id] ?? null;
-      const attachedEngineThreadIds = new Set(
-        project.threads
-          .map((thread) => thread.engineThreadId)
-          .filter((engineThreadId): engineThreadId is string => Boolean(engineThreadId)),
-      );
-      const detectedConversations = (detectedCodexProject?.threads ?? [])
-        .filter((thread) => !attachedEngineThreadIds.has(thread.engineThreadId))
-        .map<SidebarConversation>((thread) => ({
-          kind: "detected",
-          key: `detected:${thread.profileId}:${thread.engineThreadId}`,
-          updatedAt: thread.updatedAt,
-          detectedThread: thread,
-        }));
-      const localConversations = project.threads.map<SidebarConversation>((thread) => ({
-        kind: "local",
-        key: `local:${thread.id}`,
-        updatedAt: thread.lastActivityAt,
-        localThread: thread,
-      }));
-      const conversations = [...localConversations, ...detectedConversations].sort(
-        (left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime(),
-      );
+    const entries = buildSidebarProjectEntries(
+      workspaceProjects,
+      detectedCodexProjects,
+      sidebarPersistence.pinnedProjects,
+    );
 
-      return {
-        key: project.workspace.id,
-        path: project.workspace.rootPath,
-        name: getWorkspaceLabel(project.workspace),
-        workspace: project.workspace,
-        detectedCodexProject,
-        conversations,
-        totalConversationCount: conversations.length,
-        latestActivityAt:
-          conversations[0]?.updatedAt ??
-          detectedCodexProject?.lastActivityAt ??
-          project.workspace.lastOpenedAt,
-      };
-    });
-
-    const externalProjects = detectedCodexProjects
-      .filter((project) => !project.workspaceId)
-      .map<UnifiedProjectGroup>((project) => ({
-        key: `detected:${project.path}`,
-        path: project.path,
-        name: project.name,
-        workspace: null,
-        detectedCodexProject: project,
-        conversations: project.threads
-          .map<SidebarConversation>((thread) => ({
-            kind: "detected",
-            key: `detected:${thread.profileId}:${thread.engineThreadId}`,
-            updatedAt: thread.updatedAt,
-            detectedThread: thread,
-          }))
-          .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()),
-        totalConversationCount: project.threads.length,
-        latestActivityAt: project.lastActivityAt,
-      }));
-
-    return [...importedProjects, ...externalProjects].sort((left, right) => {
-      const timeDiff =
-        new Date(right.latestActivityAt).getTime() - new Date(left.latestActivityAt).getTime();
-      if (timeDiff !== 0) {
-        return timeDiff;
-      }
-      return left.name.localeCompare(right.name, undefined, { sensitivity: "base" });
-    });
-  }, [detectedCodexProjects, detectedCodexProjectsByWorkspaceId, threads, workspaceProjects]);
+    return entries.map((entry) =>
+      entry.workspace
+        ? {
+            ...entry,
+            name: getWorkspaceLabel(entry.workspace),
+          }
+        : entry,
+    );
+  }, [
+    detectedCodexProjects,
+    sidebarPersistence.pinnedProjects,
+    threads,
+    workspaceProjects,
+  ]);
 
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [showAll, setShowAll] = useState<Record<string, boolean>>({});
-  const [sidebarSections, setSidebarSections] = useState<SidebarSectionState>(() =>
-    readSidebarSectionState(),
-  );
   const [pendingActionKeys, setPendingActionKeys] = useState<Record<string, true>>({});
   const [archivedOpen, setArchivedOpen] = useState(false);
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
@@ -509,8 +673,11 @@ function SidebarContent() {
   const [archiveThreadPrompt, setArchiveThreadPrompt] = useState<{
     thread: Thread;
   } | null>(null);
+  const [deleteThreadPrompt, setDeleteThreadPrompt] = useState<{
+    thread: Thread;
+  } | null>(null);
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
-  const [settingsMenuPos, setSettingsMenuPos] = useState({ top: 0, left: 0 });
+  const [settingsMenuPos, setSettingsMenuPos] = useState({ bottom: 0, left: 0 });
   const [terminalAcceleratedRendering, setTerminalAcceleratedRendering] = useState(true);
   const pendingActionKeysRef = useRef<Set<string>>(new Set());
   const settingsMenuRef = useRef<HTMLDivElement>(null);
@@ -557,8 +724,23 @@ function SidebarContent() {
   );
 
   useEffect(() => {
-    writeSidebarSectionState(sidebarSections);
-  }, [sidebarSections]);
+    writeSidebarPersistentState(sidebarPersistence);
+  }, [sidebarPersistence]);
+
+  useEffect(() => {
+    setCollapsed((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const project of projectEntries) {
+        if (Object.prototype.hasOwnProperty.call(next, project.key)) {
+          continue;
+        }
+        next[project.key] = true;
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [projectEntries]);
 
   useEffect(() => {
     if (!settingsMenuOpen) return;
@@ -604,45 +786,18 @@ function SidebarContent() {
 
   const archivedThreads = useMemo(
     () =>
-      activeWorkspaceId
-        ? archivedThreadsByWorkspace[activeWorkspaceId] ?? []
-        : [],
-    [archivedThreadsByWorkspace, activeWorkspaceId],
+      Object.values(archivedThreadsByWorkspace)
+        .flat()
+        .sort((left, right) =>
+          new Date(right.lastActivityAt).getTime() - new Date(left.lastActivityAt).getTime(),
+        ),
+    [archivedThreadsByWorkspace],
   );
-  const openProjectEntries = useMemo(
-    () =>
-      openWorkspaceIds
-        .map((workspaceId) =>
-          projectEntries.find((project) => project.workspace?.id === workspaceId) ?? null,
-        )
-        .filter((project): project is UnifiedProjectGroup => project !== null),
-    [openWorkspaceIds, projectEntries],
-  );
-  const projectLibraryEntries = useMemo(
-    () =>
-      projectEntries.filter((project) => {
-        const workspaceId = project.workspace?.id;
-        return !workspaceId || !openWorkspaceIds.includes(workspaceId);
-      }),
-    [openWorkspaceIds, projectEntries],
-  );
-  const openProjectsCollapsed = sidebarSections.openProjectsCollapsed;
-  const projectLibraryCollapsed = sidebarSections.projectLibraryCollapsed;
-  const openProjectsSectionId = "sidebar-open-projects";
+  const projectLibraryCollapsed = sidebarPersistence.projectLibraryCollapsed;
   const projectLibrarySectionId = "sidebar-project-library";
 
   const toggleCollapse = (projectKey: string) =>
-    setCollapsed((prev) => ({ ...prev, [projectKey]: !prev[projectKey] }));
-  const toggleOpenProjectsCollapsed = () =>
-    setSidebarSections((prev) => ({
-      ...prev,
-      openProjectsCollapsed: !prev.openProjectsCollapsed,
-    }));
-  const toggleProjectLibraryCollapsed = () =>
-    setSidebarSections((prev) => ({
-      ...prev,
-      projectLibraryCollapsed: !prev.projectLibraryCollapsed,
-    }));
+    setCollapsed((prev) => ({ ...prev, [projectKey]: !(prev[projectKey] ?? true) }));
 
   function getProjectOpenActionKey(project: UnifiedProjectGroup) {
     return `sidebar:open-project:${project.key}`;
@@ -659,39 +814,146 @@ function SidebarContent() {
     return `sidebar:attach-thread:${project.key}:${detectedThread.profileId}:${detectedThread.engineThreadId}`;
   }
 
+  function getTogglePinnedActionKey(threadId: string) {
+    return `sidebar:toggle-pin:${threadId}`;
+  }
+
+  function onToggleProjectPinned(project: UnifiedProjectGroup) {
+    setSidebarPersistence((prev) => {
+      const nextPinnedProjects = { ...prev.pinnedProjects };
+      if (isProjectPinned(project.key, prev.pinnedProjects)) {
+        delete nextPinnedProjects[project.key];
+      } else {
+        nextPinnedProjects[project.key] = new Date().toISOString();
+      }
+      return {
+        ...prev,
+        pinnedProjects: nextPinnedProjects,
+      };
+    });
+  }
+
   useEffect(() => {
     void refreshArchivedWorkspaces();
   }, [refreshArchivedWorkspaces]);
 
   useEffect(() => {
-    if (!activeWorkspaceId) return;
-    void refreshArchivedThreads(activeWorkspaceId);
-  }, [activeWorkspaceId, refreshArchivedThreads]);
+    workspaces.forEach((workspace) => {
+      void refreshArchivedThreads(workspace.id);
+    });
+  }, [refreshArchivedThreads, workspaces]);
 
   async function onOpenFolder() {
     const selected = await open({ directory: true, multiple: false });
     if (!selected || Array.isArray(selected)) return;
-    await openWorkspace(selected, readLegacyDefaultScanDepth());
+    const workspace = await openWorkspace(selected, readLegacyDefaultScanDepth());
+    if (workspace) {
+      setCollapsed((prev) => ({ ...prev, [workspace.id]: false }));
+    }
   }
 
   async function onSelectThread(thread: Thread) {
     await switchToThreadTabs(thread);
   }
 
+  async function ensureLocalThreadForDetectedConversation(
+    project: UnifiedProjectGroup,
+    detectedThread: CodexDetectedProject["threads"][number],
+    options?: {
+      activate?: boolean;
+      revealProject?: boolean;
+    },
+  ): Promise<Thread | null> {
+    const activate = options?.activate !== false;
+    const revealProject = options?.revealProject !== false;
+
+    try {
+      const attached = await runWithSidebarActionLock(
+        getDetectedConversationActionKey(project, detectedThread),
+        async () => {
+          await ensureActiveCodexProfile(detectedThread.profileId);
+
+          const workspace = await ensureWorkspaceForProject(project);
+          if (!workspace) {
+            return null;
+          }
+
+          if (revealProject) {
+            setCollapsed((prev) => ({ ...prev, [workspace.id]: false }));
+          }
+
+          const existingThread = useThreadStore
+            .getState()
+            .threads.find(
+              (thread) =>
+                thread.workspaceId === workspace.id &&
+                thread.engineId === "codex" &&
+                thread.engineThreadId === detectedThread.engineThreadId,
+            );
+          if (existingThread) {
+            if (activate) {
+              await switchToThreadTabs(existingThread);
+            }
+            return existingThread;
+          }
+
+          const attachedThread = await attachCodexRemoteThread(
+            workspace.id,
+            detectedThread.engineThreadId,
+            preferredCodexModelId,
+            { activate },
+          );
+          if (!attachedThread) {
+            throw new Error("Failed to resume Codex CLI conversation.");
+          }
+
+          if (activate) {
+            await switchToThreadTabs(attachedThread);
+          }
+          await refreshDetectedCodexProjects();
+          return attachedThread;
+        },
+      );
+      return attached ?? null;
+    } catch (error) {
+      toast.error(String(error));
+      return null;
+    }
+  }
+
   async function ensureWorkspaceForProject(
     project: UnifiedProjectGroup,
+    options?: {
+      activate?: boolean;
+    },
   ): Promise<Workspace | null> {
-    if (project.workspace) {
-      return project.workspace;
+    const activate = options?.activate !== false;
+    const existingWorkspace =
+      project.workspace
+      ?? useWorkspaceStore.getState().workspaces.find((workspace) => workspace.rootPath === project.path)
+      ?? null;
+    if (existingWorkspace) {
+      return existingWorkspace;
     }
 
-    const workspace = await openWorkspace(project.path, readLegacyDefaultScanDepth());
+    const workspace = await openWorkspace(project.path, readLegacyDefaultScanDepth(), {
+      activate,
+    });
     if (!workspace) {
       return null;
     }
 
     await refreshDetectedCodexProjects();
     return workspace;
+  }
+
+  async function onArchiveProject(project: UnifiedProjectGroup) {
+    const workspace = await ensureWorkspaceForProject(project, { activate: false });
+    if (!workspace) {
+      return;
+    }
+
+    onDeleteWorkspace(workspace);
   }
 
   async function onSelectProject(project: UnifiedProjectGroup) {
@@ -709,14 +971,10 @@ function SidebarContent() {
         return;
       }
 
-      setCollapsed(
-        Object.fromEntries(
-          projectEntries.map((entry) => [
-            entry.workspace?.id ?? entry.key,
-            (entry.workspace?.id ?? entry.key) !== workspace.id,
-          ]),
-        ),
-      );
+      setCollapsed((prev) => ({
+        ...prev,
+        [workspace.id]: false,
+      }));
       await switchToWorkspaceTabs(workspace.id);
     });
   }
@@ -763,7 +1021,7 @@ function SidebarContent() {
     }
   }
 
-  function onDeleteThread(thread: Thread) {
+  function onArchiveThread(thread: Thread) {
     setArchiveThreadPrompt({ thread });
   }
 
@@ -771,10 +1029,66 @@ function SidebarContent() {
     setArchiveThreadPrompt(null);
     const wasActive = thread.id === activeThreadId;
     await removeThread(thread.id);
+    await refreshDetectedCodexProjects();
     if (wasActive) {
       setActiveThread(null);
       await bindChatThread(null);
     }
+  }
+
+  function onDeleteThreadPermanently(thread: Thread) {
+    setDeleteThreadPrompt({ thread });
+  }
+
+  async function executeDeleteThread(thread: Thread) {
+    setDeleteThreadPrompt(null);
+    const wasActive = thread.id === activeThreadId;
+    await deleteThread(thread.id);
+    await refreshDetectedCodexProjects();
+    if (wasActive) {
+      setActiveThread(null);
+      await bindChatThread(null);
+    }
+  }
+
+  async function onToggleThreadPinned(thread: Thread) {
+    const nextPinned = !isThreadPinned(thread);
+    const updated = await runWithSidebarActionLock(getTogglePinnedActionKey(thread.id), () =>
+      setThreadPinned(thread.id, nextPinned),
+    );
+    if (updated === null) {
+      toast.error(t("app:sidebar.updateThreadPinFailed"));
+    }
+  }
+
+  async function onToggleDetectedThreadPinned(
+    project: UnifiedProjectGroup,
+    detectedThread: CodexDetectedProject["threads"][number],
+  ) {
+    const localThread = await ensureLocalThreadForDetectedConversation(project, detectedThread, {
+      activate: false,
+      revealProject: true,
+    });
+    if (!localThread) {
+      return;
+    }
+
+    await onToggleThreadPinned(localThread);
+  }
+
+  async function onArchiveDetectedThread(
+    project: UnifiedProjectGroup,
+    detectedThread: CodexDetectedProject["threads"][number],
+  ) {
+    const localThread = await ensureLocalThreadForDetectedConversation(project, detectedThread, {
+      activate: false,
+      revealProject: true,
+    });
+    if (!localThread) {
+      return;
+    }
+
+    onArchiveThread(localThread);
   }
 
   async function onRestoreWorkspace(workspace: Workspace) {
@@ -837,45 +1151,10 @@ function SidebarContent() {
     project: UnifiedProjectGroup,
     detectedThread: CodexDetectedProject["threads"][number],
   ) {
-    try {
-      await runWithSidebarActionLock(
-        getDetectedConversationActionKey(project, detectedThread),
-        async () => {
-          await ensureActiveCodexProfile(detectedThread.profileId);
-
-          const workspace = await ensureWorkspaceForProject(project);
-          if (!workspace) {
-            return;
-          }
-
-          const existingThread = threads.find(
-            (thread) =>
-              thread.workspaceId === workspace.id &&
-              thread.engineId === "codex" &&
-              thread.engineThreadId === detectedThread.engineThreadId,
-          );
-          if (existingThread) {
-            await onSelectThread(existingThread);
-            return;
-          }
-
-          const attachedThread = await attachCodexRemoteThread(
-            workspace.id,
-            detectedThread.engineThreadId,
-            preferredCodexModelId,
-          );
-          if (!attachedThread) {
-            throw new Error("Failed to resume Codex CLI conversation.");
-          }
-
-          setCollapsed((prev) => ({ ...prev, [workspace.id]: false }));
-          await switchToThreadTabs(attachedThread);
-          await refreshDetectedCodexProjects();
-        },
-      );
-    } catch (error) {
-      toast.error(String(error));
-    }
+    await ensureLocalThreadForDetectedConversation(project, detectedThread, {
+      activate: true,
+      revealProject: true,
+    });
   }
 
   const keepAwakeDescription = useMemo(() => {
@@ -924,6 +1203,34 @@ function SidebarContent() {
     (terminalNotificationLoading && !terminalNotificationLoadedOnce)
     || terminalNotificationUpdatingChatEnabled
     || terminalNotificationUpdatingTerminalEnabled;
+
+  const toggleProjectLibraryCollapsed = useCallback(
+    (event: ReactMouseEvent<HTMLButtonElement>) => {
+      const shouldExpandAll = event.shiftKey;
+      const shouldCollapseAll = event.ctrlKey || event.metaKey;
+
+      if (shouldExpandAll || shouldCollapseAll) {
+        setSidebarPersistence((prev) => ({
+          ...prev,
+          projectLibraryCollapsed: false,
+        }));
+        setCollapsed((prev) => {
+          const next = { ...prev };
+          for (const project of projectEntries) {
+            next[project.key] = shouldCollapseAll;
+          }
+          return next;
+        });
+        return;
+      }
+
+      setSidebarPersistence((prev) => ({
+        ...prev,
+        projectLibraryCollapsed: !prev.projectLibraryCollapsed,
+      }));
+    },
+    [projectEntries],
+  );
 
   return (
     <div
@@ -978,150 +1285,8 @@ function SidebarContent() {
 
       {/* ── Scrollable content ── */}
       <div className="sb-scroll">
-        {openProjectEntries.length > 0 && (
-          <>
-            <SidebarSectionHeader
-              label={t("app:sidebar.openProjects")}
-              count={openProjectEntries.length}
-              expanded={!openProjectsCollapsed}
-              controlsId={openProjectsSectionId}
-              onToggle={toggleOpenProjectsCollapsed}
-              toggleTitle={
-                openProjectsCollapsed
-                  ? t("app:sidebar.showOpenProjects")
-                  : t("app:sidebar.hideOpenProjects")
-              }
-            />
-            {!openProjectsCollapsed && (
-              <div id={openProjectsSectionId} className="sb-open-projects-list">
-                {openProjectEntries.map((project) => {
-                  const workspace = project.workspace;
-                  if (!workspace) {
-                    return null;
-                  }
-                  const isActive = workspace.id === activeWorkspaceId;
-                  const isCollapsed = collapsed[workspace.id] ?? false;
-                  const openThreadIds = new Set(tabThreadIdsByWorkspace[workspace.id] ?? []);
-                  return (
-                    <div key={workspace.id} className="sb-open-project-entry">
-                      <SidebarProjectRow
-                        label={getWorkspaceLabel(workspace)}
-                        count={project.totalConversationCount}
-                        active={isActive}
-                        collapsed={isCollapsed}
-                        icon={
-                          <FolderGit2
-                            size={14}
-                            style={{
-                              flexShrink: 0,
-                              color: isActive ? "var(--accent)" : "var(--text-3)",
-                            }}
-                          />
-                        }
-                        onClick={() => {
-                          if (isActive) {
-                            toggleCollapse(workspace.id);
-                            return;
-                          }
-                          setCollapsed((prev) => ({ ...prev, [workspace.id]: false }));
-                          void switchToWorkspaceTabs(workspace.id);
-                        }}
-                        onMiddleClick={() => {
-                          void closeProjectWorkspace(workspace.id);
-                        }}
-                        trailing={
-                          <button
-                            type="button"
-                            className="sb-project-archive"
-                            title={t("app:sidebar.closeOpenProject")}
-                            aria-label={t("app:sidebar.closeOpenProject")}
-                            onMouseDown={(event) => event.stopPropagation()}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              void closeProjectWorkspace(workspace.id);
-                            }}
-                          >
-                            <X size={11} />
-                          </button>
-                        }
-                      />
-
-                      {!isCollapsed && project.conversations.length > 0 && (
-                        <div className="sb-open-project-tabs">
-                          {project.conversations.map((conversation) => {
-                            const localThread =
-                              conversation.kind === "local" ? conversation.localThread : null;
-                            const detectedThread =
-                              conversation.kind === "detected"
-                                ? conversation.detectedThread
-                                : null;
-                            const isOpenTab = Boolean(localThread && openThreadIds.has(localThread.id));
-
-                            return (
-                              <SidebarConversationRow
-                                key={conversation.key}
-                                label={
-                                  localThread
-                                    ? getThreadLabel(localThread)
-                                    : (detectedThread?.title ?? "")
-                                }
-                                timeLabel={
-                                  localThread
-                                    ? (
-                                        localThread.lastActivityAt
-                                          ? formatRelativeTime(localThread.lastActivityAt, i18n.language)
-                                          : ""
-                                      )
-                                    : (detectedThread
-                                        ? formatRelativeTime(detectedThread.updatedAt, i18n.language)
-                                        : "")
-                                }
-                                active={Boolean(localThread && localThread.id === activeThreadId)}
-                                animationDelayMs={0}
-                                className="sb-open-project-tab-row"
-                                onClick={() => {
-                                  if (localThread) {
-                                    void switchToThreadTabs(localThread);
-                                    return;
-                                  }
-                                  if (detectedThread) {
-                                    void onSelectDetectedConversation(project, detectedThread);
-                                  }
-                                }}
-                                onMiddleClick={
-                                  isOpenTab && localThread
-                                    ? () => {
-                                        void closeProjectThreadTab(workspace.id, localThread.id);
-                                      }
-                                    : undefined
-                                }
-                                trailingAction={
-                                  isOpenTab && localThread
-                                    ? {
-                                        title: t("chat:panel.projectTabs.closeTab"),
-                                        icon: <X size={11} />,
-                                        onClick: () => {
-                                          void closeProjectThreadTab(workspace.id, localThread.id);
-                                        },
-                                      }
-                                    : undefined
-                                }
-                              />
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </>
-        )}
-
         <SidebarSectionHeader
           label={t("app:sidebar.projects")}
-          count={projectLibraryEntries.length}
           expanded={!projectLibraryCollapsed}
           controlsId={projectLibrarySectionId}
           onToggle={toggleProjectLibraryCollapsed}
@@ -1145,7 +1310,7 @@ function SidebarContent() {
           )}
         />
 
-        {projectLibraryCollapsed ? null : projectLibraryEntries.length === 0 ? (
+        {projectLibraryCollapsed ? null : projectEntries.length === 0 ? (
           <div className="sb-empty">
             {t("app:sidebar.noProjects")}
             <br />
@@ -1153,11 +1318,11 @@ function SidebarContent() {
           </div>
         ) : (
           <div id={projectLibrarySectionId} className="sb-project-library">
-            {projectLibraryEntries.map((project) => {
+            {projectEntries.map((project) => {
             const workspace = project.workspace;
             const isActiveProject =
               !!workspace && workspace.id === activeWorkspaceId;
-            const isCollapsed = collapsed[project.key] ?? false;
+            const isCollapsed = collapsed[project.key] ?? true;
             const isShowingAll = showAll[project.key] ?? false;
             const projectOpenActionPending = isSidebarActionPending(
               getProjectOpenActionKey(project),
@@ -1172,10 +1337,26 @@ function SidebarContent() {
                 {/* Project header */}
                 <SidebarProjectRow
                   label={project.name}
-                  count={project.totalConversationCount}
                   active={isActiveProject}
                   collapsed={isCollapsed}
                   disabled={projectOpenActionPending}
+                  leadingAction={{
+                    title: project.isPinnedProject
+                      ? t("app:sidebar.unpinProject")
+                      : t("app:sidebar.pinProject"),
+                    icon: <Pin size={11} style={{ transform: "rotate(-35deg)" }} />,
+                    active: project.isPinnedProject,
+                    onClick: () => onToggleProjectPinned(project),
+                  }}
+                  metaAction={
+                    {
+                      title: t("app:sidebar.archiveProject"),
+                      icon: <Archive size={12} />,
+                      onClick: () => {
+                        void onArchiveProject(project);
+                      },
+                    }
+                  }
                   icon={
                     <FolderGit2
                       size={14}
@@ -1198,13 +1379,18 @@ function SidebarContent() {
                     }
                   }}
                   trailing={
-                    workspace ? (
-                      <WorkspaceMoreMenu
-                        workspace={workspace}
-                        onOpenSettings={() => openWorkspaceSettings(workspace.id)}
-                        onArchive={() => onDeleteWorkspace(workspace)}
-                      />
-                    ) : undefined
+                    <WorkspaceMoreMenu
+                      workspace={workspace}
+                      onResolveWorkspace={() =>
+                        ensureWorkspaceForProject(project, { activate: false })
+                      }
+                      onOpenSettings={(resolvedWorkspace) => {
+                        openWorkspaceSettings(resolvedWorkspace.id);
+                      }}
+                      onArchive={(resolvedWorkspace) => {
+                        onDeleteWorkspace(resolvedWorkspace);
+                      }}
+                    />
                   }
                 />
 
@@ -1228,6 +1414,10 @@ function SidebarContent() {
                               ? isSidebarActionPending(
                                   getDetectedConversationActionKey(project, detectedThread),
                                 )
+                              : false;
+                          const toggleThreadPinnedActionPending =
+                            localThread
+                              ? isSidebarActionPending(getTogglePinnedActionKey(localThread.id))
                               : false;
                           return (
                             <SidebarConversationRow
@@ -1256,7 +1446,26 @@ function SidebarContent() {
                                   ? undefined
                                   : (detectedThread?.archived ? 0.58 : 1)
                               }
-                              disabled={detectedConversationActionPending}
+                              disabled={
+                                detectedConversationActionPending || toggleThreadPinnedActionPending
+                              }
+                              leadingAction={{
+                                title:
+                                  localThread && isThreadPinned(localThread)
+                                    ? t("app:sidebar.unpinThread")
+                                    : t("app:sidebar.pinThread"),
+                                icon: <Pin size={11} style={{ transform: "rotate(-35deg)" }} />,
+                                active: localThread ? isThreadPinned(localThread) : false,
+                                onClick: () => {
+                                  if (localThread) {
+                                    void onToggleThreadPinned(localThread);
+                                    return;
+                                  }
+                                  if (detectedThread) {
+                                    void onToggleDetectedThreadPinned(project, detectedThread);
+                                  }
+                                },
+                              }}
                               onClick={() => {
                                 if (localThread) {
                                   void onSelectThread(localThread);
@@ -1266,16 +1475,53 @@ function SidebarContent() {
                                   void onSelectDetectedConversation(project, detectedThread);
                                 }
                               }}
-                              trailingAction={
-                                localThread
-                                  ? {
-                                      title: t("app:sidebar.archiveThread"),
-                                      icon: <Archive size={11} />,
-                                      onClick: () => {
-                                        void onDeleteThread(localThread);
-                                      },
+                              metaAction={
+                                {
+                                  title: t("app:sidebar.archiveThread"),
+                                  icon: <Archive size={11} />,
+                                  onClick: () => {
+                                    if (localThread) {
+                                      onArchiveThread(localThread);
+                                      return;
                                     }
-                                  : undefined
+                                    if (detectedThread) {
+                                      void onArchiveDetectedThread(project, detectedThread);
+                                    }
+                                  },
+                                }
+                              }
+                              trailing={
+                                (
+                                  <SidebarConversationMoreMenu
+                                    actions={
+                                      localThread
+                                        ? [
+                                            {
+                                              key: "delete",
+                                              label: t("app:sidebar.deleteThread"),
+                                              icon: <Trash2 size={13} />,
+                                              danger: true,
+                                              onSelect: () => {
+                                                onDeleteThreadPermanently(localThread);
+                                              },
+                                            },
+                                          ]
+                                        : detectedThread
+                                          ? [
+                                              {
+                                                key: "archive",
+                                                label: t("app:sidebar.archiveThread"),
+                                                icon: <Archive size={13} />,
+                                                onSelect: () => {
+                                                  void onArchiveDetectedThread(project, detectedThread);
+                                                },
+                                              },
+                                            ]
+                                          : []
+                                    }
+                                    disabled={detectedConversationActionPending || toggleThreadPinnedActionPending}
+                                  />
+                                )
                               }
                             />
                           );
@@ -1311,22 +1557,28 @@ function SidebarContent() {
 
         {/* Archived section */}
         <div className="sb-archived-section">
-          <button
-            type="button"
-            className="sb-archived-toggle"
-            onClick={() => setArchivedOpen((c) => !c)}
-          >
-            {archivedOpen ? (
-              <ChevronDown size={11} style={{ flexShrink: 0, opacity: 0.6 }} />
-            ) : (
-              <ChevronRight size={11} style={{ flexShrink: 0, opacity: 0.6 }} />
-            )}
-            <Archive size={11} style={{ flexShrink: 0, opacity: 0.6 }} />
-            <span style={{ flex: 1, textAlign: "left" }}>{t("app:sidebar.archived")}</span>
-            <span className="sb-project-count">
-              {archivedWorkspaces.length + archivedThreads.length}
-            </span>
-          </button>
+          <div className="sb-archived-header">
+            <button
+              type="button"
+              className="sb-archived-toggle"
+              onClick={() => setArchivedOpen((c) => !c)}
+            >
+              {archivedOpen ? (
+                <ChevronDown size={11} style={{ flexShrink: 0, opacity: 0.6 }} />
+              ) : (
+                <ChevronRight size={11} style={{ flexShrink: 0, opacity: 0.6 }} />
+              )}
+              <span className="sb-archived-title">{t("app:sidebar.archived")}</span>
+            </button>
+            <div className="sb-section-meta">
+              <span className="sb-project-count-placeholder" aria-hidden="true" />
+            </div>
+            <div className="sb-section-action">
+              <span className="sb-project-count">
+                {archivedWorkspaces.length + archivedThreads.length}
+              </span>
+            </div>
+          </div>
 
           {archivedOpen && (
             <div className="sb-archived-list">
@@ -1401,9 +1653,14 @@ function SidebarContent() {
               closeSettingsMenu();
               return;
             }
-            const rect = settingsTriggerRef.current?.getBoundingClientRect();
-            if (rect) {
-              setSettingsMenuPos({ top: rect.top - 4, left: rect.left });
+            const rawRect = settingsTriggerRef.current?.getBoundingClientRect();
+            if (rawRect) {
+              const rect = normalizeClientRectForFixedPosition(rawRect);
+              const viewport = readFixedViewportSize();
+              setSettingsMenuPos({
+                bottom: Math.max(8, viewport.height - rect.top + 4),
+                left: Math.max(8, Math.min(rect.left, viewport.width - 268)),
+              });
             }
             setSettingsMenuOpen(true);
           }}
@@ -1425,7 +1682,7 @@ function SidebarContent() {
             className="git-action-menu"
             style={{
               position: "fixed",
-              bottom: window.innerHeight - settingsMenuPos.top,
+              bottom: settingsMenuPos.bottom,
               left: settingsMenuPos.left,
               minWidth: 260,
             }}
@@ -1713,6 +1970,26 @@ function SidebarContent() {
             if (archiveThreadPrompt) void executeArchiveThread(archiveThreadPrompt.thread);
           }}
           onCancel={() => setArchiveThreadPrompt(null)}
+        />,
+        document.body,
+      )}
+
+      {createPortal(
+        <ConfirmDialog
+          open={deleteThreadPrompt !== null}
+          title={t("app:sidebar.deleteThreadTitle")}
+          message={
+            deleteThreadPrompt
+              ? t("app:sidebar.deleteThreadMessage", {
+                  name: getThreadLabel(deleteThreadPrompt.thread),
+                })
+              : ""
+          }
+          confirmLabel={t("app:sidebar.deleteThread")}
+          onConfirm={() => {
+            if (deleteThreadPrompt) void executeDeleteThread(deleteThreadPrompt.thread);
+          }}
+          onCancel={() => setDeleteThreadPrompt(null)}
         />,
         document.body,
       )}

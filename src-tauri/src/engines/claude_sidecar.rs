@@ -301,6 +301,30 @@ impl ClaudeTransport {
             }
         }
 
+        if let Ok(current_exe) = std::env::current_exe() {
+            if let Some(exe_dir) = current_exe.parent() {
+                let mut local_candidates = vec![
+                    exe_dir.join("claude-agent-sdk-server.mjs"),
+                    exe_dir
+                        .join("sidecar-dist")
+                        .join("claude-agent-sdk-server.mjs"),
+                ];
+                if let Some(parent) = exe_dir.parent() {
+                    local_candidates.push(
+                        parent
+                            .join("sidecar-dist")
+                            .join("claude-agent-sdk-server.mjs"),
+                    );
+                }
+
+                for candidate in local_candidates {
+                    if candidate.exists() {
+                        return Ok(candidate);
+                    }
+                }
+            }
+        }
+
         anyhow::bail!("claude agent sidecar script not found in dev or bundled resources")
     }
 
@@ -375,6 +399,18 @@ impl ClaudeSidecarEngine {
 
     pub async fn prewarm(&self) -> anyhow::Result<()> {
         self.ensure_transport().await.map(|_| ())
+    }
+
+    pub async fn shutdown(&self) {
+        let transport = {
+            let mut state = self.state.lock().await;
+            state.threads.clear();
+            state.transport.take()
+        };
+
+        if let Some(transport) = transport {
+            transport.kill().await;
+        }
     }
 
     /// Two-phase transport initialization to avoid holding the state mutex

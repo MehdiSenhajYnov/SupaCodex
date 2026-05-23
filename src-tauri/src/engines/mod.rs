@@ -468,6 +468,11 @@ impl EngineManager {
         }
     }
 
+    pub async fn shutdown(&self) {
+        self.codex.shutdown().await;
+        self.claude.shutdown().await;
+    }
+
     pub async fn list_codex_skills(&self, cwd: &str) -> anyhow::Result<Vec<CodexSkillDto>> {
         self.codex.list_skills(cwd).await
     }
