@@ -1,10 +1,9 @@
 node_modules/
 dist/
-.vite/
 .DS_Store
-src-tauri/target/
-src-tauri/gen/
-src-tauri/helper/build/
+native/target/
+native/gen/
+native/helper/build/
 *.log
 .agent-workspace/
 *.tsbuildinfo

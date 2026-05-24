@@ -1,75 +1,41 @@
 # Contributing to SupaCodex
 
-Thanks for contributing to SupaCodex.
+SupaCodex is a native Rust desktop app built with GTK4 and libadwaita.
 
-SupaCodex is a local-first desktop cockpit for AI-assisted coding. The project accepts external contributions, but merges stay maintainer-reviewed. Please assume that every change lands through a pull request and a final maintainer check.
-
-## Before you start
-
-- Open an issue first for large features, broad UX changes, or architectural refactors.
-- Small bug fixes, docs updates, and focused improvements can go straight to a pull request.
-- Keep changes scoped. Large mixed PRs are hard to review and slow down merge decisions.
-
-## Development setup
+## Setup
 
 Prerequisites:
 
 - Rust stable
-- Node.js 20+
-- pnpm 9+
-- Tauri v2 host prerequisites
-- `codex` on `PATH` if you want to exercise the Codex engine locally
+- GTK4 development libraries
+- libadwaita development libraries
+- `codex` on `PATH` when testing Codex conversations
 
-Install and run:
-
-```bash
-pnpm install
-pnpm tauri:dev
-```
-
-Useful checks:
+Run the app and checks:
 
 ```bash
-pnpm typecheck
-pnpm test
-pnpm build
-
-cd src-tauri
-cargo fmt -- --check
-cargo check
+npm run dev
+npm run lint
+npm run test
+npm run build
 ```
 
-## Contribution rules
+Equivalent Cargo commands:
 
-- Send changes through a branch in your fork and open a pull request against `master`.
-- Keep one PR focused on one problem.
-- Update docs when behavior, setup, or workflow changes.
-- If you add or change user-facing copy, update both locale resource sets under `src/i18n/resources/en/` and `src/i18n/resources/pt-BR/`.
-- Reuse the existing IPC/store patterns instead of introducing ad hoc flows.
-- Prefer active runtime paths over legacy or placeholder code paths.
+```bash
+cargo run --manifest-path native/Cargo.toml
+cargo check --manifest-path native/Cargo.toml
+cargo test --manifest-path native/Cargo.toml
+cargo build --manifest-path native/Cargo.toml --release
+```
 
-## Pull request expectations
+## Guidelines
 
-- Explain the problem and the chosen fix clearly.
-- Include screenshots or a short recording for visible UI changes.
-- Call out tradeoffs, follow-ups, or known gaps.
-- List the checks you ran locally.
-- Mark skipped validation explicitly instead of leaving reviewers to guess.
-
-## Review and merge policy
-
-- The maintainer is the final reviewer for merges.
-- `CODEOWNERS` routes repository-wide review requests to the maintainer.
-- GitHub branch protection/rulesets should require pull requests, passing checks, and resolved conversations before merge.
-- External approvals are welcome as feedback, but merge authority stays with the maintainer unless explicit write access is granted.
-
-## What tends to slow reviews down
-
-- Unrelated refactors bundled with a bug fix
-- Missing screenshots for UI changes
-- New strings without i18n updates
-- PRs that do not say which checks were run
-- Changes that bypass existing shared primitives without a strong reason
+- Keep visible UI aligned with GTK/libadwaita conventions.
+- Prefer native widgets and CSS classes over custom drawing.
+- Keep transparent surfaces transparent so external desktop blur/theme rules can apply.
+- Keep changes scoped and update docs when behavior or setup changes.
+- Include screenshots or recordings for visible UI changes.
 
 ## License
 
