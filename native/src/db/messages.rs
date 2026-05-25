@@ -1,6 +1,6 @@
 use anyhow::Context;
 use chrono::{Duration as ChronoDuration, Utc};
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use serde_json::Value;
@@ -17,6 +17,7 @@ use super::Database;
 pub struct ImportedThreadMessage {
     pub role: String,
     pub text: String,
+    pub blocks: Option<Value>,
     pub created_at: String,
 }
 
@@ -89,7 +90,10 @@ pub fn replace_thread_messages(
     .context("failed to clear existing thread messages")?;
 
     for message in messages {
-        let blocks = serde_json::json!([{ "type": "text", "content": message.text }]);
+        let blocks = message
+            .blocks
+            .clone()
+            .unwrap_or_else(|| serde_json::json!([{ "type": "text", "content": message.text }]));
         tx.execute(
             "INSERT INTO messages (
                 id, thread_id, role, content, blocks_json, schema_version, status,
@@ -273,6 +277,7 @@ pub fn update_assistant_blocks_json(
     status: MessageStatusDto,
     turn_model_id: Option<&str>,
 ) -> anyhow::Result<()> {
+    let started = Instant::now();
     let conn = db.connect()?;
     let normalized_blocks_json = normalize_blocks_json_for_message(&conn, message_id, blocks_json)?;
     conn.execute(
@@ -287,6 +292,12 @@ pub fn update_assistant_blocks_json(
         ],
     )
     .context("failed to update assistant blocks")?;
+    log::debug!(
+        "perf.sql.update_assistant_blocks_json: {:?}; message_id={}, bytes={}",
+        started.elapsed(),
+        message_id,
+        normalized_blocks_json.len()
+    );
     Ok(())
 }
 
@@ -351,6 +362,7 @@ pub fn update_assistant_turn_model_id(
 }
 
 pub fn get_thread_messages(db: &Database, thread_id: &str) -> anyhow::Result<Vec<MessageDto>> {
+    let started = Instant::now();
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
         "SELECT id, thread_id, role, content, blocks_json, schema_version, status,
@@ -367,6 +379,12 @@ pub fn get_thread_messages(db: &Database, thread_id: &str) -> anyhow::Result<Vec
         out.push(row?);
     }
     reconcile_answered_approvals_for_messages(&conn, &mut out)?;
+    log::debug!(
+        "perf.sql.get_thread_messages: {:?}; thread_id={}, rows={}",
+        started.elapsed(),
+        thread_id,
+        out.len()
+    );
 
     Ok(out)
 }
@@ -377,6 +395,7 @@ pub fn get_thread_messages_window(
     cursor: Option<&MessageWindowCursorDto>,
     limit: usize,
 ) -> anyhow::Result<MessageWindowDto> {
+    let started = Instant::now();
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
         "SELECT id, thread_id, role, content, blocks_json, schema_version, status,
@@ -446,10 +465,18 @@ pub fn get_thread_messages_window(
         .map(|(message, _)| message)
         .collect();
     reconcile_answered_approvals_for_messages(&conn, &mut messages)?;
-    Ok(MessageWindowDto {
+    let dto = MessageWindowDto {
         messages,
         next_cursor,
-    })
+    };
+    log::debug!(
+        "perf.sql.get_thread_messages_window: {:?}; thread_id={}, rows={}, has_more={}",
+        started.elapsed(),
+        thread_id,
+        dto.messages.len(),
+        dto.next_cursor.is_some()
+    );
+    Ok(dto)
 }
 
 pub fn get_message_blocks(db: &Database, message_id: &str) -> anyhow::Result<Option<Value>> {

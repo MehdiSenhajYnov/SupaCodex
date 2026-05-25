@@ -2181,6 +2181,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "env_logger",
  "futures",
+ "gdk-pixbuf",
  "git2",
  "gtk4",
  "libadwaita",

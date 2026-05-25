@@ -277,9 +277,17 @@ impl ThreadTranscriptMessageRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadTranscriptBlock {
+    Text { content: String },
+    Thinking { content: String },
+    Diff { diff: String, scope: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadTranscriptMessage {
     pub role: ThreadTranscriptMessageRole,
     pub content: String,
+    pub blocks: Vec<ThreadTranscriptBlock>,
 }
 
 #[derive(Debug, Clone)]

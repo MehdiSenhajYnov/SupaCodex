@@ -1,16 +1,20 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::Path,
     path::PathBuf,
     rc::Rc,
-    sync::{mpsc, Arc, Mutex},
-    time::Duration,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
 
 use adw::prelude::*;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use futures::{channel::mpsc as futures_mpsc, StreamExt};
 use gtk::{gdk, gio, glib};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -26,13 +30,14 @@ use crate::{
     config::app_config::{AppConfig, CodexProfileConfig},
     db,
     engines::{
-        approval_response_route_for_engine, normalize_approval_response_for_engine, EngineEvent,
-        OutputStream, SandboxPolicy, ThreadScope, TurnAttachment, TurnCompletionStatus, TurnInput,
-        TurnInputItem,
+        approval_response_route_for_engine, normalize_approval_response_for_engine, DiffScope,
+        EngineEvent, OutputStream, SandboxPolicy, ThreadScope, ThreadTranscriptBlock,
+        ThreadTranscriptMessage, TurnAttachment, TurnCompletionStatus, TurnInput, TurnInputItem,
     },
     git::multi_repo,
     models::{
-        MessageDto, MessageStatusDto, ThreadDto, ThreadStatusDto, TrustLevelDto, WorkspaceDto,
+        MessageDto, MessageStatusDto, MessageWindowCursorDto, ThreadDto, ThreadStatusDto,
+        TrustLevelDto, WorkspaceDto,
     },
 };
 
@@ -40,7 +45,21 @@ const APP_ID: &str = "com.supacodex.app";
 const DEFAULT_ENGINE_ID: &str = "codex";
 const DEFAULT_MODEL_ID: &str = "gpt-5.3-codex";
 const SIDEBAR_WIDTH: i32 = 320;
+const COMPOSER_SINGLE_LINE_HEIGHT: i32 = 36;
+const COMPOSER_LINE_HEIGHT: i32 = 24;
+const COMPOSER_MAX_HEIGHT: i32 = 132;
 const SIDEBAR_PROJECTS_INITIAL_HEIGHT: i32 = 390;
+const ATTACHMENT_PREVIEW_WIDTH: i32 = 96;
+const ATTACHMENT_PREVIEW_HEIGHT: i32 = 96;
+const ATTACHMENT_MENTION_TAG_NAME: &str = "attachment-mention";
+const INITIAL_MESSAGE_WINDOW_LIMIT: usize = 48;
+const BACKGROUND_MESSAGE_PAGE_LIMIT: usize = 160;
+const MESSAGE_SCROLL_SETTLE_PASSES: u8 = 4;
+const MESSAGE_SCROLL_SETTLE_INTERVAL: Duration = Duration::from_millis(32);
+const STREAM_UI_FLUSH_INTERVAL: Duration = Duration::from_millis(48);
+const STREAM_DB_FLUSH_INTERVAL: Duration = Duration::from_millis(260);
+const PERF_WARN_THRESHOLD: Duration = Duration::from_millis(24);
+const CODEX_TRANSCRIPT_SYNC_VERSION: i64 = 2;
 
 const STYLE: &str = r#"
 window.supacodex-window > contents,
@@ -74,7 +93,8 @@ window.supacodex-window:backdrop .chat-surface {
 
 window.supacodex-window headerbar.app-header,
 window.supacodex-window headerbar.app-header:backdrop {
-  background: transparent;
+  background: @window_bg_color;
+  background-color: @window_bg_color;
   background-image: none;
   border: none;
   box-shadow: none;
@@ -374,7 +394,7 @@ window.supacodex-window headerbar.app-header button.header-icon-button:hover {
 .chat-surface,
 .chat-surface:backdrop {
   background: transparent;
-  padding: 4px 16px 14px;
+  padding: 4px 16px 8px;
 }
 
 .chat-subtitle,
@@ -392,7 +412,28 @@ window.supacodex-window headerbar.app-header button.header-icon-button:hover {
   color: alpha(@headerbar_fg_color, 0.88);
   font-weight: 600;
   min-height: 34px;
+  padding: 0;
+}
+
+window.supacodex-window headerbar.app-header menubutton.mode-pill > button,
+window.supacodex-window headerbar.app-header menubutton.mode-pill > button:backdrop {
+  background: transparent;
+  background-image: none;
+  border-color: transparent;
+  border-radius: 999px;
+  box-shadow: none;
+  color: inherit;
+  font-weight: 600;
+  min-height: 34px;
   padding: 0 12px;
+}
+
+window.supacodex-window headerbar.app-header menubutton.mode-pill > button:hover,
+window.supacodex-window headerbar.app-header menubutton.mode-pill > button:active,
+window.supacodex-window headerbar.app-header menubutton.mode-pill > button:checked {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
 }
 
 .header-actions button,
@@ -455,8 +496,8 @@ window.supacodex-window headerbar.app-header button.header-icon-button:hover {
 
 .thread-tabbar,
 .thread-tabbar:backdrop {
-  background: transparent;
-  background-color: transparent;
+  background: @window_bg_color;
+  background-color: @window_bg_color;
   background-image: none;
   border: none;
   box-shadow: none;
@@ -483,17 +524,71 @@ window.supacodex-window headerbar.app-header button.header-icon-button:hover {
   padding: 0 0 4px;
 }
 
-.attachment-chip {
+.attachment-chip,
+.attachment-image-chip {
   background: color-mix(in srgb, @window_fg_color 7%, transparent);
   border: 1px solid alpha(@window_fg_color, 0.060);
   border-radius: 8px;
   margin-right: 6px;
+}
+
+.attachment-chip {
   min-height: 34px;
   padding: 4px 6px;
 }
 
+.attachment-image-chip {
+  min-height: 96px;
+  min-width: 96px;
+}
+
 .attachment-thumb {
   border-radius: 6px;
+}
+
+.attachment-preview-fallback {
+  background: alpha(@window_fg_color, 0.055);
+  border-radius: 8px;
+  color: alpha(@window_fg_color, 0.54);
+}
+
+.attachment-preview-loading {
+  background: alpha(@window_fg_color, 0.050);
+  border-radius: 8px;
+  color: alpha(@window_fg_color, 0.62);
+}
+
+.attachment-image-meta {
+  background: rgba(0, 0, 0, 0.58);
+  border-radius: 6px;
+  margin: 5px;
+  padding: 3px 5px;
+}
+
+.attachment-image-title {
+  color: rgba(255, 255, 255, 0.96);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.attachment-image-size {
+  color: rgba(255, 255, 255, 0.74);
+  font-size: 9px;
+}
+
+.attachment-remove-button {
+  background: rgba(24, 24, 28, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: 999px;
+  box-shadow: none;
+  margin: 5px;
+  min-height: 22px;
+  min-width: 22px;
+  padding: 0;
+}
+
+.attachment-remove-button:hover {
+  background: rgba(42, 42, 48, 0.86);
 }
 
 .attachment-chip button {
@@ -503,6 +598,19 @@ window.supacodex-window headerbar.app-header button.header-icon-button:hover {
   min-height: 22px;
   min-width: 22px;
   padding: 0;
+}
+
+.attachment-chip button.attachment-remove-button {
+  background: rgba(24, 24, 28, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: 999px;
+  margin: 0 0 0 2px;
+  min-height: 28px;
+  min-width: 28px;
+}
+
+.attachment-chip button.attachment-remove-button:hover {
+  background: rgba(42, 42, 48, 0.86);
 }
 
 .message-toolbar button {
@@ -522,6 +630,39 @@ window.supacodex-window headerbar.app-header button.header-icon-button:hover {
 .message-edit-button:hover {
   background: alpha(@window_fg_color, 0.075);
   opacity: 0.92;
+}
+
+.message-card.message-editing,
+.message-card.message-editing:backdrop {
+  background: color-mix(in srgb, @accent_bg_color 13%, transparent);
+  border-color: color-mix(in srgb, @accent_bg_color 34%, transparent);
+}
+
+.message-edit-scroll {
+  background: alpha(@window_fg_color, 0.045);
+  border: 1px solid alpha(@window_fg_color, 0.070);
+  border-radius: 8px;
+  box-shadow: none;
+}
+
+.message-edit-scroll viewport,
+textview.message-edit-view,
+textview.message-edit-view.view,
+textview.message-edit-view text {
+  background: transparent;
+  background-color: transparent;
+  color: @window_fg_color;
+}
+
+.message-edit-actions {
+  margin-top: 2px;
+}
+
+.message-edit-actions button {
+  border-radius: 8px;
+  min-height: 32px;
+  min-width: 112px;
+  padding: 0 12px;
 }
 
 .messages-list {
@@ -583,6 +724,59 @@ window.supacodex-window headerbar.app-header button.header-icon-button:hover {
   padding: 9px 10px;
 }
 
+.collapsible-block {
+  padding: 7px 10px;
+}
+
+.collapsible-block.reasoning-block,
+.collapsible-block.reasoning-block:backdrop {
+  background: color-mix(in srgb, @accent_bg_color 8%, transparent);
+  border-color: color-mix(in srgb, @accent_bg_color 24%, transparent);
+}
+
+.collapsible-block.changes-block,
+.collapsible-block.changes-block:backdrop {
+  background: alpha(@window_fg_color, 0.024);
+  border-color: alpha(@window_fg_color, 0.070);
+}
+
+.collapsible-header {
+  margin-bottom: 0;
+}
+
+.collapsible-title-row {
+  min-height: 22px;
+}
+
+.collapsible-toggle {
+  background: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+}
+
+.collapsible-toggle:hover {
+  background: alpha(@window_fg_color, 0.045);
+}
+
+.collapsible-chevron {
+  color: alpha(@window_fg_color, 0.62);
+}
+
+.collapsible-content {
+  margin-top: 6px;
+}
+
+.block-subtitle {
+  color: alpha(@window_fg_color, 0.56);
+  font-size: 11px;
+}
+
+.reasoning-text {
+  color: alpha(@window_fg_color, 0.78);
+}
+
 .block-title {
   color: alpha(@window_fg_color, 0.90);
   font-weight: 700;
@@ -602,17 +796,17 @@ window.supacodex-window headerbar.app-header button.header-icon-button:hover {
 }
 
 .composer-wrap {
-  background: transparent;
-  border: 1px solid alpha(@window_fg_color, 0.035);
-  border-radius: 12px;
-  padding: 6px;
+  background: color-mix(in srgb, @window_fg_color 7%, transparent);
+  border: 1px solid alpha(@window_fg_color, 0.050);
+  border-radius: 24px;
+  padding: 6px 8px;
 }
 
 .composer-wrap:backdrop {
-  background: transparent;
-  border: 1px solid alpha(@window_fg_color, 0.035);
-  border-radius: 12px;
-  padding: 6px;
+  background: color-mix(in srgb, @window_fg_color 7%, transparent);
+  border: 1px solid alpha(@window_fg_color, 0.050);
+  border-radius: 24px;
+  padding: 6px 8px;
 }
 
 .composer-scroll {
@@ -640,6 +834,7 @@ textview.composer-view text {
   background: transparent;
   background-color: transparent;
   color: @window_fg_color;
+  padding: 0;
 }
 
 .composer-scroll viewport:backdrop,
@@ -653,13 +848,29 @@ textview.composer-view text:backdrop {
 
 textview.composer-view {
   color: @window_fg_color;
-  min-height: 44px;
+  min-height: 16px;
+}
+
+textview.composer-view.view,
+textview.composer-view text {
+  min-height: 16px;
 }
 
 .send-button {
+  -gtk-icon-size: 16px;
+  background: transparent;
+  background-image: none;
+  border-color: transparent;
   border-radius: 999px;
-  min-height: 34px;
-  min-width: 34px;
+  box-shadow: none;
+  min-height: 32px;
+  min-width: 32px;
+  padding: 0;
+}
+
+.send-button:hover {
+  background: alpha(@window_fg_color, 0.080);
+  border-color: transparent;
 }
 
 .empty-state {
@@ -710,14 +921,99 @@ window.supacodex-window textview.composer-view text:backdrop {
 #[derive(Debug)]
 enum UiEvent {
     Reload,
+    SyncActiveWorkspace,
+    WorkspaceOpened(Result<WorkspaceDto, String>),
+    ThreadCreated {
+        workspace_id: String,
+        result: Result<ThreadDto, String>,
+    },
+    CodexThreadsSynced {
+        workspace_id: String,
+        result: Result<usize, String>,
+    },
+    CodexTranscriptSynced {
+        thread_id: String,
+        result: Result<(), String>,
+    },
+    CodexProfileSet {
+        profile_id: String,
+        result: Result<(), String>,
+    },
+    WorkspaceTrustSet {
+        workspace_id: String,
+        result: Result<(), String>,
+    },
+    AttachmentsResolved {
+        insertion_offset: i32,
+        results: Vec<Result<PendingAttachment, String>>,
+    },
+    AttachmentThumbnailReady {
+        file_path: String,
+        result: Result<String, String>,
+    },
+    ViewSnapshotLoaded(Result<ViewSnapshot, String>),
+    ThreadHistoryLoaded {
+        thread_id: String,
+        messages: Vec<MessageDto>,
+        complete: bool,
+    },
+    StreamingMessageUpdated {
+        thread_id: String,
+        message: MessageDto,
+    },
     SelectThread(String),
     OpenThreadTab(String),
     CloseThreadTab(String),
-    EditMessage(String),
+    StartEditMessage {
+        thread_id: String,
+        message_id: String,
+        user_turn_index: usize,
+        content: String,
+    },
+    UpdateEditMessageDraft {
+        message_id: String,
+        user_turn_index: usize,
+        content: String,
+    },
+    CancelEditMessage(String),
+    SubmitEditMessage(String),
     SetCodexProfile(String),
     SetWorkspaceTrust(TrustLevelDto),
     RemoveAttachment(usize),
     Toast(String),
+}
+
+#[derive(Clone)]
+struct UiEventSender {
+    sender: futures_mpsc::UnboundedSender<UiEvent>,
+    backlog: Arc<AtomicUsize>,
+}
+
+impl UiEventSender {
+    fn new(sender: futures_mpsc::UnboundedSender<UiEvent>) -> Self {
+        Self {
+            sender,
+            backlog: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn send(&self, event: UiEvent) -> bool {
+        self.backlog.fetch_add(1, Ordering::Relaxed);
+        if self.sender.unbounded_send(event).is_ok() {
+            true
+        } else {
+            self.backlog.fetch_sub(1, Ordering::Relaxed);
+            false
+        }
+    }
+
+    fn mark_processed(&self, count: usize) {
+        self.backlog.fetch_sub(count, Ordering::Relaxed);
+    }
+
+    fn backlog_len(&self) -> usize {
+        self.backlog.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -726,6 +1022,9 @@ struct PendingAttachment {
     file_path: String,
     size_bytes: u64,
     mime_type: Option<String>,
+    mention: Option<String>,
+    thumbnail_path: Option<String>,
+    thumbnail_failed: bool,
 }
 
 impl PendingAttachment {
@@ -737,6 +1036,41 @@ impl PendingAttachment {
             mime_type: self.mime_type.clone(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ViewSnapshot {
+    requested_workspace_id: Option<String>,
+    requested_thread_id: Option<String>,
+    workspaces: Vec<WorkspaceDto>,
+    active_workspace_id: Option<String>,
+    threads: Vec<ThreadDto>,
+    active_thread: Option<ThreadDto>,
+    messages: Vec<MessageDto>,
+    messages_next_cursor: Option<MessageWindowCursorDto>,
+    trust_level: TrustLevelDto,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CachedThreadView {
+    thread: Option<ThreadDto>,
+    messages: Vec<MessageDto>,
+    history_complete: bool,
+    scroll_value: Option<f64>,
+}
+
+#[derive(Clone)]
+struct CachedListRow {
+    row: gtk::ListBoxRow,
+    signature: String,
+}
+
+#[derive(Debug, Clone)]
+struct EditingMessageState {
+    thread_id: String,
+    message_id: String,
+    user_turn_index: usize,
+    draft: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -830,6 +1164,12 @@ struct NativeBackend {
     config: Arc<Mutex<AppConfig>>,
     engines: Arc<crate::engines::EngineManager>,
     running: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    syncing_workspaces: Arc<Mutex<HashSet<String>>>,
+    syncing_transcripts: Arc<Mutex<HashSet<String>>>,
+    opening_workspaces: Arc<Mutex<HashSet<String>>>,
+    creating_threads: Arc<Mutex<HashSet<String>>>,
+    setting_codex_profile: Arc<Mutex<bool>>,
+    setting_workspace_trusts: Arc<Mutex<HashSet<String>>>,
 }
 
 impl NativeBackend {
@@ -864,6 +1204,12 @@ impl NativeBackend {
             config,
             engines,
             running: Arc::new(Mutex::new(HashMap::new())),
+            syncing_workspaces: Arc::new(Mutex::new(HashSet::new())),
+            syncing_transcripts: Arc::new(Mutex::new(HashSet::new())),
+            opening_workspaces: Arc::new(Mutex::new(HashSet::new())),
+            creating_threads: Arc::new(Mutex::new(HashSet::new())),
+            setting_codex_profile: Arc::new(Mutex::new(false)),
+            setting_workspace_trusts: Arc::new(Mutex::new(HashSet::new())),
         }))
     }
 
@@ -872,7 +1218,6 @@ impl NativeBackend {
     }
 
     fn list_threads(&self, workspace_id: &str) -> anyhow::Result<Vec<ThreadDto>> {
-        self.sync_codex_threads_for_workspace(workspace_id)?;
         db::threads::list_threads_for_workspace(&self.db, workspace_id)
     }
 
@@ -880,11 +1225,195 @@ impl NativeBackend {
         db::threads::get_thread(&self.db, thread_id)
     }
 
-    fn get_messages(&self, thread_id: &str) -> anyhow::Result<Vec<MessageDto>> {
-        if let Err(error) = self.sync_codex_thread_transcript_if_needed(thread_id) {
-            log::warn!("failed to sync codex thread transcript for {thread_id}: {error:#}");
+    fn get_messages_window(
+        &self,
+        thread_id: &str,
+        cursor: Option<&MessageWindowCursorDto>,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<MessageDto>, Option<MessageWindowCursorDto>)> {
+        let started = Instant::now();
+        let window = db::messages::get_thread_messages_window(&self.db, thread_id, cursor, limit)?;
+        log_perf(
+            "sql.get_thread_messages_window",
+            started,
+            format!(
+                "thread_id={}, rows={}, has_more={}",
+                thread_id,
+                window.messages.len(),
+                window.next_cursor.is_some()
+            ),
+        );
+        Ok((window.messages, window.next_cursor))
+    }
+
+    fn load_view_snapshot(
+        &self,
+        preferred_workspace_id: Option<String>,
+        preferred_thread_id: Option<String>,
+    ) -> anyhow::Result<ViewSnapshot> {
+        let started = Instant::now();
+        let requested_workspace_id = preferred_workspace_id.clone();
+        let requested_thread_id = preferred_thread_id.clone();
+        let workspaces = self.list_workspaces()?;
+        let active_workspace_id = preferred_workspace_id
+            .filter(|workspace_id| {
+                workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == *workspace_id)
+            })
+            .or_else(|| workspaces.first().map(|workspace| workspace.id.clone()));
+
+        let Some(workspace_id) = active_workspace_id.clone() else {
+            return Ok(ViewSnapshot {
+                requested_workspace_id,
+                requested_thread_id,
+                workspaces,
+                active_workspace_id: None,
+                threads: Vec::new(),
+                active_thread: None,
+                messages: Vec::new(),
+                messages_next_cursor: None,
+                trust_level: TrustLevelDto::Standard,
+            });
+        };
+
+        let mut threads = self.list_threads(&workspace_id)?;
+        if let Some(active_thread_id) = preferred_thread_id.as_ref() {
+            if !threads.iter().any(|thread| thread.id == *active_thread_id) {
+                if let Some(active_thread) = self.get_thread(active_thread_id)? {
+                    if active_thread.workspace_id == workspace_id {
+                        threads.insert(0, active_thread);
+                    }
+                }
+            }
         }
-        db::messages::get_thread_messages(&self.db, thread_id)
+
+        let active_thread_id = preferred_thread_id
+            .filter(|thread_id| threads.iter().any(|thread| thread.id == *thread_id))
+            .or_else(|| threads.first().map(|thread| thread.id.clone()));
+        let active_thread = active_thread_id.as_deref().and_then(|thread_id| {
+            threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .cloned()
+        });
+        let (messages, messages_next_cursor) = match active_thread.as_ref() {
+            Some(thread) => {
+                self.get_messages_window(&thread.id, None, INITIAL_MESSAGE_WINDOW_LIMIT)?
+            }
+            None => (Vec::new(), None),
+        };
+        let trust_level = self.workspace_trust_level(&workspace_id);
+
+        let snapshot = ViewSnapshot {
+            requested_workspace_id,
+            requested_thread_id,
+            workspaces,
+            active_workspace_id: Some(workspace_id),
+            threads,
+            active_thread,
+            messages,
+            messages_next_cursor,
+            trust_level,
+        };
+        log_perf(
+            "sql.load_view_snapshot",
+            started,
+            format!(
+                "workspaces={}, threads={}, messages={}, has_more={}",
+                snapshot.workspaces.len(),
+                snapshot.threads.len(),
+                snapshot.messages.len(),
+                snapshot.messages_next_cursor.is_some()
+            ),
+        );
+        Ok(snapshot)
+    }
+
+    fn load_view_snapshot_async(
+        self: &Arc<Self>,
+        preferred_workspace_id: Option<String>,
+        preferred_thread_id: Option<String>,
+        ui_tx: UiEventSender,
+    ) {
+        let backend = Arc::clone(self);
+        self.runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                backend.load_view_snapshot(preferred_workspace_id, preferred_thread_id)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("view snapshot task failed: {error}"))
+            .and_then(|result| result)
+            .map_err(|error| format!("{error:#}"));
+
+            let _ = ui_tx.send(UiEvent::ViewSnapshotLoaded(result));
+        });
+    }
+
+    fn load_thread_history_async(
+        self: &Arc<Self>,
+        thread_id: String,
+        cursor: MessageWindowCursorDto,
+        ui_tx: UiEventSender,
+    ) {
+        let backend = Arc::clone(self);
+        self.runtime.spawn(async move {
+            let thread_id_for_task = thread_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                backend.load_thread_history(&thread_id_for_task, cursor)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("thread history load task failed: {error}"))
+            .and_then(|result| result)
+            .map_err(|error| format!("{error:#}"));
+
+            match result {
+                Ok(messages) => {
+                    let _ = ui_tx.send(UiEvent::ThreadHistoryLoaded {
+                        thread_id,
+                        messages,
+                        complete: true,
+                    });
+                }
+                Err(error) => {
+                    let _ = ui_tx.send(UiEvent::Toast(error));
+                }
+            }
+        });
+    }
+
+    fn load_thread_history(
+        &self,
+        thread_id: &str,
+        mut cursor: MessageWindowCursorDto,
+    ) -> anyhow::Result<Vec<MessageDto>> {
+        let started = Instant::now();
+        let mut pages = Vec::new();
+        loop {
+            let window = db::messages::get_thread_messages_window(
+                &self.db,
+                thread_id,
+                Some(&cursor),
+                BACKGROUND_MESSAGE_PAGE_LIMIT,
+            )?;
+            let next_cursor = window.next_cursor.clone();
+            if !window.messages.is_empty() {
+                pages.push(window.messages);
+            }
+            let Some(next_cursor) = next_cursor else {
+                break;
+            };
+            cursor = next_cursor;
+        }
+
+        pages.reverse();
+        let messages = pages.into_iter().flatten().collect::<Vec<_>>();
+        log_perf(
+            "sql.load_thread_history",
+            started,
+            format!("thread_id={thread_id}, rows={}", messages.len()),
+        );
+        Ok(messages)
     }
 
     fn open_workspace(&self, path: &str) -> anyhow::Result<WorkspaceDto> {
@@ -913,6 +1442,29 @@ impl NativeBackend {
         Ok(workspace)
     }
 
+    fn open_workspace_async(self: &Arc<Self>, path: PathBuf, ui_tx: UiEventSender) {
+        let path_string = path.to_string_lossy().to_string();
+        if !self.mark_opening_workspace(&path_string) {
+            return;
+        }
+
+        let backend = Arc::clone(self);
+        self.runtime.spawn(async move {
+            let path_for_task = path_string.clone();
+            let backend_for_task = Arc::clone(&backend);
+            let result = tokio::task::spawn_blocking(move || {
+                backend_for_task.open_workspace(&path_for_task)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("workspace open task failed: {error}"))
+            .and_then(|result| result)
+            .map_err(|error| format!("{error:#}"));
+
+            backend.unmark_opening_workspace(&path_string);
+            let _ = ui_tx.send(UiEvent::WorkspaceOpened(result));
+        });
+    }
+
     fn create_thread(&self, workspace_id: &str) -> anyhow::Result<ThreadDto> {
         let created = db::threads::create_thread(
             &self.db,
@@ -923,16 +1475,84 @@ impl NativeBackend {
             "New thread",
         )?;
 
-        let active_profile_id = self
-            .runtime
-            .block_on(self.engines.active_codex_profile())
-            .id;
+        let active_profile_id = self.active_codex_profile_id();
         let mut metadata = created.engine_metadata.clone().unwrap_or_else(|| json!({}));
         set_codex_profile_id(&mut metadata, &active_profile_id);
         db::threads::update_engine_metadata(&self.db, &created.id, &metadata)?;
 
         db::threads::get_thread(&self.db, &created.id)?
             .ok_or_else(|| anyhow::anyhow!("thread not found after creation"))
+    }
+
+    fn create_thread_async(self: &Arc<Self>, workspace_id: String, ui_tx: UiEventSender) -> bool {
+        if !self.mark_creating_thread(&workspace_id) {
+            return false;
+        }
+
+        let backend = Arc::clone(self);
+        self.runtime.spawn(async move {
+            let workspace_id_for_task = workspace_id.clone();
+            let backend_for_task = Arc::clone(&backend);
+            let result = tokio::task::spawn_blocking(move || {
+                backend_for_task.create_thread(&workspace_id_for_task)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("thread creation task failed: {error}"))
+            .and_then(|result| result)
+            .map_err(|error| format!("{error:#}"));
+
+            backend.unmark_creating_thread(&workspace_id);
+            let _ = ui_tx.send(UiEvent::ThreadCreated {
+                workspace_id,
+                result,
+            });
+        });
+        true
+    }
+
+    fn create_thread_and_send_message_async(
+        self: &Arc<Self>,
+        workspace_id: String,
+        message: String,
+        attachments: Vec<TurnAttachment>,
+        ui_tx: UiEventSender,
+    ) -> bool {
+        if !self.mark_creating_thread(&workspace_id) {
+            return false;
+        }
+
+        let backend = Arc::clone(self);
+        self.runtime.spawn(async move {
+            let workspace_id_for_task = workspace_id.clone();
+            let backend_for_task = Arc::clone(&backend);
+            let result = tokio::task::spawn_blocking(move || {
+                backend_for_task.create_thread(&workspace_id_for_task)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("thread creation task failed: {error}"))
+            .and_then(|result| result);
+
+            backend.unmark_creating_thread(&workspace_id);
+            match result {
+                Ok(thread) => {
+                    let thread_id = thread.id.clone();
+                    let _ = ui_tx.send(UiEvent::SelectThread(thread_id.clone()));
+                    let _ = ui_tx.send(UiEvent::Reload);
+                    if let Err(error) = backend
+                        .run_message_turn(thread_id.clone(), message, attachments, ui_tx.clone())
+                        .await
+                    {
+                        let _ = ui_tx.send(UiEvent::Toast(format!("{error:#}")));
+                        let _ = ui_tx.send(UiEvent::Reload);
+                        backend.finish_running(&thread_id);
+                    }
+                }
+                Err(error) => {
+                    let _ = ui_tx.send(UiEvent::Toast(format!("{error:#}")));
+                }
+            }
+        });
+        true
     }
 
     fn sync_codex_threads_for_workspace(&self, workspace_id: &str) -> anyhow::Result<usize> {
@@ -979,7 +1599,57 @@ impl NativeBackend {
         Ok(synced)
     }
 
-    fn sync_codex_thread_transcript_if_needed(&self, thread_id: &str) -> anyhow::Result<()> {
+    fn sync_codex_threads_for_workspace_async(
+        self: &Arc<Self>,
+        workspace_id: String,
+        ui_tx: UiEventSender,
+    ) {
+        if !self.mark_syncing_workspace(&workspace_id) {
+            return;
+        }
+
+        let backend = Arc::clone(self);
+        self.runtime.spawn(async move {
+            let workspace_id_for_task = workspace_id.clone();
+            let backend_for_task = Arc::clone(&backend);
+            let result = tokio::task::spawn_blocking(move || {
+                backend_for_task.sync_codex_threads_for_workspace(&workspace_id_for_task)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("Codex thread sync task failed: {error}"))
+            .and_then(|result| result)
+            .map_err(|error| format!("{error:#}"));
+
+            backend.unmark_syncing_workspace(&workspace_id);
+            let _ = ui_tx.send(UiEvent::CodexThreadsSynced {
+                workspace_id,
+                result,
+            });
+        });
+    }
+
+    fn sync_codex_thread_transcript_if_needed_async(
+        self: &Arc<Self>,
+        thread_id: String,
+        ui_tx: UiEventSender,
+    ) {
+        if !self.mark_syncing_transcript(&thread_id) {
+            return;
+        }
+
+        let backend = Arc::clone(self);
+        self.runtime.spawn(async move {
+            let result = backend
+                .sync_codex_thread_transcript_if_needed(&thread_id)
+                .await
+                .map_err(|error| format!("{error:#}"));
+
+            backend.unmark_syncing_transcript(&thread_id);
+            let _ = ui_tx.send(UiEvent::CodexTranscriptSynced { thread_id, result });
+        });
+    }
+
+    async fn sync_codex_thread_transcript_if_needed(&self, thread_id: &str) -> anyhow::Result<()> {
         let thread = db::threads::get_thread(&self.db, thread_id)?
             .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
         if thread.engine_id != "codex" || thread.engine_thread_id.is_none() {
@@ -989,12 +1659,12 @@ impl NativeBackend {
             return Ok(());
         }
 
-        let snapshot = self.runtime.block_on(async {
+        let snapshot = {
             self.set_codex_profile_for_thread(&thread).await?;
             self.engines
                 .read_codex_thread_transcript_snapshot(&thread)
                 .await
-        })?;
+        }?;
         let Some(snapshot) = snapshot else {
             return Ok(());
         };
@@ -1006,12 +1676,17 @@ impl NativeBackend {
             .messages
             .iter()
             .enumerate()
-            .map(|(index, message)| db::messages::ImportedThreadMessage {
-                role: message.role.as_str().to_string(),
-                text: message.content.clone(),
-                created_at: transcript_message_timestamp(snapshot.created_at, index),
+            .map(|(index, message)| {
+                Ok(db::messages::ImportedThreadMessage {
+                    role: message.role.as_str().to_string(),
+                    text: message.content.clone(),
+                    blocks: Some(serde_json::to_value(
+                        native_blocks_from_transcript_message(message),
+                    )?),
+                    created_at: transcript_message_timestamp(snapshot.created_at, index),
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         db::messages::replace_thread_messages(
             &self.db,
@@ -1036,6 +1711,8 @@ impl NativeBackend {
             metadata["codexTranscriptSyncedRemoteUpdatedAt"] = Value::String(remote_updated_at);
         }
         metadata["codexTranscriptSyncedAt"] = Value::String(Utc::now().to_rfc3339());
+        metadata["codexTranscriptSyncVersion"] =
+            Value::Number(CODEX_TRANSCRIPT_SYNC_VERSION.into());
 
         db::threads::update_thread_runtime_snapshot(
             &self.db,
@@ -1080,25 +1757,55 @@ impl NativeBackend {
             .unwrap_or_else(|_| "default".to_string())
     }
 
-    fn set_active_codex_profile(&self, profile_id: &str) -> anyhow::Result<()> {
-        let profile = AppConfig::mutate(|config| {
-            config.codex.active_profile_id = profile_id.to_string();
-            config.codex.normalize();
-            runtime_profile_by_id(config, profile_id)
-                .ok_or_else(|| anyhow::anyhow!("unknown Codex profile: {profile_id}"))
-        })?;
-
-        {
-            let mut config = self
-                .config
-                .lock()
-                .map_err(|_| anyhow::anyhow!("app config lock is poisoned"))?;
-            *config = AppConfig::load_or_create()?;
+    fn set_active_codex_profile_async(
+        self: &Arc<Self>,
+        profile_id: String,
+        ui_tx: UiEventSender,
+    ) -> bool {
+        if !self.mark_setting_codex_profile() {
+            return false;
         }
 
-        self.runtime
-            .block_on(self.engines.set_codex_profile(profile))?;
-        Ok(())
+        let backend = Arc::clone(self);
+        self.runtime.spawn(async move {
+            let profile_id_for_config = profile_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let profile = AppConfig::mutate(|config| {
+                    config.codex.active_profile_id = profile_id_for_config.clone();
+                    config.codex.normalize();
+                    runtime_profile_by_id(config, &profile_id_for_config).ok_or_else(|| {
+                        anyhow::anyhow!("unknown Codex profile: {profile_id_for_config}")
+                    })
+                })?;
+                let config = AppConfig::load_or_create()?;
+                Ok::<_, anyhow::Error>((profile, config))
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("Codex profile update task failed: {error}"))
+            .and_then(|result| result);
+
+            let result = match result {
+                Ok((profile, config)) => {
+                    let config_result = backend
+                        .config
+                        .lock()
+                        .map(|mut stored| {
+                            *stored = config;
+                        })
+                        .map_err(|_| anyhow::anyhow!("app config lock is poisoned"));
+                    match config_result {
+                        Ok(()) => backend.engines.set_codex_profile(profile).await,
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            }
+            .map_err(|error| format!("{error:#}"));
+
+            backend.unmark_setting_codex_profile();
+            let _ = ui_tx.send(UiEvent::CodexProfileSet { profile_id, result });
+        });
+        true
     }
 
     fn workspace_trust_level(&self, workspace_id: &str) -> TrustLevelDto {
@@ -1122,6 +1829,37 @@ impl NativeBackend {
         Ok(())
     }
 
+    fn set_workspace_trust_level_async(
+        self: &Arc<Self>,
+        workspace_id: String,
+        trust_level: TrustLevelDto,
+        ui_tx: UiEventSender,
+    ) -> bool {
+        if !self.mark_setting_workspace_trust(&workspace_id) {
+            return false;
+        }
+
+        let backend = Arc::clone(self);
+        self.runtime.spawn(async move {
+            let workspace_id_for_task = workspace_id.clone();
+            let backend_for_task = Arc::clone(&backend);
+            let result = tokio::task::spawn_blocking(move || {
+                backend_for_task.set_workspace_trust_level(&workspace_id_for_task, trust_level)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("workspace trust update task failed: {error}"))
+            .and_then(|result| result)
+            .map_err(|error| format!("{error:#}"));
+
+            backend.unmark_setting_workspace_trust(&workspace_id);
+            let _ = ui_tx.send(UiEvent::WorkspaceTrustSet {
+                workspace_id,
+                result,
+            });
+        });
+        true
+    }
+
     fn is_running(&self, thread_id: &str) -> bool {
         self.running
             .lock()
@@ -1129,12 +1867,104 @@ impl NativeBackend {
             .unwrap_or(false)
     }
 
+    fn is_creating_thread(&self, workspace_id: &str) -> bool {
+        self.creating_threads
+            .lock()
+            .map(|creating| creating.contains(workspace_id))
+            .unwrap_or(false)
+    }
+
+    fn mark_syncing_workspace(&self, workspace_id: &str) -> bool {
+        self.syncing_workspaces
+            .lock()
+            .map(|mut syncing| syncing.insert(workspace_id.to_string()))
+            .unwrap_or(false)
+    }
+
+    fn unmark_syncing_workspace(&self, workspace_id: &str) {
+        if let Ok(mut syncing) = self.syncing_workspaces.lock() {
+            syncing.remove(workspace_id);
+        }
+    }
+
+    fn mark_syncing_transcript(&self, thread_id: &str) -> bool {
+        self.syncing_transcripts
+            .lock()
+            .map(|mut syncing| syncing.insert(thread_id.to_string()))
+            .unwrap_or(false)
+    }
+
+    fn unmark_syncing_transcript(&self, thread_id: &str) {
+        if let Ok(mut syncing) = self.syncing_transcripts.lock() {
+            syncing.remove(thread_id);
+        }
+    }
+
+    fn mark_opening_workspace(&self, path: &str) -> bool {
+        self.opening_workspaces
+            .lock()
+            .map(|mut opening| opening.insert(path.to_string()))
+            .unwrap_or(false)
+    }
+
+    fn unmark_opening_workspace(&self, path: &str) {
+        if let Ok(mut opening) = self.opening_workspaces.lock() {
+            opening.remove(path);
+        }
+    }
+
+    fn mark_creating_thread(&self, workspace_id: &str) -> bool {
+        self.creating_threads
+            .lock()
+            .map(|mut creating| creating.insert(workspace_id.to_string()))
+            .unwrap_or(false)
+    }
+
+    fn unmark_creating_thread(&self, workspace_id: &str) {
+        if let Ok(mut creating) = self.creating_threads.lock() {
+            creating.remove(workspace_id);
+        }
+    }
+
+    fn mark_setting_codex_profile(&self) -> bool {
+        self.setting_codex_profile
+            .lock()
+            .map(|mut setting| {
+                if *setting {
+                    false
+                } else {
+                    *setting = true;
+                    true
+                }
+            })
+            .unwrap_or(false)
+    }
+
+    fn unmark_setting_codex_profile(&self) {
+        if let Ok(mut setting) = self.setting_codex_profile.lock() {
+            *setting = false;
+        }
+    }
+
+    fn mark_setting_workspace_trust(&self, workspace_id: &str) -> bool {
+        self.setting_workspace_trusts
+            .lock()
+            .map(|mut setting| setting.insert(workspace_id.to_string()))
+            .unwrap_or(false)
+    }
+
+    fn unmark_setting_workspace_trust(&self, workspace_id: &str) {
+        if let Ok(mut setting) = self.setting_workspace_trusts.lock() {
+            setting.remove(workspace_id);
+        }
+    }
+
     fn send_message(
         self: &Arc<Self>,
         thread_id: String,
         message: String,
         attachments: Vec<TurnAttachment>,
-        ui_tx: mpsc::Sender<UiEvent>,
+        ui_tx: UiEventSender,
     ) {
         let backend = Arc::clone(self);
         self.runtime.spawn(async move {
@@ -1149,7 +1979,7 @@ impl NativeBackend {
         });
     }
 
-    fn cancel_turn(self: &Arc<Self>, thread_id: String, ui_tx: mpsc::Sender<UiEvent>) {
+    fn cancel_turn(self: &Arc<Self>, thread_id: String, ui_tx: UiEventSender) {
         let cancellation = self
             .running
             .lock()
@@ -1178,8 +2008,9 @@ impl NativeBackend {
         self: &Arc<Self>,
         thread_id: String,
         message_id: String,
+        user_turn_index: usize,
         message: String,
-        ui_tx: mpsc::Sender<UiEvent>,
+        ui_tx: UiEventSender,
     ) {
         let backend = Arc::clone(self);
         self.runtime.spawn(async move {
@@ -1196,10 +2027,14 @@ impl NativeBackend {
                 }
 
                 let messages = db::messages::get_thread_messages(&backend.db, &thread.id)?;
-                let target_index = messages
-                    .iter()
-                    .position(|candidate| candidate.id == message_id)
-                    .ok_or_else(|| anyhow::anyhow!("message not found: {message_id}"))?;
+                let target_index = find_resume_target_index(
+                    &messages,
+                    &message_id,
+                    user_turn_index,
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Message introuvable. Recharge le thread puis reessaie.")
+                })?;
                 if messages[target_index].role != "user" {
                     anyhow::bail!("Seuls les messages utilisateur peuvent etre modifies.");
                 }
@@ -1246,7 +2081,7 @@ impl NativeBackend {
         approval_id: String,
         details: Value,
         decision: &'static str,
-        ui_tx: mpsc::Sender<UiEvent>,
+        ui_tx: UiEventSender,
     ) {
         let backend = Arc::clone(self);
         self.runtime.spawn(async move {
@@ -1279,7 +2114,7 @@ impl NativeBackend {
         thread_id: String,
         message: String,
         attachments: Vec<TurnAttachment>,
-        ui_tx: mpsc::Sender<UiEvent>,
+        ui_tx: UiEventSender,
     ) -> anyhow::Result<()> {
         if message.trim().is_empty() && attachments.is_empty() {
             return Ok(());
@@ -1411,8 +2246,28 @@ impl NativeBackend {
             &mut thread_status,
             &mut token_usage,
         )?;
+        let _ = ui_tx.send(UiEvent::StreamingMessageUpdated {
+            thread_id: thread.id.clone(),
+            message: streaming_message_snapshot(
+                &assistant_message,
+                &blocks,
+                message_status.clone(),
+                &effective_model_id,
+            )?,
+        });
 
+        let mut last_ui_flush = Instant::now();
+        let mut last_db_flush = Instant::now();
+        let mut db_dirty = false;
         while let Some(event) = event_rx.recv().await {
+            let force_flush = matches!(
+                event,
+                EngineEvent::TurnCompleted { .. }
+                    | EngineEvent::ApprovalRequested { .. }
+                    | EngineEvent::ActionStarted { .. }
+                    | EngineEvent::ActionCompleted { .. }
+                    | EngineEvent::Error { .. }
+            );
             self.apply_event(
                 &assistant_message.id,
                 &mut blocks,
@@ -1423,7 +2278,26 @@ impl NativeBackend {
                 &mut thread_status,
                 &mut token_usage,
             )?;
-            let _ = ui_tx.send(UiEvent::Reload);
+            db_dirty = true;
+
+            if db_dirty && (force_flush || last_db_flush.elapsed() >= STREAM_DB_FLUSH_INTERVAL) {
+                self.persist_blocks(&assistant_message.id, &blocks, message_status.clone(), "")?;
+                last_db_flush = Instant::now();
+                db_dirty = false;
+            }
+
+            if force_flush || last_ui_flush.elapsed() >= STREAM_UI_FLUSH_INTERVAL {
+                let _ = ui_tx.send(UiEvent::StreamingMessageUpdated {
+                    thread_id: thread.id.clone(),
+                    message: streaming_message_snapshot(
+                        &assistant_message,
+                        &blocks,
+                        message_status.clone(),
+                        &effective_model_id,
+                    )?,
+                });
+                last_ui_flush = Instant::now();
+            }
         }
 
         match engine_task.await {
@@ -1455,12 +2329,24 @@ impl NativeBackend {
             thread_status = ThreadStatusDto::Completed;
         }
 
+        if db_dirty {
+            self.persist_blocks(&assistant_message.id, &blocks, message_status.clone(), "")?;
+        }
         self.persist_blocks(
             &assistant_message.id,
             &blocks,
             message_status.clone(),
             &effective_model_id,
         )?;
+        let _ = ui_tx.send(UiEvent::StreamingMessageUpdated {
+            thread_id: thread.id.clone(),
+            message: streaming_message_snapshot(
+                &assistant_message,
+                &blocks,
+                message_status.clone(),
+                &effective_model_id,
+            )?,
+        });
         db::messages::complete_assistant_message(
             &self.db,
             &assistant_message.id,
@@ -1540,7 +2426,7 @@ impl NativeBackend {
     #[allow(clippy::too_many_arguments)]
     fn apply_event(
         &self,
-        assistant_message_id: &str,
+        _assistant_message_id: &str,
         blocks: &mut Vec<NativeContentBlock>,
         action_index: &mut HashMap<String, usize>,
         approval_index: &mut HashMap<String, usize>,
@@ -1578,10 +2464,7 @@ impl NativeBackend {
                 append_thinking_block(blocks, content);
             }
             EngineEvent::DiffUpdated { diff, scope } => {
-                blocks.push(NativeContentBlock::Diff {
-                    diff: diff.clone(),
-                    scope: format!("{scope:?}").to_lowercase(),
-                });
+                append_or_replace_diff_block(blocks, diff, &diff_scope_label(scope));
             }
             EngineEvent::ActionStarted {
                 action_id,
@@ -1697,7 +2580,6 @@ impl NativeBackend {
             }
         }
 
-        self.persist_blocks(assistant_message_id, blocks, message_status.clone(), "")?;
         Ok(())
     }
 
@@ -1708,7 +2590,9 @@ impl NativeBackend {
         status: MessageStatusDto,
         model_id: &str,
     ) -> anyhow::Result<()> {
+        let started = Instant::now();
         let blocks_json = serde_json::to_string(blocks)?;
+        let blocks_json_bytes = blocks_json.len();
         let model_id = if model_id.is_empty() {
             None
         } else {
@@ -1721,6 +2605,16 @@ impl NativeBackend {
             status,
             model_id,
         )?;
+        log_perf(
+            "sql.persist_blocks",
+            started,
+            format!(
+                "message_id={}, blocks={}, bytes={}",
+                assistant_message_id,
+                blocks.len(),
+                blocks_json_bytes
+            ),
+        );
         Ok(())
     }
 
@@ -1740,14 +2634,16 @@ impl NativeBackend {
     }
 
     fn shutdown(&self) {
-        self.runtime.block_on(self.engines.shutdown());
+        let engines = Arc::clone(&self.engines);
+        self.runtime.spawn(async move {
+            engines.shutdown().await;
+        });
     }
 }
 
 struct AppController {
     backend: Arc<NativeBackend>,
-    ui_tx: mpsc::Sender<UiEvent>,
-    ui_rx: RefCell<mpsc::Receiver<UiEvent>>,
+    ui_tx: UiEventSender,
     toast_overlay: adw::ToastOverlay,
     window: adw::ApplicationWindow,
     title_label: gtk::Label,
@@ -1763,16 +2659,35 @@ struct AppController {
     messages_box: gtk::Box,
     messages_scroll: gtk::ScrolledWindow,
     attachment_bar: gtk::Box,
+    composer_scroll: gtk::ScrolledWindow,
     composer: gtk::TextView,
     send_button: gtk::Button,
     search_entry: gtk::SearchEntry,
     workspaces: RefCell<Vec<WorkspaceDto>>,
     threads: RefCell<Vec<ThreadDto>>,
+    active_thread_snapshot: RefCell<Option<ThreadDto>>,
+    active_messages: RefCell<Vec<MessageDto>>,
+    active_trust_level: RefCell<TrustLevelDto>,
     visible_workspace_ids: RefCell<Vec<String>>,
     visible_thread_ids: RefCell<Vec<String>>,
+    workspace_row_cache: RefCell<HashMap<String, CachedListRow>>,
+    thread_row_cache: RefCell<HashMap<String, CachedListRow>>,
+    message_widget_cache: RefCell<HashMap<String, gtk::Widget>>,
+    collapsible_block_expanded: Rc<RefCell<HashMap<String, bool>>>,
+    thread_view_cache: RefCell<HashMap<String, CachedThreadView>>,
     thread_tabs_by_workspace: RefCell<HashMap<String, Vec<String>>>,
     syncing_tab_view: Cell<bool>,
+    loading_snapshot: Cell<bool>,
+    queued_snapshot: Cell<bool>,
+    composer_last_height: Cell<i32>,
+    composer_last_line_count: Cell<i32>,
+    composer_last_send_enabled: Cell<bool>,
+    composer_last_running: Cell<bool>,
+    render_widgets_created: Cell<usize>,
+    runtime_controls_signature: RefCell<String>,
+    editing_message: Rc<RefCell<Option<EditingMessageState>>>,
     pending_attachments: RefCell<Vec<PendingAttachment>>,
+    snapping_attachment_mention_cursor: Cell<bool>,
     active_workspace_id: RefCell<Option<String>>,
     active_thread_id: RefCell<Option<String>>,
     split_view: adw::OverlaySplitView,
@@ -1780,7 +2695,8 @@ struct AppController {
 
 impl AppController {
     fn new(app: &adw::Application, backend: Arc<NativeBackend>) -> Rc<Self> {
-        let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
+        let (raw_ui_tx, ui_rx) = futures_mpsc::unbounded::<UiEvent>();
+        let ui_tx = UiEventSender::new(raw_ui_tx);
 
         let window = adw::ApplicationWindow::builder()
             .application(app)
@@ -1826,21 +2742,31 @@ impl AppController {
         title_box.add_css_class("app-title");
         title_box.set_halign(gtk::Align::Center);
         title_box.set_valign(gtk::Align::Center);
+        title_box.set_overflow(gtk::Overflow::Hidden);
+        title_box.set_size_request(-1, 32);
 
         let title_label = gtk::Label::new(Some("SupaCodex"));
         title_label.add_css_class("app-title-main");
         title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         title_label.set_justify(gtk::Justification::Center);
+        title_label.set_lines(1);
         title_label.set_max_width_chars(48);
+        title_label.set_overflow(gtk::Overflow::Hidden);
+        title_label.set_single_line_mode(true);
         title_label.set_width_chars(1);
+        title_label.set_wrap(false);
         title_label.set_xalign(0.5);
 
         let subtitle_label = gtk::Label::new(Some("codex"));
         subtitle_label.add_css_class("app-title-subtitle");
         subtitle_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         subtitle_label.set_justify(gtk::Justification::Center);
+        subtitle_label.set_lines(1);
         subtitle_label.set_max_width_chars(42);
+        subtitle_label.set_overflow(gtk::Overflow::Hidden);
+        subtitle_label.set_single_line_mode(true);
         subtitle_label.set_width_chars(1);
+        subtitle_label.set_wrap(false);
         subtitle_label.set_xalign(0.5);
 
         title_box.append(&title_label);
@@ -1876,16 +2802,19 @@ impl AppController {
         let profile_button = gtk::MenuButton::new();
         profile_button.add_css_class("mode-pill");
         profile_button.set_tooltip_text(Some("Profil Codex"));
+        profile_button.set_valign(gtk::Align::Center);
         profile_button.set_child(Some(&profile_button_label));
 
         let permission_button_label = gtk::Label::new(Some("Standard"));
         let permission_button = gtk::MenuButton::new();
         permission_button.add_css_class("mode-pill");
         permission_button.set_tooltip_text(Some("Permissions"));
+        permission_button.set_valign(gtk::Align::Center);
         permission_button.set_child(Some(&permission_button_label));
 
         let header_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         header_actions.add_css_class("header-actions");
+        header_actions.set_valign(gtk::Align::Center);
         header_actions.append(&profile_button);
         header_actions.append(&permission_button);
         header_actions.append(&new_thread_header);
@@ -1901,11 +2830,6 @@ impl AppController {
         let sidebar_actions = gtk::Box::new(gtk::Orientation::Vertical, 6);
         sidebar_actions.add_css_class("sidebar-actions");
         sidebar.append(&sidebar_actions);
-
-        let new_thread_sidebar = icon_label_button("list-add-symbolic", "Nouveau thread");
-        new_thread_sidebar.add_css_class("sidebar-action");
-        new_thread_sidebar.add_css_class("sidebar-action-primary");
-        sidebar_actions.append(&new_thread_sidebar);
 
         let open_workspace_button = icon_label_button("folder-open-symbolic", "Ouvrir un projet");
         open_workspace_button.add_css_class("sidebar-action");
@@ -1993,14 +2917,20 @@ impl AppController {
 
         let composer_wrap = gtk::Box::new(gtk::Orientation::Vertical, 6);
         composer_wrap.add_css_class("composer-wrap");
+        composer_wrap.set_vexpand(false);
+        composer_wrap.set_valign(gtk::Align::End);
         content.append(&composer_wrap);
 
         let attachment_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         attachment_bar.add_css_class("attachment-bar");
+        attachment_bar.set_halign(gtk::Align::Start);
+        attachment_bar.set_hexpand(false);
         attachment_bar.set_visible(false);
         composer_wrap.append(&attachment_bar);
 
-        let composer_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let composer_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        composer_row.set_vexpand(false);
+        composer_row.set_valign(gtk::Align::Center);
         composer_wrap.append(&composer_row);
 
         let attach_button = gtk::Button::builder()
@@ -2008,7 +2938,7 @@ impl AppController {
             .tooltip_text("Ajouter une piece jointe")
             .build();
         attach_button.add_css_class("send-button");
-        attach_button.set_valign(gtk::Align::End);
+        attach_button.set_valign(gtk::Align::Center);
         composer_row.append(&attach_button);
 
         let composer = gtk::TextView::new();
@@ -2016,29 +2946,38 @@ impl AppController {
         composer.set_wrap_mode(gtk::WrapMode::WordChar);
         composer.set_vexpand(false);
         composer.set_monospace(false);
+        composer.set_top_margin(18);
+        composer.set_bottom_margin(0);
+        composer.set_left_margin(2);
+        composer.set_right_margin(2);
         let composer_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .min_content_height(44)
-            .max_content_height(116)
+            .min_content_height(COMPOSER_SINGLE_LINE_HEIGHT)
+            .max_content_height(COMPOSER_SINGLE_LINE_HEIGHT)
             .build();
         composer_scroll.add_css_class("composer-scroll");
         composer_scroll.set_hexpand(true);
+        composer_scroll.set_vexpand(false);
+        composer_scroll.set_valign(gtk::Align::Center);
+        composer_scroll.set_propagate_natural_height(false);
+        composer_scroll.set_size_request(-1, COMPOSER_SINGLE_LINE_HEIGHT);
         composer_scroll.set_child(Some(&composer));
         composer_row.append(&composer_scroll);
 
         let send_button = gtk::Button::builder()
-            .icon_name("send-symbolic")
+            .icon_name("mail-send-symbolic")
             .tooltip_text("Envoyer")
             .build();
         send_button.add_css_class("send-button");
-        send_button.set_valign(gtk::Align::End);
+        send_button.set_valign(gtk::Align::Center);
+        send_button.set_opacity(0.0);
+        send_button.set_sensitive(false);
         composer_row.append(&send_button);
 
         let controller = Rc::new(Self {
             backend,
             ui_tx,
-            ui_rx: RefCell::new(ui_rx),
             toast_overlay,
             window,
             title_label,
@@ -2054,16 +2993,35 @@ impl AppController {
             messages_box,
             messages_scroll,
             attachment_bar,
+            composer_scroll,
             composer,
             send_button,
             search_entry,
             workspaces: RefCell::new(Vec::new()),
             threads: RefCell::new(Vec::new()),
+            active_thread_snapshot: RefCell::new(None),
+            active_messages: RefCell::new(Vec::new()),
+            active_trust_level: RefCell::new(TrustLevelDto::Standard),
             visible_workspace_ids: RefCell::new(Vec::new()),
             visible_thread_ids: RefCell::new(Vec::new()),
+            workspace_row_cache: RefCell::new(HashMap::new()),
+            thread_row_cache: RefCell::new(HashMap::new()),
+            message_widget_cache: RefCell::new(HashMap::new()),
+            collapsible_block_expanded: Rc::new(RefCell::new(HashMap::new())),
+            thread_view_cache: RefCell::new(HashMap::new()),
             thread_tabs_by_workspace: RefCell::new(HashMap::new()),
             syncing_tab_view: Cell::new(false),
+            loading_snapshot: Cell::new(false),
+            queued_snapshot: Cell::new(false),
+            composer_last_height: Cell::new(COMPOSER_SINGLE_LINE_HEIGHT),
+            composer_last_line_count: Cell::new(1),
+            composer_last_send_enabled: Cell::new(false),
+            composer_last_running: Cell::new(false),
+            render_widgets_created: Cell::new(0),
+            runtime_controls_signature: RefCell::new(String::new()),
+            editing_message: Rc::new(RefCell::new(None)),
             pending_attachments: RefCell::new(Vec::new()),
+            snapping_attachment_mention_cursor: Cell::new(false),
             active_workspace_id: RefCell::new(None),
             active_thread_id: RefCell::new(None),
             split_view,
@@ -2079,14 +3037,7 @@ impl AppController {
         let weak = Rc::downgrade(&controller);
         new_thread_header.connect_clicked(move |_| {
             if let Some(controller) = weak.upgrade() {
-                controller.create_thread();
-            }
-        });
-
-        let weak = Rc::downgrade(&controller);
-        new_thread_sidebar.connect_clicked(move |_| {
-            if let Some(controller) = weak.upgrade() {
-                controller.create_thread();
+                controller.request_create_thread();
             }
         });
 
@@ -2104,27 +3055,71 @@ impl AppController {
             }
         });
 
-        let drop_target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
-        let weak = Rc::downgrade(&controller);
-        drop_target.connect_drop(move |_, value, _, _| {
-            let Ok(file_list) = value.get::<gdk::FileList>() else {
-                return false;
-            };
-            let paths = file_list
-                .files()
-                .into_iter()
-                .filter_map(|file| file.path())
-                .collect::<Vec<_>>();
-            if paths.is_empty() {
-                return false;
-            }
-            if let Some(controller) = weak.upgrade() {
-                controller.add_attachments(paths);
-                return true;
-            }
-            false
-        });
-        controller.window.add_controller(drop_target);
+        let file_drop_target = |weak: std::rc::Weak<AppController>| {
+            let drop_target =
+                gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+            drop_target.set_propagation_phase(gtk::PropagationPhase::Capture);
+            drop_target.set_preload(true);
+            drop_target.connect_drop(move |_, value, _, _| {
+                let Ok(file_list) = value.get::<gdk::FileList>() else {
+                    return false;
+                };
+                let paths = file_list
+                    .files()
+                    .into_iter()
+                    .filter_map(|file| file.path())
+                    .collect::<Vec<_>>();
+                if paths.is_empty() {
+                    return false;
+                }
+                if let Some(controller) = weak.upgrade() {
+                    controller.add_attachments(paths);
+                    return true;
+                }
+                false
+            });
+            drop_target
+        };
+        let text_drop_target = |weak: std::rc::Weak<AppController>| {
+            let drop_target = gtk::DropTarget::new(String::static_type(), gdk::DragAction::COPY);
+            drop_target.set_propagation_phase(gtk::PropagationPhase::Capture);
+            drop_target.set_preload(true);
+            drop_target.connect_drop(move |_, value, _, _| {
+                let Ok(text) = value.get::<String>() else {
+                    return false;
+                };
+                let paths = paths_from_dropped_text(&text);
+                if paths.is_empty() {
+                    return false;
+                }
+                if let Some(controller) = weak.upgrade() {
+                    controller.add_attachments(paths);
+                    return true;
+                }
+                false
+            });
+            drop_target
+        };
+        controller
+            .window
+            .add_controller(file_drop_target(Rc::downgrade(&controller)));
+        controller
+            .window
+            .add_controller(text_drop_target(Rc::downgrade(&controller)));
+        composer_wrap.add_controller(file_drop_target(Rc::downgrade(&controller)));
+        composer_wrap.add_controller(text_drop_target(Rc::downgrade(&controller)));
+        controller
+            .composer_scroll
+            .add_controller(file_drop_target(Rc::downgrade(&controller)));
+        controller
+            .composer_scroll
+            .add_controller(text_drop_target(Rc::downgrade(&controller)));
+        controller
+            .composer
+            .add_controller(file_drop_target(Rc::downgrade(&controller)));
+        controller
+            .composer
+            .add_controller(text_drop_target(Rc::downgrade(&controller)));
 
         let weak = Rc::downgrade(&controller);
         controller
@@ -2188,7 +3183,8 @@ impl AppController {
         let weak = Rc::downgrade(&controller);
         controller.search_entry.connect_search_changed(move |_| {
             if let Some(controller) = weak.upgrade() {
-                controller.render_all();
+                controller.render_workspaces();
+                controller.render_threads();
             }
         });
 
@@ -2206,9 +3202,39 @@ impl AppController {
             }
         });
 
+        let weak = Rc::downgrade(&controller);
+        controller
+            .composer
+            .buffer()
+            .connect_mark_set(move |buffer, location, mark| {
+                if mark.name().as_deref() != Some("insert") {
+                    return;
+                }
+                if let Some(controller) = weak.upgrade() {
+                    controller.snap_cursor_out_of_attachment_mention(buffer, location.offset());
+                }
+            });
+
         let key_controller = gtk::EventControllerKey::new();
         let weak = Rc::downgrade(&controller);
         key_controller.connect_key_pressed(move |_, key, _, state| {
+            let plain_arrow = matches!(key, gdk::Key::Left | gdk::Key::Right)
+                && !state.contains(gdk::ModifierType::SHIFT_MASK)
+                && !state.contains(gdk::ModifierType::CONTROL_MASK);
+            if plain_arrow {
+                if let Some(controller) = weak.upgrade() {
+                    if controller.handle_attachment_mention_arrow_key(key) {
+                        return glib::Propagation::Stop;
+                    }
+                }
+            }
+            if matches!(key, gdk::Key::BackSpace | gdk::Key::Delete) {
+                if let Some(controller) = weak.upgrade() {
+                    if controller.handle_attachment_mention_delete_key(key) {
+                        return glib::Propagation::Stop;
+                    }
+                }
+            }
             if key == gdk::Key::Return && !state.contains(gdk::ModifierType::SHIFT_MASK) {
                 if let Some(controller) = weak.upgrade() {
                     controller.submit_or_cancel();
@@ -2231,7 +3257,7 @@ impl AppController {
                 }
 
                 if ctrl && key == gdk::Key::n {
-                    controller.create_thread();
+                    controller.request_create_thread();
                     return glib::Propagation::Stop;
                 }
 
@@ -2246,18 +3272,26 @@ impl AppController {
         controller.window.add_controller(window_key_controller);
 
         let weak = Rc::downgrade(&controller);
-        glib::timeout_add_local(Duration::from_millis(80), move || {
-            if let Some(controller) = weak.upgrade() {
-                controller.drain_ui_events();
-                return glib::ControlFlow::Continue;
-            }
-            glib::ControlFlow::Break
+        controller
+            .messages_scroll
+            .vadjustment()
+            .connect_value_changed(move |adjustment| {
+                if adjustment.value() <= 32.0 {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.reveal_cached_history();
+                    }
+                }
+            });
+
+        let weak = Rc::downgrade(&controller);
+        glib::MainContext::default().spawn_local(async move {
+            run_ui_event_loop(weak, ui_rx).await;
         });
 
         let weak = Rc::downgrade(&controller);
         glib::timeout_add_local(Duration::from_secs(5), move || {
             if let Some(controller) = weak.upgrade() {
-                let _ = controller.ui_tx.send(UiEvent::Reload);
+                let _ = controller.ui_tx.send(UiEvent::SyncActiveWorkspace);
                 return glib::ControlFlow::Continue;
             }
             glib::ControlFlow::Break
@@ -2279,61 +3313,193 @@ impl AppController {
     }
 
     fn load_initial(&self) {
-        match self.backend.list_workspaces() {
-            Ok(workspaces) => {
-                let active_id = workspaces.first().map(|workspace| workspace.id.clone());
-                *self.workspaces.borrow_mut() = workspaces;
-                *self.active_workspace_id.borrow_mut() = active_id;
-                self.reload_threads();
-                self.render_all();
-            }
-            Err(error) => self.toast(format!("{error:#}")),
+        self.request_view_snapshot();
+    }
+
+    fn request_view_snapshot(&self) {
+        if self.loading_snapshot.get() {
+            self.queued_snapshot.set(true);
+            return;
+        }
+
+        self.loading_snapshot.set(true);
+        self.backend.load_view_snapshot_async(
+            self.active_workspace_id.borrow().clone(),
+            self.active_thread_id.borrow().clone(),
+            self.ui_tx.clone(),
+        );
+    }
+
+    fn apply_view_snapshot(&self, snapshot: ViewSnapshot) {
+        let active_thread_id = snapshot
+            .active_thread
+            .as_ref()
+            .map(|thread| thread.id.clone());
+        if let Some(thread) = snapshot.active_thread.as_ref() {
+            let mut cache = self.thread_view_cache.borrow_mut();
+            let entry = cache.entry(thread.id.clone()).or_default();
+            entry.thread = Some(thread.clone());
+            entry.messages = merge_messages(&entry.messages, &snapshot.messages);
+            entry.history_complete =
+                snapshot.messages_next_cursor.is_none() || entry.history_complete;
+        }
+        *self.workspaces.borrow_mut() = snapshot.workspaces;
+        *self.active_workspace_id.borrow_mut() = snapshot.active_workspace_id;
+        *self.threads.borrow_mut() = snapshot.threads;
+        *self.active_thread_id.borrow_mut() = active_thread_id;
+        *self.active_thread_snapshot.borrow_mut() = snapshot.active_thread;
+        *self.active_messages.borrow_mut() = snapshot.messages;
+        *self.active_trust_level.borrow_mut() = snapshot.trust_level;
+    }
+
+    fn remember_active_thread_scroll(&self) {
+        let Some(thread_id) = self.active_thread_id.borrow().clone() else {
+            return;
+        };
+        let mut cache = self.thread_view_cache.borrow_mut();
+        let entry = cache.entry(thread_id).or_default();
+        entry.thread = self.active_thread_snapshot.borrow().clone();
+        entry.messages = self.active_messages.borrow().clone();
+        entry.scroll_value = Some(self.messages_scroll.vadjustment().value());
+    }
+
+    fn active_thread_scroll_value(&self) -> Option<f64> {
+        let thread_id = self.active_thread_id.borrow().clone()?;
+        self.thread_view_cache
+            .borrow()
+            .get(&thread_id)
+            .and_then(|entry| entry.scroll_value)
+    }
+
+    fn restore_cached_thread_view(&self) {
+        let Some(thread_id) = self.active_thread_id.borrow().clone() else {
+            *self.active_thread_snapshot.borrow_mut() = None;
+            self.active_messages.borrow_mut().clear();
+            return;
+        };
+        let cache = self.thread_view_cache.borrow();
+        if let Some(entry) = cache.get(&thread_id) {
+            *self.active_thread_snapshot.borrow_mut() = entry.thread.clone();
+            *self.active_messages.borrow_mut() = visible_messages_for_cache(entry);
+        } else {
+            *self.active_thread_snapshot.borrow_mut() = None;
+            self.active_messages.borrow_mut().clear();
         }
     }
 
-    fn reload_threads(&self) {
-        let Some(workspace_id) = self.active_workspace_id.borrow().clone() else {
-            self.threads.borrow_mut().clear();
-            *self.active_thread_id.borrow_mut() = None;
+    fn restore_active_thread_scroll_after_render(&self) {
+        let Some(scroll_value) = self.active_thread_scroll_value() else {
             return;
         };
+        let scroll = self.messages_scroll.clone();
+        glib::idle_add_local_once(move || {
+            let adjustment = scroll.vadjustment();
+            let max_value = (adjustment.upper() - adjustment.page_size()).max(0.0);
+            adjustment.set_value(scroll_value.clamp(0.0, max_value));
+        });
+    }
 
-        match self.backend.list_threads(&workspace_id) {
-            Ok(mut threads) => {
-                if let Some(active_thread_id) = self.active_thread_id.borrow().clone() {
-                    if !threads.iter().any(|thread| thread.id == active_thread_id) {
-                        if let Ok(Some(active_thread)) = self.backend.get_thread(&active_thread_id)
-                        {
-                            if active_thread.workspace_id == workspace_id {
-                                threads.insert(0, active_thread);
-                            }
-                        }
-                    }
-                }
+    fn merge_thread_history(&self, thread_id: &str, messages: Vec<MessageDto>, complete: bool) {
+        let mut cache = self.thread_view_cache.borrow_mut();
+        let entry = cache.entry(thread_id.to_string()).or_default();
+        entry.messages = merge_messages(&entry.messages, &messages);
+        entry.history_complete = complete;
+    }
 
-                if self.active_thread_id.borrow().is_none() {
-                    *self.active_thread_id.borrow_mut() =
-                        threads.first().map(|thread| thread.id.clone());
-                }
-                *self.threads.borrow_mut() = threads;
-            }
-            Err(error) => self.toast(format!("{error:#}")),
+    fn reveal_cached_history(&self) {
+        let Some(thread_id) = self.active_thread_id.borrow().clone() else {
+            return;
+        };
+        let Some(messages) = self
+            .thread_view_cache
+            .borrow()
+            .get(&thread_id)
+            .map(|entry| entry.messages.clone())
+        else {
+            return;
+        };
+        if messages.len() <= self.active_messages.borrow().len() {
+            return;
         }
+
+        let adjustment = self.messages_scroll.vadjustment();
+        let old_upper = adjustment.upper();
+        let old_value = adjustment.value();
+        *self.active_messages.borrow_mut() = messages;
+        self.render_messages();
+        let scroll = self.messages_scroll.clone();
+        glib::idle_add_local_once(move || {
+            let adjustment = scroll.vadjustment();
+            let delta = adjustment.upper() - old_upper;
+            adjustment.set_value((old_value + delta).max(0.0));
+        });
+    }
+
+    fn apply_streaming_message_update(&self, thread_id: &str, message: MessageDto) {
+        {
+            let mut cache = self.thread_view_cache.borrow_mut();
+            let entry = cache.entry(thread_id.to_string()).or_default();
+            upsert_message(&mut entry.messages, message.clone());
+            if entry.thread.is_none() {
+                entry.thread = self.active_thread_snapshot.borrow().clone();
+            }
+        }
+
+        if self.active_thread_id.borrow().as_deref() != Some(thread_id) {
+            return;
+        }
+
+        upsert_message(&mut self.active_messages.borrow_mut(), message.clone());
+        if let Some(thread) = self.active_thread_snapshot.borrow_mut().as_mut() {
+            thread.status = ThreadStatusDto::Streaming;
+        }
+        self.refresh_message_widget(&message);
+        self.sync_composer_state();
+    }
+
+    fn snapshot_is_stale(&self, snapshot: &ViewSnapshot) -> bool {
+        let current_workspace_id = self.active_workspace_id.borrow().clone();
+        let current_thread_id = self.active_thread_id.borrow().clone();
+        snapshot_request_is_stale(
+            snapshot.requested_workspace_id.as_deref(),
+            snapshot.requested_thread_id.as_deref(),
+            current_workspace_id.as_deref(),
+            current_thread_id.as_deref(),
+        )
+    }
+
+    fn sync_active_workspace(&self) {
+        let Some(workspace_id) = self.active_workspace_id.borrow().clone() else {
+            return;
+        };
+        self.backend
+            .sync_codex_threads_for_workspace_async(workspace_id, self.ui_tx.clone());
     }
 
     fn render_all(&self) {
+        let started = Instant::now();
         self.render_workspaces();
         self.render_threads();
         self.render_thread_tabs();
         self.render_messages();
         self.sync_composer_state();
+        log_perf(
+            "ui.render_all",
+            started,
+            format!(
+                "workspaces={}, threads={}, messages={}",
+                self.workspaces.borrow().len(),
+                self.threads.borrow().len(),
+                self.active_messages.borrow().len()
+            ),
+        );
     }
 
     fn render_workspaces(&self) {
-        clear_list_box(&self.workspace_list);
         let active_id = self.active_workspace_id.borrow().clone();
         let query = self.search_entry.text().to_string().to_lowercase();
         let mut visible_ids = Vec::new();
+        let mut desired_rows = Vec::new();
 
         for (index, workspace) in self.workspaces.borrow().iter().enumerate() {
             if !query.is_empty()
@@ -2343,93 +3509,160 @@ impl AppController {
                 continue;
             }
             visible_ids.push(workspace.id.clone());
-            let row = gtk::ListBoxRow::new();
-            row.set_selectable(false);
-            row.set_activatable(true);
-            row.set_widget_name(&format!("workspace-row-{index}"));
-            let content = row_box(
-                "folder-symbolic",
-                &workspace.name,
-                Some(&workspace.root_path),
+            let is_active = active_id.as_deref() == Some(workspace.id.as_str());
+            let signature = format!(
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                workspace.id, workspace.name, workspace.root_path, is_active
             );
-            content.add_css_class("workspace-row");
-            if active_id.as_deref() == Some(workspace.id.as_str()) {
-                content.add_css_class("active");
-            }
-            row.set_child(Some(&content));
-            self.workspace_list.append(&row);
+            let row = {
+                let mut cache = self.workspace_row_cache.borrow_mut();
+                let entry = cache
+                    .entry(workspace.id.clone())
+                    .or_insert_with(|| CachedListRow {
+                        row: gtk::ListBoxRow::new(),
+                        signature: String::new(),
+                    });
+                if entry.signature != signature {
+                    entry.row.set_selectable(false);
+                    entry.row.set_activatable(true);
+                    entry.row.set_widget_name(&format!("workspace-row-{index}"));
+                    let content = row_box(
+                        "folder-symbolic",
+                        &workspace.name,
+                        Some(&workspace.root_path),
+                    );
+                    content.add_css_class("workspace-row");
+                    if is_active {
+                        content.add_css_class("active");
+                    }
+                    entry.row.set_child(Some(&content));
+                    entry.signature = signature;
+                }
+                entry.row.clone()
+            };
+            desired_rows.push(row);
         }
 
+        self.workspace_row_cache
+            .borrow_mut()
+            .retain(|workspace_id, _| visible_ids.iter().any(|id| id == workspace_id));
+        clear_list_box(&self.workspace_list);
+        for row in desired_rows {
+            self.workspace_list.append(&row);
+        }
         *self.visible_workspace_ids.borrow_mut() = visible_ids;
     }
 
     fn render_threads(&self) {
-        clear_list_box(&self.thread_list);
         let active_id = self.active_thread_id.borrow().clone();
         let query = self.search_entry.text().to_string().to_lowercase();
         let mut visible_ids = Vec::new();
+        let mut desired_rows = Vec::new();
 
         for thread in self.threads.borrow().iter() {
             if !query.is_empty() && !thread.title.to_lowercase().contains(&query) {
                 continue;
             }
             visible_ids.push(thread.id.clone());
-
-            let row = gtk::ListBoxRow::new();
-            row.set_selectable(false);
-            row.set_activatable(true);
-            let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-            content.add_css_class("thread-row");
-            if active_id.as_deref() == Some(thread.id.as_str()) {
-                content.add_css_class("active");
-            }
-
-            let dot = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            dot.add_css_class("status-dot");
-            dot.add_css_class(status_class(&thread.status));
-            dot.set_valign(gtk::Align::Center);
-            content.append(&dot);
-
-            let labels = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            labels.set_hexpand(true);
-            let title = gtk::Label::new(Some(thread.title.trim()));
-            title.add_css_class("row-title");
-            title.set_xalign(0.0);
-            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            title.set_max_width_chars(24);
-            let subtitle = gtk::Label::new(Some(&format!(
-                "{} messages - {}",
+            let is_active = active_id.as_deref() == Some(thread.id.as_str());
+            let is_running = self.backend.is_running(&thread.id);
+            let signature = format!(
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                thread.id,
+                thread.title,
                 thread.message_count,
-                compact_timestamp(&thread.last_activity_at)
-            )));
-            subtitle.add_css_class("row-subtitle");
-            subtitle.set_xalign(0.0);
-            subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            subtitle.set_max_width_chars(28);
-            labels.append(&title);
-            labels.append(&subtitle);
-            content.append(&labels);
+                thread.last_activity_at,
+                thread.status.as_str(),
+                is_active || is_running
+            );
+            let row = {
+                let mut cache = self.thread_row_cache.borrow_mut();
+                if cache
+                    .get(&thread.id)
+                    .is_some_and(|entry| entry.signature == signature)
+                {
+                    cache.get(&thread.id).map(|entry| entry.row.clone())
+                } else {
+                    let row = gtk::ListBoxRow::new();
+                    row.set_selectable(false);
+                    row.set_activatable(true);
+                    let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+                    content.add_css_class("thread-row");
+                    if is_active {
+                        content.add_css_class("active");
+                    }
 
-            if self.backend.is_running(&thread.id) {
-                let badge = gtk::Label::new(Some("Live"));
-                badge.add_css_class("row-badge");
-                content.append(&badge);
+                    let dot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                    dot.add_css_class("status-dot");
+                    dot.add_css_class(status_class(&thread.status));
+                    dot.set_valign(gtk::Align::Center);
+                    content.append(&dot);
+
+                    let labels = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                    labels.set_hexpand(true);
+                    let title_text = single_line_text(&thread.title);
+                    let title = gtk::Label::new(Some(&title_text));
+                    title.add_css_class("row-title");
+                    title.set_xalign(0.0);
+                    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                    title.set_lines(1);
+                    title.set_max_width_chars(24);
+                    title.set_overflow(gtk::Overflow::Hidden);
+                    title.set_single_line_mode(true);
+                    title.set_width_chars(1);
+                    title.set_wrap(false);
+                    let subtitle = gtk::Label::new(Some(&format!(
+                        "{} messages - {}",
+                        thread.message_count,
+                        compact_timestamp(&thread.last_activity_at)
+                    )));
+                    subtitle.add_css_class("row-subtitle");
+                    subtitle.set_xalign(0.0);
+                    subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                    subtitle.set_max_width_chars(28);
+                    labels.append(&title);
+                    labels.append(&subtitle);
+                    content.append(&labels);
+
+                    if is_running {
+                        let badge = gtk::Label::new(Some("Live"));
+                        badge.add_css_class("row-badge");
+                        content.append(&badge);
+                    }
+
+                    let middle_click = gtk::GestureClick::new();
+                    middle_click.set_button(gdk::BUTTON_MIDDLE);
+                    let ui_tx = self.ui_tx.clone();
+                    let thread_id = thread.id.clone();
+                    middle_click.connect_pressed(move |gesture, _, _, _| {
+                        let _ = gesture.set_state(gtk::EventSequenceState::Claimed);
+                        let _ = ui_tx.send(UiEvent::OpenThreadTab(thread_id.clone()));
+                    });
+                    row.add_controller(middle_click);
+
+                    row.set_child(Some(&content));
+                    cache.insert(
+                        thread.id.clone(),
+                        CachedListRow {
+                            row: row.clone(),
+                            signature,
+                        },
+                    );
+                    Some(row)
+                }
+            };
+            if let Some(row) = row {
+                desired_rows.push(row);
             }
-
-            let middle_click = gtk::GestureClick::new();
-            middle_click.set_button(gdk::BUTTON_MIDDLE);
-            let ui_tx = self.ui_tx.clone();
-            let thread_id = thread.id.clone();
-            middle_click.connect_pressed(move |gesture, _, _, _| {
-                let _ = gesture.set_state(gtk::EventSequenceState::Claimed);
-                let _ = ui_tx.send(UiEvent::OpenThreadTab(thread_id.clone()));
-            });
-            row.add_controller(middle_click);
-
-            row.set_child(Some(&content));
-            self.thread_list.append(&row);
         }
 
+        self.thread_row_cache
+            .borrow_mut()
+            .retain(|thread_id, _| visible_ids.iter().any(|id| id == thread_id));
+        clear_list_box(&self.thread_list);
+        for row in desired_rows {
+            self.thread_list.append(&row);
+        }
         *self.visible_thread_ids.borrow_mut() = visible_ids;
     }
 
@@ -2546,85 +3779,126 @@ impl AppController {
             .find(|thread| thread.id == thread_id)
             .map(|thread| thread.title.clone())
             .or_else(|| {
-                self.backend
-                    .get_thread(thread_id)
-                    .ok()
-                    .flatten()
-                    .map(|thread| thread.title)
+                self.active_thread_snapshot
+                    .borrow()
+                    .as_ref()
+                    .filter(|thread| thread.id == thread_id)
+                    .map(|thread| thread.title.clone())
             })
             .unwrap_or_else(|| "Thread".to_string());
         let title = title.trim();
         if title.is_empty() {
             "Thread".to_string()
         } else {
-            title.to_string()
+            single_line_text(title)
         }
     }
 
     fn render_messages(&self) {
+        let started = Instant::now();
+        self.render_widgets_created.set(0);
+        let stick_to_bottom = self.messages_scroll_is_near_bottom();
         clear_box(&self.messages_box);
         let Some(thread_id) = self.active_thread_id.borrow().clone() else {
             self.render_empty("Aucun thread selectionne");
             self.title_label.set_text("SupaCodex");
             self.title_label.set_tooltip_text(None);
             self.subtitle_label.set_text("codex");
+            self.title_label.queue_draw();
+            self.subtitle_label.queue_draw();
+            self.window.queue_draw();
             self.render_runtime_controls(None);
             return;
         };
 
-        let thread = match self.backend.get_thread(&thread_id) {
-            Ok(Some(thread)) => thread,
-            Ok(None) => {
-                self.render_empty("Thread introuvable");
-                return;
-            }
-            Err(error) => {
-                self.render_empty(&format!("{error:#}"));
-                return;
-            }
+        let Some(thread) = self.active_thread_snapshot.borrow().clone() else {
+            self.render_empty("Chargement du thread...");
+            self.render_runtime_controls(None);
+            return;
+        };
+        if thread.id != thread_id {
+            self.render_empty("Chargement du thread...");
+            self.render_runtime_controls(None);
+            return;
         };
 
-        let header_title = thread.title.trim();
+        let editing_active_thread = self
+            .editing_message
+            .borrow()
+            .as_ref()
+            .is_some_and(|state| state.thread_id == thread.id);
+        if !editing_active_thread
+            && !self.backend.is_running(&thread.id)
+            && codex_transcript_sync_needed(&thread)
+        {
+            self.backend.sync_codex_thread_transcript_if_needed_async(
+                thread.id.clone(),
+                self.ui_tx.clone(),
+            );
+        }
+
+        let header_title = single_line_text(thread.title.trim());
         let header_title = if header_title.is_empty() {
-            "Thread"
+            "Thread".to_string()
         } else {
             header_title
         };
-        self.title_label.set_text(header_title);
-        self.title_label.set_tooltip_text(Some(header_title));
+        self.title_label.set_text(&header_title);
+        self.title_label.set_tooltip_text(Some(&header_title));
         self.subtitle_label.set_text(&format!(
             "{} - {} - {} tokens",
             thread.engine_id, thread.model_id, thread.total_tokens
         ));
+        self.title_label.queue_draw();
+        self.subtitle_label.queue_draw();
+        self.window.queue_draw();
         self.render_runtime_controls(Some(&thread));
         self.send_button
             .set_icon_name(if self.backend.is_running(&thread.id) {
                 "process-stop-symbolic"
             } else {
-                "send-symbolic"
+                "mail-send-symbolic"
             });
 
-        match self.backend.get_messages(&thread_id) {
-            Ok(messages) if messages.is_empty() => {
-                self.render_empty("Pret a demarrer une conversation.");
+        let messages = self.active_messages.borrow().clone();
+        if messages.is_empty() {
+            self.render_empty("Pret a demarrer une conversation.");
+        } else {
+            let mut user_turn_index = 0usize;
+            for message in messages {
+                let message_user_turn_index = if message.role == "user" {
+                    let index = user_turn_index;
+                    user_turn_index += 1;
+                    Some(index)
+                } else {
+                    None
+                };
+                self.render_message(&thread, &message, message_user_turn_index);
             }
-            Ok(messages) => {
-                for message in messages {
-                    self.render_message(&thread, &message);
-                }
-                let scroll = self.messages_scroll.clone();
-                glib::idle_add_local_once(move || {
-                    let adjustment = scroll.vadjustment();
-                    adjustment.set_value(adjustment.upper());
-                });
+            if stick_to_bottom {
+                self.scroll_messages_to_bottom();
+            } else if self.active_thread_scroll_value().is_none() {
+                self.scroll_messages_to_bottom();
+            } else {
+                self.restore_active_thread_scroll_after_render();
             }
-            Err(error) => self.render_empty(&format!("{error:#}")),
         }
+        log_perf(
+            "ui.render_messages",
+            started,
+            format!(
+                "messages={}, widgets_created={}",
+                self.active_messages.borrow().len(),
+                self.render_widgets_created.get()
+            ),
+        );
     }
 
     fn render_empty(&self, text: &str) {
         let empty = gtk::Box::new(gtk::Orientation::Vertical, 10);
         empty.add_css_class("empty-state");
+        self.render_widgets_created
+            .set(self.render_widgets_created.get().saturating_add(2));
         empty.set_halign(gtk::Align::Center);
         empty.set_valign(gtk::Align::Start);
         let icon = gtk::Image::from_icon_name("dialog-information-symbolic");
@@ -2637,9 +3911,46 @@ impl AppController {
         self.messages_box.append(&empty);
     }
 
+    fn messages_scroll_is_near_bottom(&self) -> bool {
+        let adjustment = self.messages_scroll.vadjustment();
+        let distance = adjustment.upper() - adjustment.page_size() - adjustment.value();
+        distance <= 48.0
+    }
+
+    fn scroll_messages_to_bottom(&self) {
+        let scroll = self.messages_scroll.clone();
+        glib::idle_add_local_once(move || {
+            scroll_scrolled_window_to_bottom(&scroll);
+            settle_scrolled_window_to_bottom(
+                scroll,
+                MESSAGE_SCROLL_SETTLE_PASSES,
+                MESSAGE_SCROLL_SETTLE_INTERVAL,
+            );
+        });
+    }
+
     fn render_runtime_controls(&self, thread: Option<&ThreadDto>) {
         let active_profile_id = self.backend.active_codex_profile_id();
         let profiles = self.backend.codex_profiles();
+        let workspace_id = thread
+            .map(|thread| thread.workspace_id.clone())
+            .or_else(|| self.active_workspace_id.borrow().clone());
+        let trust_level = if workspace_id.is_some() {
+            self.active_trust_level.borrow().clone()
+        } else {
+            TrustLevelDto::Standard
+        };
+        let signature = format!(
+            "{}\u{1f}{:?}\u{1f}{}",
+            active_profile_id,
+            workspace_id,
+            trust_level.as_str()
+        );
+        if self.runtime_controls_signature.borrow().as_str() == signature {
+            return;
+        }
+        *self.runtime_controls_signature.borrow_mut() = signature;
+
         let active_profile_label = profiles
             .iter()
             .find(|profile| profile.id == active_profile_id)
@@ -2649,14 +3960,6 @@ impl AppController {
         self.profile_button.set_popover(Some(
             &self.build_profile_popover(&profiles, &active_profile_id),
         ));
-
-        let workspace_id = thread
-            .map(|thread| thread.workspace_id.clone())
-            .or_else(|| self.active_workspace_id.borrow().clone());
-        let trust_level = workspace_id
-            .as_deref()
-            .map(|workspace_id| self.backend.workspace_trust_level(workspace_id))
-            .unwrap_or(TrustLevelDto::Standard);
         self.permission_button_label
             .set_text(trust_level_label(&trust_level));
         self.permission_button.set_popover(Some(
@@ -2723,8 +4026,61 @@ impl AppController {
         popover
     }
 
-    fn render_message(&self, thread: &ThreadDto, message: &MessageDto) {
+    fn editing_state_for_message(
+        &self,
+        thread_id: &str,
+        message: &MessageDto,
+        user_turn_index: Option<usize>,
+    ) -> Option<EditingMessageState> {
+        let state = self.editing_message.borrow().clone()?;
+        if state.thread_id != thread_id || message.role != "user" {
+            return None;
+        }
+        if state.message_id == message.id || user_turn_index == Some(state.user_turn_index) {
+            Some(state)
+        } else {
+            None
+        }
+    }
+
+    fn render_message(
+        &self,
+        thread: &ThreadDto,
+        message: &MessageDto,
+        user_turn_index: Option<usize>,
+    ) {
+        let Some(widget) = self.build_message_widget(thread, message, user_turn_index) else {
+            return;
+        };
+        self.message_widget_cache
+            .borrow_mut()
+            .insert(message.id.clone(), widget.clone());
+        self.messages_box.append(&widget);
+    }
+
+    fn build_message_widget(
+        &self,
+        thread: &ThreadDto,
+        message: &MessageDto,
+        user_turn_index: Option<usize>,
+    ) -> Option<gtk::Widget> {
+        self.render_widgets_created
+            .set(self.render_widgets_created.get().saturating_add(1));
         let is_user = message.role == "user";
+        let mut editing = self.editing_state_for_message(&thread.id, message, user_turn_index);
+        if let Some(editing_state) = editing.as_mut() {
+            if editing_state.message_id != message.id {
+                editing_state.message_id = message.id.clone();
+                if let Some(current) = self.editing_message.borrow_mut().as_mut() {
+                    if current.thread_id == thread.id
+                        && current.user_turn_index == editing_state.user_turn_index
+                    {
+                        current.message_id = message.id.clone();
+                    }
+                }
+            }
+        }
+        let is_editing = editing.is_some();
         let blocks = parse_blocks(message);
         let has_visible_blocks = blocks.iter().any(block_has_visible_content);
         let fallback_text = message.content.as_deref().unwrap_or("").trim().to_string();
@@ -2739,14 +4095,24 @@ impl AppController {
             }
         };
         if empty_status_text.is_none() && !has_visible_blocks && fallback_text.is_empty() {
-            return;
+            return None;
         }
 
         let outer = gtk::Box::new(gtk::Orientation::Vertical, 3);
         outer.set_hexpand(true);
-        outer.set_margin_start(if is_user { 160 } else { 0 });
+        outer.set_margin_start(if is_user {
+            if is_editing {
+                96
+            } else {
+                160
+            }
+        } else {
+            0
+        });
         outer.set_margin_end(if is_user { 0 } else { 160 });
-        outer.set_halign(if is_user {
+        outer.set_halign(if is_editing {
+            gtk::Align::Fill
+        } else if is_user {
             gtk::Align::End
         } else {
             gtk::Align::Start
@@ -2759,6 +4125,10 @@ impl AppController {
         } else {
             card.add_css_class("assistant-message");
         }
+        if is_editing {
+            card.add_css_class("message-editing");
+            card.set_hexpand(true);
+        }
         outer.append(&card);
 
         let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -2768,7 +4138,7 @@ impl AppController {
         author.set_xalign(0.0);
         author.set_hexpand(true);
         toolbar.append(&author);
-        if is_user {
+        if is_user && !is_editing {
             let edit_button = gtk::Button::builder()
                 .icon_name("document-edit-symbolic")
                 .tooltip_text("Modifier et reprendre depuis ce message")
@@ -2776,15 +4146,25 @@ impl AppController {
             edit_button.add_css_class("message-edit-button");
             edit_button.set_has_frame(false);
             let ui_tx = self.ui_tx.clone();
+            let thread_id = thread.id.clone();
             let message_id = message.id.clone();
+            let user_turn_index = user_turn_index.unwrap_or_default();
+            let content = message_plain_text(message).unwrap_or_default();
             edit_button.connect_clicked(move |_| {
-                let _ = ui_tx.send(UiEvent::EditMessage(message_id.clone()));
+                let _ = ui_tx.send(UiEvent::StartEditMessage {
+                    thread_id: thread_id.clone(),
+                    message_id: message_id.clone(),
+                    user_turn_index,
+                    content: content.clone(),
+                });
             });
             toolbar.append(&edit_button);
         }
         card.append(&toolbar);
 
-        if let Some(status_text) = empty_status_text {
+        if let Some(editing_state) = editing {
+            self.render_inline_message_editor(&card, editing_state);
+        } else if let Some(status_text) = empty_status_text {
             let pending = gtk::Label::new(Some(status_text));
             pending.add_css_class("dim-label");
             pending.set_xalign(0.0);
@@ -2792,19 +4172,165 @@ impl AppController {
         } else if !has_visible_blocks {
             card.append(&message_label(&fallback_text));
         } else {
-            for block in blocks {
-                self.render_block(thread, &card, block);
+            for (block_index, block) in blocks.into_iter().enumerate() {
+                self.render_block(thread, message, &card, block_index, block);
             }
         }
 
-        self.messages_box.append(&outer);
+        Some(outer.upcast::<gtk::Widget>())
     }
 
-    fn render_block(&self, thread: &ThreadDto, parent: &gtk::Box, block: NativeContentBlock) {
+    fn refresh_message_widget(&self, message: &MessageDto) {
+        let Some(thread) = self.active_thread_snapshot.borrow().clone() else {
+            return;
+        };
+        let user_turn_index = self.user_turn_index_for_message(&message.id);
+        let Some(widget) = self.build_message_widget(&thread, message, user_turn_index) else {
+            return;
+        };
+        let stick_to_bottom = self.messages_scroll_is_near_bottom();
+        let previous = self
+            .message_widget_cache
+            .borrow_mut()
+            .insert(message.id.clone(), widget.clone());
+        if let Some(previous) = previous.filter(|widget| widget.parent().is_some()) {
+            let previous_sibling = previous.prev_sibling();
+            self.messages_box.remove(&previous);
+            self.messages_box
+                .insert_child_after(&widget, previous_sibling.as_ref());
+        } else {
+            self.messages_box.append(&widget);
+        }
+        if stick_to_bottom {
+            self.scroll_messages_to_bottom();
+        }
+    }
+
+    fn user_turn_index_for_message(&self, message_id: &str) -> Option<usize> {
+        let mut user_turn_index = 0usize;
+        for message in self.active_messages.borrow().iter() {
+            if message.id == message_id {
+                return (message.role == "user").then_some(user_turn_index);
+            }
+            if message.role == "user" {
+                user_turn_index += 1;
+            }
+        }
+        None
+    }
+
+    fn render_inline_message_editor(&self, parent: &gtk::Box, state: EditingMessageState) {
+        let editor = gtk::TextView::new();
+        editor.add_css_class("composer-view");
+        editor.add_css_class("message-edit-view");
+        editor.set_wrap_mode(gtk::WrapMode::WordChar);
+        editor.set_vexpand(false);
+        editor.set_monospace(false);
+        editor.set_top_margin(6);
+        editor.set_bottom_margin(6);
+        editor.set_left_margin(6);
+        editor.set_right_margin(6);
+        editor.buffer().set_text(&state.draft);
+
+        let buffer = editor.buffer();
+        let ui_tx = self.ui_tx.clone();
+        let message_id = state.message_id.clone();
+        let user_turn_index = state.user_turn_index;
+        buffer.connect_changed(move |buffer| {
+            let content = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                .to_string();
+            let _ = ui_tx.send(UiEvent::UpdateEditMessageDraft {
+                message_id: message_id.clone(),
+                user_turn_index,
+                content,
+            });
+        });
+
+        let key_controller = gtk::EventControllerKey::new();
+        let ui_tx = self.ui_tx.clone();
+        let message_id = state.message_id.clone();
+        key_controller.connect_key_pressed(move |_, key, _, modifiers| {
+            if key == gdk::Key::Escape {
+                let _ = ui_tx.send(UiEvent::CancelEditMessage(message_id.clone()));
+                return glib::Propagation::Stop;
+            }
+            if key == gdk::Key::Return && modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
+                let _ = ui_tx.send(UiEvent::SubmitEditMessage(message_id.clone()));
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        editor.add_controller(key_controller);
+
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .min_content_height(92)
+            .max_content_height(240)
+            .build();
+        scroller.add_css_class("message-edit-scroll");
+        scroller.set_hexpand(true);
+        scroller.set_child(Some(&editor));
+        parent.append(&scroller);
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.add_css_class("message-edit-actions");
+        actions.set_halign(gtk::Align::End);
+
+        let cancel = gtk::Button::with_label("Annuler");
+        let ui_tx = self.ui_tx.clone();
+        let message_id = state.message_id.clone();
+        cancel.connect_clicked(move |_| {
+            let _ = ui_tx.send(UiEvent::CancelEditMessage(message_id.clone()));
+        });
+        actions.append(&cancel);
+
+        let resume = gtk::Button::with_label("Reprendre");
+        resume.add_css_class("suggested-action");
+        let ui_tx = self.ui_tx.clone();
+        let message_id = state.message_id.clone();
+        resume.connect_clicked(move |_| {
+            let _ = ui_tx.send(UiEvent::SubmitEditMessage(message_id.clone()));
+        });
+        actions.append(&resume);
+        parent.append(&actions);
+
+        let editor_for_focus = editor.clone();
+        glib::idle_add_local_once(move || {
+            editor_for_focus.grab_focus();
+            let buffer = editor_for_focus.buffer();
+            let end = buffer.end_iter();
+            buffer.place_cursor(&end);
+        });
+    }
+
+    fn render_block(
+        &self,
+        thread: &ThreadDto,
+        message: &MessageDto,
+        parent: &gtk::Box,
+        block_index: usize,
+        block: NativeContentBlock,
+    ) {
         match block {
-            NativeContentBlock::Text { content, .. } | NativeContentBlock::Thinking { content } => {
+            NativeContentBlock::Text { content, .. } => {
                 if !content.trim().is_empty() {
                     parent.append(&message_label(&content));
+                }
+            }
+            NativeContentBlock::Thinking { content } => {
+                if !content.trim().is_empty() {
+                    let key = collapsible_block_key(&message.id, block_index, "thinking");
+                    let card = self.collapsible_text_card(
+                        key,
+                        "Reflexion",
+                        None,
+                        &content,
+                        "reasoning-block",
+                        Some("reasoning-text"),
+                    );
+                    parent.append(&card);
                 }
             }
             NativeContentBlock::Error { message } => {
@@ -2816,11 +4342,13 @@ impl AppController {
                 parent.append(&card);
             }
             NativeContentBlock::Diff { diff, scope } => {
-                let title = format!("Diff {scope}");
-                let card = code_card(&title, &diff);
+                let title = changes_title(&scope);
+                let key = collapsible_block_key(&message.id, block_index, "diff");
+                let card = self.collapsible_code_card(key, &title, Some("Diff du code"), &diff);
                 parent.append(&card);
             }
             NativeContentBlock::Action {
+                action_id,
                 summary,
                 action_type,
                 output_chunks,
@@ -2834,15 +4362,30 @@ impl AppController {
                     .collect::<Vec<_>>()
                     .join("");
                 if body.trim().is_empty() {
-                    if let Some(result) = result {
+                    if let Some(result) = result.as_ref() {
                         body = result
                             .output
-                            .or(result.error)
-                            .or(result.diff)
+                            .clone()
+                            .or_else(|| result.error.clone())
                             .unwrap_or_else(|| "Termine".to_string());
                     }
                 }
                 parent.append(&code_card(&title, &body));
+
+                if let Some(diff) = result
+                    .as_ref()
+                    .and_then(|result| result.diff.as_deref())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    let key = collapsible_block_key(
+                        &message.id,
+                        block_index,
+                        &format!("action-diff-{action_id}"),
+                    );
+                    let card = self.collapsible_code_card(key, "Changements", Some(&summary), diff);
+                    parent.append(&card);
+                }
             }
             NativeContentBlock::Approval {
                 approval_id,
@@ -2939,13 +4482,141 @@ impl AppController {
         }
     }
 
+    fn collapsible_text_card(
+        &self,
+        state_key: String,
+        title: &str,
+        subtitle: Option<&str>,
+        body: &str,
+        block_class: &str,
+        body_class: Option<&str>,
+    ) -> gtk::Box {
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let label = message_label(body);
+        if let Some(body_class) = body_class {
+            label.add_css_class(body_class);
+        }
+        content.append(&label);
+        self.collapsible_block_card(
+            state_key,
+            title,
+            subtitle,
+            content.upcast::<gtk::Widget>(),
+            block_class,
+        )
+    }
+
+    fn collapsible_code_card(
+        &self,
+        state_key: String,
+        title: &str,
+        subtitle: Option<&str>,
+        body: &str,
+    ) -> gtk::Box {
+        self.collapsible_block_card(
+            state_key,
+            title,
+            subtitle,
+            code_output_content(body).upcast::<gtk::Widget>(),
+            "changes-block",
+        )
+    }
+
+    fn collapsible_block_card(
+        &self,
+        state_key: String,
+        title: &str,
+        subtitle: Option<&str>,
+        child: gtk::Widget,
+        block_class: &str,
+    ) -> gtk::Box {
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        card.add_css_class("block-card");
+        card.add_css_class("collapsible-block");
+        card.add_css_class(block_class);
+
+        let expanded = self
+            .collapsible_block_expanded
+            .borrow()
+            .get(&state_key)
+            .copied()
+            .unwrap_or(true);
+
+        let header_button = gtk::Button::new();
+        header_button.add_css_class("collapsible-toggle");
+        header_button.set_has_frame(false);
+        header_button.set_halign(gtk::Align::Fill);
+        header_button.set_hexpand(true);
+
+        let header_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        header_row.add_css_class("collapsible-title-row");
+        header_row.set_halign(gtk::Align::Fill);
+        header_row.set_hexpand(true);
+
+        let icon = gtk::Image::from_icon_name(if expanded {
+            "pan-down-symbolic"
+        } else {
+            "pan-end-symbolic"
+        });
+        icon.add_css_class("collapsible-chevron");
+        icon.set_pixel_size(12);
+        icon.set_valign(gtk::Align::Start);
+        header_row.append(&icon);
+
+        let header = collapsible_header(title, subtitle);
+        header.set_hexpand(true);
+        header_row.append(&header);
+        header_button.set_child(Some(&header_row));
+        card.append(&header_button);
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.add_css_class("collapsible-content");
+        content.append(&child);
+
+        let revealer = gtk::Revealer::new();
+        revealer.set_transition_type(gtk::RevealerTransitionType::None);
+        revealer.set_reveal_child(expanded);
+        revealer.set_child(Some(&content));
+        card.append(&revealer);
+
+        let expanded_state = Rc::clone(&self.collapsible_block_expanded);
+        let revealer_for_toggle = revealer.clone();
+        let icon_for_toggle = icon.clone();
+        header_button.connect_clicked(move |_| {
+            let next = !revealer_for_toggle.property::<bool>("reveal-child");
+            revealer_for_toggle.set_reveal_child(next);
+            icon_for_toggle.set_icon_name(Some(if next {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            }));
+            expanded_state.borrow_mut().insert(state_key.clone(), next);
+        });
+        card
+    }
+
     fn submit_or_cancel(&self) {
-        let Some(thread_id) = self.ensure_thread() else {
+        let active_thread_id = self.active_thread_id.borrow().clone();
+        if let Some(thread_id) = active_thread_id.as_ref() {
+            if self.backend.is_running(thread_id) {
+                self.backend
+                    .cancel_turn(thread_id.clone(), self.ui_tx.clone());
+                return;
+            }
+        }
+
+        let workspace_id = self.active_workspace_id.borrow().clone().or_else(|| {
+            self.workspaces
+                .borrow()
+                .first()
+                .map(|workspace| workspace.id.clone())
+        });
+        let Some(workspace_id) = workspace_id else {
             return;
         };
 
-        if self.backend.is_running(&thread_id) {
-            self.backend.cancel_turn(thread_id, self.ui_tx.clone());
+        if active_thread_id.is_none() && self.backend.is_creating_thread(&workspace_id) {
+            self.toast("Creation du thread en cours.".to_string());
             return;
         }
 
@@ -2961,41 +4632,43 @@ impl AppController {
         if message.is_empty() && attachments.is_empty() {
             return;
         }
+
+        if let Some(thread_id) = active_thread_id {
+            self.backend
+                .send_message(thread_id, message, attachments, self.ui_tx.clone());
+        } else if !self.backend.create_thread_and_send_message_async(
+            workspace_id,
+            message,
+            attachments,
+            self.ui_tx.clone(),
+        ) {
+            self.toast("Creation du thread en cours.".to_string());
+            return;
+        }
+
         buffer.set_text("");
         self.pending_attachments.borrow_mut().clear();
         self.render_attachment_bar();
         self.composer.grab_focus();
-        self.backend
-            .send_message(thread_id, message, attachments, self.ui_tx.clone());
     }
 
-    fn ensure_thread(&self) -> Option<String> {
-        if let Some(thread_id) = self.active_thread_id.borrow().clone() {
-            return Some(thread_id);
-        }
-        self.create_thread()
-    }
-
-    fn create_thread(&self) -> Option<String> {
-        let workspace_id = self.active_workspace_id.borrow().clone().or_else(|| {
+    fn request_create_thread(&self) {
+        let Some(workspace_id) = self.active_workspace_id.borrow().clone().or_else(|| {
             self.workspaces
                 .borrow()
                 .first()
                 .map(|workspace| workspace.id.clone())
-        })?;
+        }) else {
+            return;
+        };
 
-        match self.backend.create_thread(&workspace_id) {
-            Ok(thread) => {
-                *self.active_thread_id.borrow_mut() = Some(thread.id.clone());
-                self.reload_threads();
-                self.render_all();
-                self.composer.grab_focus();
-                Some(thread.id)
-            }
-            Err(error) => {
-                self.toast(format!("{error:#}"));
-                None
-            }
+        if !self
+            .backend
+            .create_thread_async(workspace_id, self.ui_tx.clone())
+        {
+            self.toast("Creation du thread en cours.".to_string());
+        } else {
+            *self.editing_message.borrow_mut() = None;
         }
     }
 
@@ -3008,10 +4681,15 @@ impl AppController {
         else {
             return;
         };
+        self.remember_active_thread_scroll();
+        *self.editing_message.borrow_mut() = None;
         *self.active_workspace_id.borrow_mut() = Some(workspace_id);
         *self.active_thread_id.borrow_mut() = None;
-        self.reload_threads();
+        *self.active_thread_snapshot.borrow_mut() = None;
+        self.active_messages.borrow_mut().clear();
         self.render_all();
+        self.request_view_snapshot();
+        self.sync_active_workspace();
     }
 
     fn select_thread_by_index(&self, index: i32) {
@@ -3023,9 +4701,22 @@ impl AppController {
         else {
             return;
         };
+        if self.active_thread_id.borrow().as_deref() != Some(thread_id.as_str()) {
+            self.remember_active_thread_scroll();
+            *self.editing_message.borrow_mut() = None;
+        }
         *self.active_thread_id.borrow_mut() = Some(thread_id);
+        self.restore_cached_thread_view();
         self.render_all();
+        self.request_view_snapshot();
         self.composer.grab_focus();
+    }
+
+    fn refocus_window_after_native_dialog(&self) {
+        let window = self.window.clone();
+        glib::idle_add_local_once(move || {
+            window.present();
+        });
     }
 
     fn open_workspace_dialog(self: &Rc<Self>) {
@@ -3038,8 +4729,9 @@ impl AppController {
             Some(&self.window),
             None::<&gio::Cancellable>,
             move |result| {
-                if let Ok(file) = result {
-                    if let Some(controller) = weak.upgrade() {
+                if let Some(controller) = weak.upgrade() {
+                    controller.refocus_window_after_native_dialog();
+                    if let Ok(file) = result {
                         if let Some(path) = file.path() {
                             controller.open_workspace_path(&path);
                         }
@@ -3059,6 +4751,10 @@ impl AppController {
             Some(&self.window),
             None::<&gio::Cancellable>,
             move |result| {
+                let Some(controller) = weak.upgrade() else {
+                    return;
+                };
+                controller.refocus_window_after_native_dialog();
                 let Ok(files) = result else {
                     return;
                 };
@@ -3073,9 +4769,7 @@ impl AppController {
                         }
                     }
                 }
-                if let Some(controller) = weak.upgrade() {
-                    controller.add_attachments(paths);
-                }
+                controller.add_attachments(paths);
             },
         );
     }
@@ -3084,37 +4778,68 @@ impl AppController {
         if paths.is_empty() {
             return;
         }
-        let mut attachments = self.pending_attachments.borrow_mut();
-        for path in paths {
-            let path_string = path.to_string_lossy().to_string();
-            if attachments
-                .iter()
-                .any(|attachment| attachment.file_path == path_string)
-            {
-                continue;
-            }
-            let Ok(metadata) = fs::metadata(&path) else {
-                self.toast(format!("Fichier introuvable: {path_string}"));
-                continue;
-            };
-            if !metadata.is_file() {
-                continue;
-            }
-            let file_name = path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("fichier")
-                .to_string();
-            attachments.push(PendingAttachment {
-                mime_type: guess_mime_type(&path),
-                file_name,
-                file_path: path_string,
-                size_bytes: metadata.len(),
-            });
+
+        let mut seen = self
+            .pending_attachments
+            .borrow()
+            .iter()
+            .map(|attachment| attachment.file_path.clone())
+            .collect::<HashSet<_>>();
+        let paths = paths
+            .into_iter()
+            .filter(|path| seen.insert(path.to_string_lossy().to_string()))
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return;
         }
-        drop(attachments);
-        self.render_attachment_bar();
-        self.sync_composer_state();
+
+        let insertion_offset = self.composer.buffer().cursor_position();
+        let ui_tx = self.ui_tx.clone();
+        self.backend.runtime.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                paths
+                    .into_iter()
+                    .filter_map(|path| match resolve_pending_attachment(path) {
+                        Ok(Some(attachment)) => Some(Ok(attachment)),
+                        Ok(None) => None,
+                        Err(error) => Some(Err(error)),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+
+            match result {
+                Ok(attachments) => {
+                    let _ = ui_tx.send(UiEvent::AttachmentsResolved {
+                        insertion_offset,
+                        results: attachments,
+                    });
+                }
+                Err(error) => {
+                    let _ = ui_tx.send(UiEvent::Toast(format!(
+                        "Impossible d'ajouter les pieces jointes: {error}"
+                    )));
+                }
+            }
+        });
+    }
+
+    fn queue_attachment_thumbnail(&self, attachment: &PendingAttachment) {
+        if !is_image_attachment(attachment) {
+            return;
+        }
+
+        let file_path = attachment.file_path.clone();
+        let ui_tx = self.ui_tx.clone();
+        self.backend.runtime.spawn(async move {
+            let task_file_path = file_path.clone();
+            let result =
+                tokio::task::spawn_blocking(move || build_attachment_thumbnail(&task_file_path))
+                    .await
+                    .map_err(|error| format!("Generation du thumbnail interrompue: {error}"))
+                    .and_then(|result| result);
+            let _ = ui_tx.send(UiEvent::AttachmentThumbnailReady { file_path, result });
+        });
     }
 
     fn render_attachment_bar(&self) {
@@ -3123,61 +4848,312 @@ impl AppController {
         self.attachment_bar.set_visible(!attachments.is_empty());
 
         for (index, attachment) in attachments.iter().enumerate() {
-            let chip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            chip.add_css_class("attachment-chip");
-
             if is_image_attachment(attachment) {
-                let file = gio::File::for_path(&attachment.file_path);
-                let picture = gtk::Picture::for_file(&file);
-                picture.add_css_class("attachment-thumb");
-                picture.set_size_request(28, 28);
-                picture.set_content_fit(gtk::ContentFit::Cover);
-                chip.append(&picture);
+                let chip = gtk::Overlay::new();
+                chip.add_css_class("attachment-image-chip");
+                chip.set_halign(gtk::Align::Start);
+                chip.set_hexpand(false);
+                chip.set_valign(gtk::Align::Start);
+                chip.set_vexpand(false);
+                chip.set_size_request(ATTACHMENT_PREVIEW_WIDTH, ATTACHMENT_PREVIEW_HEIGHT);
+                chip.set_overflow(gtk::Overflow::Hidden);
+                let preview = attachment_preview_widget(attachment);
+                chip.set_child(Some(&preview));
+
+                let meta = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                meta.add_css_class("attachment-image-meta");
+                meta.set_halign(gtk::Align::Start);
+                meta.set_valign(gtk::Align::End);
+                let title = gtk::Label::new(Some(&attachment.file_name));
+                title.add_css_class("attachment-image-title");
+                title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                title.set_max_width_chars(10);
+                title.set_tooltip_text(Some(&attachment.file_name));
+                title.set_xalign(0.0);
+                let size = gtk::Label::new(Some(&format_size(attachment.size_bytes)));
+                size.add_css_class("attachment-image-size");
+                size.set_xalign(0.0);
+                meta.append(&title);
+                meta.append(&size);
+                chip.add_overlay(&meta);
+
+                let remove = attachment_remove_button(index, &self.ui_tx);
+                chip.add_overlay(&remove);
+                self.attachment_bar.append(&chip);
             } else {
+                let chip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                chip.add_css_class("attachment-chip");
+                chip.set_halign(gtk::Align::Start);
+                chip.set_hexpand(false);
+
                 let icon = gtk::Image::from_icon_name("text-x-generic-symbolic");
                 icon.set_pixel_size(16);
                 chip.append(&icon);
+
+                let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                let title = gtk::Label::new(Some(&attachment.file_name));
+                title.add_css_class("row-title");
+                title.set_xalign(0.0);
+                title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                title.set_max_width_chars(22);
+                let subtitle = gtk::Label::new(Some(&format_size(attachment.size_bytes)));
+                subtitle.add_css_class("row-subtitle");
+                subtitle.set_xalign(0.0);
+                labels.append(&title);
+                labels.append(&subtitle);
+                chip.append(&labels);
+
+                chip.append(&attachment_remove_button(index, &self.ui_tx));
+                self.attachment_bar.append(&chip);
             }
-
-            let labels = gtk::Box::new(gtk::Orientation::Vertical, 0);
-            let title = gtk::Label::new(Some(&attachment.file_name));
-            title.add_css_class("row-title");
-            title.set_xalign(0.0);
-            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            title.set_max_width_chars(22);
-            let subtitle = gtk::Label::new(Some(&format_size(attachment.size_bytes)));
-            subtitle.add_css_class("row-subtitle");
-            subtitle.set_xalign(0.0);
-            labels.append(&title);
-            labels.append(&subtitle);
-            chip.append(&labels);
-
-            let remove = gtk::Button::builder()
-                .icon_name("window-close-symbolic")
-                .tooltip_text("Retirer")
-                .build();
-            let ui_tx = self.ui_tx.clone();
-            remove.connect_clicked(move |_| {
-                let _ = ui_tx.send(UiEvent::RemoveAttachment(index));
-            });
-            chip.append(&remove);
-            self.attachment_bar.append(&chip);
         }
     }
 
-    fn open_workspace_path(&self, path: &Path) {
-        match self.backend.open_workspace(&path.to_string_lossy()) {
-            Ok(workspace) => {
-                if let Ok(workspaces) = self.backend.list_workspaces() {
-                    *self.workspaces.borrow_mut() = workspaces;
-                }
-                *self.active_workspace_id.borrow_mut() = Some(workspace.id);
-                *self.active_thread_id.borrow_mut() = None;
-                self.reload_threads();
-                self.render_all();
-            }
-            Err(error) => self.toast(format!("{error:#}")),
+    fn insert_attachment_mentions(&self, insertion_offset: i32, mentions: &[String]) {
+        if mentions.is_empty() {
+            return;
         }
+
+        let buffer = self.composer.buffer();
+        let offset = insertion_offset.clamp(0, buffer.char_count());
+        let iter = buffer.iter_at_offset(offset);
+        let before = buffer.text(&buffer.start_iter(), &iter, false).to_string();
+        let after = buffer.text(&iter, &buffer.end_iter(), false).to_string();
+        let text = attachment_mention_insert_text(&before, &after, mentions);
+
+        let mut insert_iter = buffer.iter_at_offset(offset);
+        let tag = attachment_mention_tag(&buffer);
+        buffer.insert(&mut insert_iter, &text);
+        apply_attachment_mention_tags(&buffer, offset, &text, mentions, &tag);
+        buffer.place_cursor(&insert_iter);
+        self.composer.grab_focus();
+    }
+
+    fn remove_attachment_mention(&self, attachment: &PendingAttachment) {
+        let Some(mention) = attachment.mention.as_deref() else {
+            return;
+        };
+
+        let buffer = self.composer.buffer();
+        let text = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string();
+        let Some(byte_start) = text.find(mention) else {
+            return;
+        };
+
+        let byte_end = byte_start + mention.len();
+        let mut char_start = text[..byte_start].chars().count();
+        let mut char_end = text[..byte_end].chars().count();
+        let chars = text.chars().collect::<Vec<_>>();
+        if char_end < chars.len() && chars[char_end].is_whitespace() {
+            char_end += 1;
+        } else if char_start > 0 && chars[char_start - 1].is_whitespace() {
+            char_start -= 1;
+        }
+
+        let mut start = buffer.iter_at_offset(char_start as i32);
+        let mut end = buffer.iter_at_offset(char_end as i32);
+        buffer.delete(&mut start, &mut end);
+    }
+
+    fn handle_attachment_mention_arrow_key(&self, key: gdk::Key) -> bool {
+        if !self.has_attachment_mentions() {
+            return false;
+        }
+        let buffer = self.composer.buffer();
+        if buffer.selection_bounds().is_some() {
+            return false;
+        }
+
+        let text = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string();
+        let attachments = self.pending_attachments.borrow().clone();
+        let ranges = attachment_mention_ranges(&text, &attachments);
+        if ranges.is_empty() {
+            return false;
+        }
+
+        let cursor_offset = buffer.cursor_position();
+        let target = match key {
+            gdk::Key::Right => ranges
+                .iter()
+                .find(|range| {
+                    cursor_offset == range.start
+                        || (cursor_offset > range.start && cursor_offset < range.end)
+                })
+                .map(|range| range.end),
+            gdk::Key::Left => ranges
+                .iter()
+                .find(|range| {
+                    cursor_offset == range.end
+                        || (cursor_offset > range.start && cursor_offset < range.end)
+                })
+                .map(|range| range.start),
+            _ => None,
+        };
+
+        let Some(target) = target else {
+            return false;
+        };
+        self.snapping_attachment_mention_cursor.set(true);
+        let iter = buffer.iter_at_offset(target);
+        buffer.place_cursor(&iter);
+        self.snapping_attachment_mention_cursor.set(false);
+        true
+    }
+
+    fn handle_attachment_mention_delete_key(&self, key: gdk::Key) -> bool {
+        if !self.has_attachment_mentions() {
+            return false;
+        }
+        let buffer = self.composer.buffer();
+        let text = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string();
+        let attachments = self.pending_attachments.borrow().clone();
+        let ranges = attachment_mention_ranges(&text, &attachments);
+        if ranges.is_empty() {
+            return false;
+        }
+
+        let mut target_mentions = Vec::new();
+        let mut selection_delete_range = None;
+        if let Some((selection_start, selection_end)) = buffer.selection_bounds() {
+            let start = selection_start.offset().min(selection_end.offset());
+            let end = selection_start.offset().max(selection_end.offset());
+            if start != end {
+                let overlapping = ranges
+                    .iter()
+                    .filter(|range| start < range.end && end > range.start)
+                    .collect::<Vec<_>>();
+                if !overlapping.is_empty() {
+                    let delete_start = overlapping
+                        .iter()
+                        .map(|range| range.start)
+                        .chain(std::iter::once(start))
+                        .min()
+                        .unwrap_or(start);
+                    let delete_end = overlapping
+                        .iter()
+                        .map(|range| range.end)
+                        .chain(std::iter::once(end))
+                        .max()
+                        .unwrap_or(end);
+                    target_mentions.extend(overlapping.iter().map(|range| range.mention.clone()));
+                    selection_delete_range = Some((delete_start, delete_end));
+                }
+            }
+        }
+
+        if target_mentions.is_empty() {
+            let cursor_offset = buffer.cursor_position();
+            let range = match key {
+                gdk::Key::BackSpace => ranges.iter().find(|range| {
+                    cursor_offset == range.end
+                        || (cursor_offset > range.start && cursor_offset <= range.end)
+                }),
+                gdk::Key::Delete => ranges.iter().find(|range| {
+                    cursor_offset == range.start
+                        || (cursor_offset >= range.start && cursor_offset < range.end)
+                }),
+                _ => None,
+            };
+            if let Some(range) = range {
+                target_mentions.push(range.mention.clone());
+            }
+        }
+
+        if target_mentions.is_empty() {
+            return false;
+        }
+
+        target_mentions.sort();
+        target_mentions.dedup();
+        let mut changed = false;
+        if let Some((delete_start, delete_end)) = selection_delete_range {
+            for mention in target_mentions {
+                let _ = self.remove_pending_attachment_by_mention(&mention);
+            }
+            let mut start = buffer.iter_at_offset(delete_start);
+            let mut end = buffer.iter_at_offset(delete_end);
+            buffer.delete(&mut start, &mut end);
+            changed = true;
+        } else {
+            for mention in target_mentions {
+                if let Some(attachment) = self.remove_pending_attachment_by_mention(&mention) {
+                    self.remove_attachment_mention(&attachment);
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            self.render_attachment_bar();
+            self.sync_composer_state();
+        }
+        changed
+    }
+
+    fn remove_pending_attachment_by_mention(&self, mention: &str) -> Option<PendingAttachment> {
+        let mut attachments = self.pending_attachments.borrow_mut();
+        let index = attachments
+            .iter()
+            .position(|attachment| attachment.mention.as_deref() == Some(mention))?;
+        Some(attachments.remove(index))
+    }
+
+    fn prune_attachments_missing_mentions(&self, text: &str) -> bool {
+        let mut attachments = self.pending_attachments.borrow_mut();
+        let previous_len = attachments.len();
+        attachments.retain(|attachment| {
+            attachment
+                .mention
+                .as_deref()
+                .map(|mention| text.contains(mention))
+                .unwrap_or(true)
+        });
+        attachments.len() != previous_len
+    }
+
+    fn snap_cursor_out_of_attachment_mention(&self, buffer: &gtk::TextBuffer, offset: i32) {
+        if self.snapping_attachment_mention_cursor.get() {
+            return;
+        }
+        if !self.has_attachment_mentions() {
+            return;
+        }
+
+        let text = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string();
+        let attachments = self.pending_attachments.borrow().clone();
+        let ranges = attachment_mention_ranges(&text, &attachments);
+        let Some(range) = ranges
+            .iter()
+            .find(|range| offset > range.start && offset < range.end)
+        else {
+            return;
+        };
+
+        let distance_to_start = offset - range.start;
+        let distance_to_end = range.end - offset;
+        let target = if distance_to_start <= distance_to_end {
+            range.start
+        } else {
+            range.end
+        };
+
+        self.snapping_attachment_mention_cursor.set(true);
+        let target_iter = buffer.iter_at_offset(target);
+        buffer.place_cursor(&target_iter);
+        self.snapping_attachment_mention_cursor.set(false);
+    }
+
+    fn open_workspace_path(&self, path: &Path) {
+        self.backend
+            .open_workspace_async(path.to_path_buf(), self.ui_tx.clone());
     }
 
     fn toggle_sidebar(&self) {
@@ -3186,30 +5162,68 @@ impl AppController {
     }
 
     fn sync_composer_state(&self) {
+        let started = Instant::now();
         let active_thread_id = self.active_thread_id.borrow().clone();
         let running = active_thread_id
             .as_ref()
             .is_some_and(|thread_id| self.backend.is_running(thread_id));
         let buffer = self.composer.buffer();
         let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
-        let has_text = !text.trim().is_empty();
+        if self.has_attachment_mentions() && self.prune_attachments_missing_mentions(text.as_str())
+        {
+            self.render_attachment_bar();
+        }
+        let has_text = text.as_str().chars().any(|ch| !ch.is_whitespace());
         let has_attachments = !self.pending_attachments.borrow().is_empty();
-        let has_context = active_thread_id.is_some()
-            || self.active_workspace_id.borrow().is_some()
-            || !self.workspaces.borrow().is_empty();
+        let show_send_button = running || has_text || has_attachments;
+        let composer_height = composer_height_for_text(text.as_str());
+        let composer_line_count = composer_line_count(text.as_str());
 
-        self.send_button.set_icon_name(if running {
-            "process-stop-symbolic"
-        } else {
-            "send-symbolic"
-        });
-        self.send_button.set_tooltip_text(Some(if running {
-            "Annuler la generation"
-        } else {
-            "Envoyer"
-        }));
-        self.send_button
-            .set_sensitive(running || (has_context && (has_text || has_attachments)));
+        if self.composer_last_running.replace(running) != running {
+            self.send_button.set_icon_name(if running {
+                "process-stop-symbolic"
+            } else {
+                "mail-send-symbolic"
+            });
+            self.send_button.set_tooltip_text(Some(if running {
+                "Annuler la generation"
+            } else {
+                "Envoyer"
+            }));
+        }
+        if self.composer_last_send_enabled.replace(show_send_button) != show_send_button {
+            self.send_button
+                .set_opacity(if show_send_button { 1.0 } else { 0.0 });
+            self.send_button.set_sensitive(show_send_button);
+        }
+        if self.composer_last_line_count.replace(composer_line_count) != composer_line_count {
+            self.composer
+                .set_top_margin(if composer_line_count <= 1 { 18 } else { 8 });
+            self.composer
+                .set_bottom_margin(if composer_line_count <= 1 { 0 } else { 8 });
+        }
+        if self.composer_last_height.replace(composer_height) != composer_height {
+            self.composer_scroll.set_min_content_height(composer_height);
+            self.composer_scroll.set_max_content_height(composer_height);
+            self.composer_scroll.set_size_request(-1, composer_height);
+        }
+        log_perf(
+            "ui.sync_composer_state",
+            started,
+            format!(
+                "chars={}, height={}, send_enabled={}",
+                text.len(),
+                composer_height,
+                show_send_button
+            ),
+        );
+    }
+
+    fn has_attachment_mentions(&self) -> bool {
+        self.pending_attachments
+            .borrow()
+            .iter()
+            .any(|attachment| attachment.mention.is_some())
     }
 
     fn close_thread_tab(&self, thread_id: &str) {
@@ -3222,6 +5236,8 @@ impl AppController {
         tabs.retain(|candidate| candidate != thread_id);
 
         if self.active_thread_id.borrow().as_deref() == Some(thread_id) {
+            self.remember_active_thread_scroll();
+            *self.editing_message.borrow_mut() = None;
             let next_thread_id = removed_index
                 .and_then(|index| {
                     tabs.get(index)
@@ -3236,6 +5252,7 @@ impl AppController {
                         .map(|thread| thread.id.clone())
                 });
             *self.active_thread_id.borrow_mut() = next_thread_id;
+            self.restore_cached_thread_view();
         }
         drop(tabs_by_workspace);
         self.render_all();
@@ -3263,90 +5280,222 @@ impl AppController {
         self.render_thread_tabs();
     }
 
-    fn show_edit_message_dialog(&self, message_id: &str) {
-        let Some(thread_id) = self.active_thread_id.borrow().clone() else {
-            return;
-        };
-        let message = self
-            .backend
-            .get_messages(&thread_id)
-            .ok()
-            .and_then(|messages| {
-                messages
-                    .into_iter()
-                    .find(|message| message.id == message_id && message.role == "user")
-            });
-        let Some(message) = message else {
-            self.toast("Message introuvable.".to_string());
-            return;
-        };
-
-        let editor = gtk::TextView::new();
-        editor.add_css_class("composer-view");
-        editor.set_wrap_mode(gtk::WrapMode::WordChar);
-        editor
-            .buffer()
-            .set_text(&message_plain_text(&message).unwrap_or_default());
-        let scroller = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .min_content_height(160)
-            .max_content_height(280)
-            .width_request(520)
-            .build();
-        scroller.add_css_class("composer-scroll");
-        scroller.set_child(Some(&editor));
-
-        let dialog = adw::AlertDialog::builder()
-            .heading("Modifier le message")
-            .body("La conversation sera reprise depuis ce message. Les reponses suivantes seront remplacees.")
-            .extra_child(&scroller)
-            .close_response("cancel")
-            .default_response("resume")
-            .build();
-        dialog.add_response("cancel", "Annuler");
-        dialog.add_response("resume", "Reprendre");
-        dialog.set_response_appearance("resume", adw::ResponseAppearance::Suggested);
-
-        let backend = Arc::clone(&self.backend);
-        let ui_tx = self.ui_tx.clone();
-        let thread_id_for_edit = thread_id;
-        let message_id_for_edit = message.id.clone();
-        let editor_for_response = editor.clone();
-        dialog.connect_response(None, move |_, response| {
-            if response != "resume" {
-                return;
-            }
-            let buffer = editor_for_response.buffer();
-            let text = buffer
-                .text(&buffer.start_iter(), &buffer.end_iter(), false)
-                .trim()
-                .to_string();
-            backend.edit_and_resume(
-                thread_id_for_edit.clone(),
-                message_id_for_edit.clone(),
-                text,
-                ui_tx.clone(),
-            );
-        });
-        dialog.present(Some(&self.window));
-        editor.grab_focus();
-    }
-
-    fn drain_ui_events(&self) {
-        while let Ok(event) = self.ui_rx.borrow_mut().try_recv() {
+    fn drain_ui_events(
+        &self,
+        first_event: UiEvent,
+        ui_rx: &mut futures_mpsc::UnboundedReceiver<UiEvent>,
+    ) {
+        let started = Instant::now();
+        let mut events = Vec::with_capacity(16);
+        events.push(first_event);
+        while let Ok(event) = ui_rx.try_recv() {
+            events.push(event);
+        }
+        let processed = events.len();
+        let mut reload_requested = false;
+        for event in events {
             match event {
                 UiEvent::Reload => {
-                    if let Ok(workspaces) = self.backend.list_workspaces() {
-                        *self.workspaces.borrow_mut() = workspaces;
+                    reload_requested = true;
+                }
+                UiEvent::SyncActiveWorkspace => {
+                    self.sync_active_workspace();
+                }
+                UiEvent::WorkspaceOpened(result) => match result {
+                    Ok(workspace) => {
+                        *self.editing_message.borrow_mut() = None;
+                        *self.active_workspace_id.borrow_mut() = Some(workspace.id);
+                        *self.active_thread_id.borrow_mut() = None;
+                        *self.active_thread_snapshot.borrow_mut() = None;
+                        self.active_messages.borrow_mut().clear();
+                        self.render_all();
+                        self.request_view_snapshot();
+                        self.sync_active_workspace();
                     }
-                    self.reload_threads();
-                    self.render_all();
+                    Err(error) => self.toast(error),
+                },
+                UiEvent::ThreadCreated {
+                    workspace_id,
+                    result,
+                } => match result {
+                    Ok(thread) => {
+                        if self.active_workspace_id.borrow().as_deref()
+                            == Some(workspace_id.as_str())
+                        {
+                            *self.editing_message.borrow_mut() = None;
+                            *self.active_thread_id.borrow_mut() = Some(thread.id);
+                            *self.active_thread_snapshot.borrow_mut() = None;
+                            self.active_messages.borrow_mut().clear();
+                            self.render_all();
+                            self.request_view_snapshot();
+                            self.composer.grab_focus();
+                        }
+                    }
+                    Err(error) => self.toast(error),
+                },
+                UiEvent::CodexThreadsSynced {
+                    workspace_id,
+                    result,
+                } => {
+                    if let Err(error) = result {
+                        log::warn!(
+                            "failed to sync Codex threads for workspace {workspace_id}: {error}"
+                        );
+                    }
+                    if self.active_workspace_id.borrow().as_deref() == Some(workspace_id.as_str()) {
+                        self.request_view_snapshot();
+                    }
+                }
+                UiEvent::CodexTranscriptSynced { thread_id, result } => {
+                    if let Err(error) = result {
+                        log::warn!(
+                            "failed to sync Codex transcript for thread {thread_id}: {error}"
+                        );
+                    } else if self.active_thread_id.borrow().as_deref() == Some(thread_id.as_str())
+                    {
+                        self.request_view_snapshot();
+                    }
+                }
+                UiEvent::CodexProfileSet { profile_id, result } => match result {
+                    Ok(()) => {
+                        log::debug!("active Codex profile set to {profile_id}");
+                        self.render_all();
+                        self.sync_active_workspace();
+                    }
+                    Err(error) => self.toast(error),
+                },
+                UiEvent::WorkspaceTrustSet {
+                    workspace_id,
+                    result,
+                } => match result {
+                    Ok(()) => {
+                        log::debug!("workspace trust level updated for {workspace_id}");
+                        self.request_view_snapshot();
+                    }
+                    Err(error) => self.toast(error),
+                },
+                UiEvent::AttachmentsResolved {
+                    insertion_offset,
+                    results,
+                } => {
+                    let mut changed = false;
+                    let mut mentions = Vec::new();
+                    let mut thumbnails_to_queue = Vec::new();
+                    let mut attachments = self.pending_attachments.borrow_mut();
+                    let mut next_image_index = attachments
+                        .iter()
+                        .filter(|attachment| is_image_attachment(attachment))
+                        .count()
+                        + 1;
+                    for result in results {
+                        match result {
+                            Ok(mut attachment) => {
+                                if attachments
+                                    .iter()
+                                    .any(|candidate| candidate.file_path == attachment.file_path)
+                                {
+                                    continue;
+                                }
+                                if is_image_attachment(&attachment) {
+                                    let mention = format!("[Image #{next_image_index}]");
+                                    next_image_index += 1;
+                                    attachment.mention = Some(mention.clone());
+                                    mentions.push(mention);
+                                    thumbnails_to_queue.push(attachment.clone());
+                                }
+                                attachments.push(attachment);
+                                changed = true;
+                            }
+                            Err(error) => self.toast(error),
+                        }
+                    }
+                    drop(attachments);
+                    if changed {
+                        self.insert_attachment_mentions(insertion_offset, &mentions);
+                        self.render_attachment_bar();
+                        for attachment in thumbnails_to_queue {
+                            self.queue_attachment_thumbnail(&attachment);
+                        }
+                        self.sync_composer_state();
+                    }
+                }
+                UiEvent::AttachmentThumbnailReady { file_path, result } => {
+                    let mut attachments = self.pending_attachments.borrow_mut();
+                    let Some(attachment) = attachments
+                        .iter_mut()
+                        .find(|attachment| attachment.file_path == file_path)
+                    else {
+                        continue;
+                    };
+                    match result {
+                        Ok(thumbnail_path) => {
+                            attachment.thumbnail_path = Some(thumbnail_path);
+                            attachment.thumbnail_failed = false;
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "failed to build attachment thumbnail for {file_path}: {error}"
+                            );
+                            attachment.thumbnail_failed = true;
+                        }
+                    }
+                    drop(attachments);
+                    self.render_attachment_bar();
+                }
+                UiEvent::ViewSnapshotLoaded(result) => {
+                    self.loading_snapshot.set(false);
+                    match result {
+                        Ok(snapshot) => {
+                            if self.snapshot_is_stale(&snapshot) {
+                                self.queued_snapshot.set(true);
+                            } else {
+                                let had_workspace = self.active_workspace_id.borrow().is_some();
+                                let history_cursor = snapshot.messages_next_cursor.clone();
+                                let history_thread_id = snapshot
+                                    .active_thread
+                                    .as_ref()
+                                    .map(|thread| thread.id.clone());
+                                self.apply_view_snapshot(snapshot);
+                                self.render_all();
+                                if let (Some(thread_id), Some(cursor)) =
+                                    (history_thread_id, history_cursor)
+                                {
+                                    self.backend.load_thread_history_async(
+                                        thread_id,
+                                        cursor,
+                                        self.ui_tx.clone(),
+                                    );
+                                }
+                                if !had_workspace {
+                                    self.sync_active_workspace();
+                                }
+                            }
+                        }
+                        Err(error) => self.toast(error),
+                    }
+                    if self.queued_snapshot.replace(false) {
+                        self.request_view_snapshot();
+                    }
+                }
+                UiEvent::ThreadHistoryLoaded {
+                    thread_id,
+                    messages,
+                    complete,
+                } => {
+                    self.merge_thread_history(&thread_id, messages, complete);
+                }
+                UiEvent::StreamingMessageUpdated { thread_id, message } => {
+                    self.apply_streaming_message_update(&thread_id, message);
                 }
                 UiEvent::SelectThread(thread_id) => {
+                    if self.active_thread_id.borrow().as_deref() != Some(thread_id.as_str()) {
+                        self.remember_active_thread_scroll();
+                        *self.editing_message.borrow_mut() = None;
+                    }
                     *self.active_thread_id.borrow_mut() = Some(thread_id);
-                    self.reload_threads();
+                    self.restore_cached_thread_view();
                     self.render_all();
+                    self.request_view_snapshot();
                 }
                 UiEvent::OpenThreadTab(thread_id) => {
                     self.open_thread_tab(&thread_id);
@@ -3354,13 +5503,75 @@ impl AppController {
                 UiEvent::CloseThreadTab(thread_id) => {
                     self.close_thread_tab(&thread_id);
                 }
-                UiEvent::EditMessage(message_id) => {
-                    self.show_edit_message_dialog(&message_id);
+                UiEvent::StartEditMessage {
+                    thread_id,
+                    message_id,
+                    user_turn_index,
+                    content,
+                } => {
+                    *self.editing_message.borrow_mut() = Some(EditingMessageState {
+                        thread_id,
+                        message_id,
+                        user_turn_index,
+                        draft: content,
+                    });
+                    self.render_messages();
+                }
+                UiEvent::UpdateEditMessageDraft {
+                    message_id,
+                    user_turn_index,
+                    content,
+                } => {
+                    if let Some(state) = self.editing_message.borrow_mut().as_mut() {
+                        if state.message_id == message_id
+                            || state.user_turn_index == user_turn_index
+                        {
+                            state.draft = content;
+                        }
+                    }
+                }
+                UiEvent::CancelEditMessage(message_id) => {
+                    let should_cancel = self
+                        .editing_message
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|state| state.message_id == message_id);
+                    if should_cancel {
+                        *self.editing_message.borrow_mut() = None;
+                        self.render_messages();
+                    }
+                }
+                UiEvent::SubmitEditMessage(message_id) => {
+                    let editing = self
+                        .editing_message
+                        .borrow()
+                        .as_ref()
+                        .filter(|state| state.message_id == message_id)
+                        .cloned();
+                    let Some(editing) = editing else {
+                        continue;
+                    };
+                    if editing.draft.trim().is_empty() {
+                        self.toast("Le message modifie ne peut pas etre vide.".to_string());
+                        continue;
+                    }
+
+                    *self.editing_message.borrow_mut() = None;
+                    self.render_messages();
+                    self.backend.edit_and_resume(
+                        editing.thread_id,
+                        editing.message_id,
+                        editing.user_turn_index,
+                        editing.draft,
+                        self.ui_tx.clone(),
+                    );
                 }
                 UiEvent::SetCodexProfile(profile_id) => {
-                    match self.backend.set_active_codex_profile(&profile_id) {
-                        Ok(()) => self.render_all(),
-                        Err(error) => self.toast(format!("{error:#}")),
+                    if !self
+                        .backend
+                        .set_active_codex_profile_async(profile_id, self.ui_tx.clone())
+                    {
+                        self.toast("Changement de profil deja en cours.".to_string());
                     }
                 }
                 UiEvent::SetWorkspaceTrust(trust_level) => {
@@ -3372,12 +5583,12 @@ impl AppController {
                     });
                     match workspace_id {
                         Some(workspace_id) => {
-                            match self
-                                .backend
-                                .set_workspace_trust_level(&workspace_id, trust_level)
-                            {
-                                Ok(()) => self.render_all(),
-                                Err(error) => self.toast(format!("{error:#}")),
+                            if !self.backend.set_workspace_trust_level_async(
+                                workspace_id,
+                                trust_level,
+                                self.ui_tx.clone(),
+                            ) {
+                                self.toast("Changement de permissions deja en cours.".to_string());
                             }
                         }
                         None => self.toast("Aucun projet actif.".to_string()),
@@ -3385,20 +5596,47 @@ impl AppController {
                 }
                 UiEvent::RemoveAttachment(index) => {
                     let mut attachments = self.pending_attachments.borrow_mut();
-                    if index < attachments.len() {
-                        attachments.remove(index);
-                    }
+                    let removed = if index < attachments.len() {
+                        Some(attachments.remove(index))
+                    } else {
+                        None
+                    };
                     drop(attachments);
+                    if let Some(attachment) = removed {
+                        self.remove_attachment_mention(&attachment);
+                    }
                     self.render_attachment_bar();
                     self.sync_composer_state();
                 }
                 UiEvent::Toast(message) => self.toast(message),
             }
         }
+
+        if reload_requested {
+            self.request_view_snapshot();
+        }
+        self.ui_tx.mark_processed(processed);
+        log_perf(
+            "ui.drain_events",
+            started,
+            format!("events={}, backlog={}", processed, self.ui_tx.backlog_len()),
+        );
     }
 
     fn toast(&self, message: String) {
         self.toast_overlay.add_toast(adw::Toast::new(&message));
+    }
+}
+
+async fn run_ui_event_loop(
+    weak: std::rc::Weak<AppController>,
+    mut ui_rx: futures_mpsc::UnboundedReceiver<UiEvent>,
+) {
+    while let Some(event) = ui_rx.next().await {
+        let Some(controller) = weak.upgrade() else {
+            break;
+        };
+        controller.drain_ui_events(event, &mut ui_rx);
     }
 }
 
@@ -3497,6 +5735,127 @@ fn display_codex_profile_name(profile: &CodexProfileConfig) -> String {
         .replace("CODEX", "Codex")
 }
 
+fn single_line_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn attachment_mention_insert_text(before: &str, after: &str, mentions: &[String]) -> String {
+    let mut text = mentions.join(" ");
+    if !before.is_empty()
+        && !before
+            .chars()
+            .last()
+            .is_some_and(|char| char.is_whitespace())
+    {
+        text.insert(0, ' ');
+    }
+    if after.is_empty()
+        || !after
+            .chars()
+            .next()
+            .is_some_and(|char| char.is_whitespace())
+    {
+        text.push(' ');
+    }
+    text
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachmentMentionRange {
+    mention: String,
+    start: i32,
+    end: i32,
+}
+
+fn attachment_mention_ranges(
+    text: &str,
+    attachments: &[PendingAttachment],
+) -> Vec<AttachmentMentionRange> {
+    let mut ranges = attachments
+        .iter()
+        .filter_map(|attachment| {
+            let mention = attachment.mention.as_deref()?;
+            let byte_start = text.find(mention)?;
+            let start = text[..byte_start].chars().count() as i32;
+            let end = start + mention.chars().count() as i32;
+            Some(AttachmentMentionRange {
+                mention: mention.to_string(),
+                start,
+                end,
+            })
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| range.start);
+    ranges
+}
+
+fn attachment_mention_tag(buffer: &gtk::TextBuffer) -> gtk::TextTag {
+    if let Some(tag) = buffer.tag_table().lookup(ATTACHMENT_MENTION_TAG_NAME) {
+        return tag;
+    }
+
+    let background = gdk::RGBA::new(0.12, 0.36, 0.72, 0.44);
+    let foreground = gdk::RGBA::new(0.66, 0.86, 1.0, 1.0);
+    let tag = gtk::TextTag::builder()
+        .name(ATTACHMENT_MENTION_TAG_NAME)
+        .background_rgba(&background)
+        .background_set(true)
+        .foreground_rgba(&foreground)
+        .foreground_set(true)
+        .editable(false)
+        .editable_set(true)
+        .weight(700)
+        .weight_set(true)
+        .scale(0.92)
+        .scale_set(true)
+        .build();
+    buffer.tag_table().add(&tag);
+    tag
+}
+
+fn apply_attachment_mention_tags(
+    buffer: &gtk::TextBuffer,
+    insertion_offset: i32,
+    inserted_text: &str,
+    mentions: &[String],
+    tag: &gtk::TextTag,
+) {
+    let mut search_byte_offset = 0;
+    for mention in mentions {
+        let Some(relative_byte_start) = inserted_text[search_byte_offset..].find(mention) else {
+            continue;
+        };
+        let byte_start = search_byte_offset + relative_byte_start;
+        let byte_end = byte_start + mention.len();
+        let start_offset = insertion_offset + inserted_text[..byte_start].chars().count() as i32;
+        let end_offset = insertion_offset + inserted_text[..byte_end].chars().count() as i32;
+        let start = buffer.iter_at_offset(start_offset);
+        let end = buffer.iter_at_offset(end_offset);
+        buffer.apply_tag(tag, &start, &end);
+        search_byte_offset = byte_end;
+    }
+}
+
+fn composer_height_for_text(value: &str) -> i32 {
+    let line_count = composer_line_count(value);
+    let height =
+        COMPOSER_SINGLE_LINE_HEIGHT + (line_count.saturating_sub(1) * COMPOSER_LINE_HEIGHT);
+    height.min(COMPOSER_MAX_HEIGHT)
+}
+
+fn composer_line_count(value: &str) -> i32 {
+    value.bytes().filter(|byte| *byte == b'\n').count() as i32 + 1
+}
+
+fn snapshot_request_is_stale(
+    requested_workspace_id: Option<&str>,
+    requested_thread_id: Option<&str>,
+    current_workspace_id: Option<&str>,
+    current_thread_id: Option<&str>,
+) -> bool {
+    requested_workspace_id != current_workspace_id || requested_thread_id != current_thread_id
+}
+
 fn compact_title(title: &str, max_chars: usize) -> String {
     let trimmed = title.trim();
     if trimmed.chars().count() <= max_chars {
@@ -3514,7 +5873,12 @@ fn compact_title(title: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::compact_title;
+    use super::{
+        append_or_replace_diff_block, attachment_mention_insert_text, attachment_mention_ranges,
+        compact_title, find_resume_target_index, paths_from_dropped_text, single_line_text,
+        snapshot_request_is_stale, NativeContentBlock, PendingAttachment,
+    };
+    use crate::models::{MessageDto, MessageStatusDto};
 
     #[test]
     fn compact_title_keeps_short_title() {
@@ -3536,6 +5900,165 @@ mod tests {
             "\u{e9}conom..."
         );
     }
+
+    #[test]
+    fn single_line_text_collapses_title_whitespace() {
+        assert_eq!(
+            single_line_text("  first line\nsecond\tline  "),
+            "first line second line"
+        );
+    }
+
+    #[test]
+    fn attachment_mention_insert_text_preserves_readable_spacing() {
+        assert_eq!(
+            attachment_mention_insert_text("Comme ici : ", "suite", &["[Image #1]".to_string()]),
+            "[Image #1] "
+        );
+        assert_eq!(
+            attachment_mention_insert_text("Comme ici", "suite", &["[Image #1]".to_string()]),
+            " [Image #1] "
+        );
+        assert_eq!(
+            attachment_mention_insert_text("", "", &["[Image #1]".to_string()]),
+            "[Image #1] "
+        );
+    }
+
+    #[test]
+    fn attachment_mention_ranges_track_tag_offsets() {
+        let attachments = vec![PendingAttachment {
+            file_name: "image.png".to_string(),
+            file_path: "/tmp/image.png".to_string(),
+            size_bytes: 12,
+            mime_type: Some("image/png".to_string()),
+            mention: Some("[Image #1]".to_string()),
+            thumbnail_path: None,
+            thumbnail_failed: false,
+        }];
+
+        assert_eq!(
+            attachment_mention_ranges("avant [Image #1] apres", &attachments),
+            vec![super::AttachmentMentionRange {
+                mention: "[Image #1]".to_string(),
+                start: 6,
+                end: 16,
+            }]
+        );
+    }
+
+    #[test]
+    fn paths_from_dropped_text_accepts_plain_paths_and_file_uris() {
+        let temp_path =
+            std::env::temp_dir().join(format!("supacodex-drop-test-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&temp_path, b"drop").expect("write temp file");
+        let uri = format!("file://{}", temp_path.to_string_lossy());
+
+        let paths = paths_from_dropped_text(&format!(
+            "# comment\n{}\n{}\nrelative.txt\n",
+            temp_path.to_string_lossy(),
+            uri
+        ));
+
+        assert_eq!(paths, vec![temp_path.clone()]);
+        std::fs::remove_file(temp_path).ok();
+    }
+
+    #[test]
+    fn snapshot_request_staleness_tracks_workspace_and_thread_selection() {
+        assert!(!snapshot_request_is_stale(
+            Some("workspace-a"),
+            Some("thread-a"),
+            Some("workspace-a"),
+            Some("thread-a")
+        ));
+        assert!(snapshot_request_is_stale(
+            Some("workspace-a"),
+            Some("thread-a"),
+            Some("workspace-b"),
+            Some("thread-a")
+        ));
+        assert!(snapshot_request_is_stale(
+            Some("workspace-a"),
+            Some("thread-a"),
+            Some("workspace-a"),
+            Some("thread-b")
+        ));
+        assert!(snapshot_request_is_stale(
+            None,
+            None,
+            Some("workspace-a"),
+            Some("thread-a")
+        ));
+    }
+
+    #[test]
+    fn resume_target_index_uses_message_id_when_present() {
+        let messages = vec![
+            test_message("user-a", "user"),
+            test_message("assistant-a", "assistant"),
+            test_message("user-b", "user"),
+        ];
+
+        assert_eq!(find_resume_target_index(&messages, "user-b", 0), Some(2));
+    }
+
+    #[test]
+    fn resume_target_index_falls_back_to_user_turn_index() {
+        let messages = vec![
+            test_message("new-user-a", "user"),
+            test_message("new-assistant-a", "assistant"),
+            test_message("new-user-b", "user"),
+        ];
+
+        assert_eq!(
+            find_resume_target_index(&messages, "old-user-b", 1),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn diff_updates_replace_existing_scope_snapshot() {
+        let mut blocks = Vec::new();
+        append_or_replace_diff_block(&mut blocks, "diff --git a/a b/a\n+one", "turn");
+        append_or_replace_diff_block(&mut blocks, "diff --git a/a b/a\n+two", "turn");
+
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            NativeContentBlock::Diff { diff, scope } => {
+                assert_eq!(scope, "turn");
+                assert!(diff.contains("+two"));
+                assert!(!diff.contains("+one"));
+            }
+            other => panic!("expected diff block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_diff_update_removes_existing_scope_snapshot() {
+        let mut blocks = Vec::new();
+        append_or_replace_diff_block(&mut blocks, "diff --git a/a b/a\n+one", "turn");
+        append_or_replace_diff_block(&mut blocks, "", "turn");
+
+        assert!(blocks.is_empty());
+    }
+
+    fn test_message(id: &str, role: &str) -> MessageDto {
+        MessageDto {
+            id: id.to_string(),
+            thread_id: "thread-a".to_string(),
+            role: role.to_string(),
+            content: Some(id.to_string()),
+            blocks: None,
+            turn_engine_id: None,
+            turn_model_id: None,
+            turn_reasoning_effort: None,
+            schema_version: 1,
+            status: MessageStatusDto::Completed,
+            token_usage: None,
+            created_at: "2026-05-24 00:00:00".to_string(),
+        }
+    }
 }
 
 fn trust_level_label(level: &TrustLevelDto) -> &'static str {
@@ -3552,6 +6075,51 @@ fn trust_level_description(level: &TrustLevelDto) -> &'static str {
         TrustLevelDto::Standard => "Confirmations sur demande pour les changements sensibles.",
         TrustLevelDto::Restricted => "Mode prudent pour les projets non verifies.",
     }
+}
+
+fn resolve_pending_attachment(path: PathBuf) -> Result<Option<PendingAttachment>, String> {
+    let path_string = path.to_string_lossy().to_string();
+    let metadata =
+        fs::metadata(&path).map_err(|_| format!("Fichier introuvable: {path_string}"))?;
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("fichier")
+        .to_string();
+    Ok(Some(PendingAttachment {
+        mime_type: guess_mime_type(&path),
+        file_name,
+        file_path: path_string,
+        size_bytes: metadata.len(),
+        mention: None,
+        thumbnail_path: None,
+        thumbnail_failed: false,
+    }))
+}
+
+fn paths_from_dropped_text(text: &str) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+
+            let path = if line.starts_with("file://") {
+                gio::File::for_uri(line).path()
+            } else {
+                let path = PathBuf::from(line);
+                path.is_absolute().then_some(path)
+            }?;
+
+            let key = path.to_string_lossy().to_string();
+            (path.exists() && seen.insert(key)).then_some(path)
+        })
+        .collect()
 }
 
 fn guess_mime_type(path: &Path) -> Option<String> {
@@ -3586,6 +6154,94 @@ fn is_image_attachment(attachment: &PendingAttachment) -> bool {
         .as_deref()
         .is_some_and(|mime| mime.starts_with("image/"))
         || is_image_path(&attachment.file_path)
+}
+
+fn build_attachment_thumbnail(file_path: &str) -> Result<String, String> {
+    let pixbuf = gdk_pixbuf::Pixbuf::from_file_at_scale(
+        file_path,
+        ATTACHMENT_PREVIEW_WIDTH,
+        ATTACHMENT_PREVIEW_HEIGHT,
+        true,
+    )
+    .map_err(|error| format!("Impossible de lire l'image: {error}"))?;
+
+    let thumbnail_dir = std::env::temp_dir().join("supacodex-thumbnails");
+    fs::create_dir_all(&thumbnail_dir)
+        .map_err(|error| format!("Impossible de preparer le cache thumbnail: {error}"))?;
+    let thumbnail_path = thumbnail_dir.join(format!("{}.png", uuid::Uuid::new_v4()));
+    pixbuf
+        .savev(&thumbnail_path, "png", &[])
+        .map_err(|error| format!("Impossible d'ecrire le thumbnail: {error}"))?;
+    Ok(thumbnail_path.to_string_lossy().to_string())
+}
+
+fn attachment_preview_widget(attachment: &PendingAttachment) -> gtk::Widget {
+    if let Some(thumbnail_path) = attachment.thumbnail_path.as_deref() {
+        let picture = gtk::Picture::for_filename(thumbnail_path);
+        picture.add_css_class("attachment-thumb");
+        picture.set_halign(gtk::Align::Fill);
+        picture.set_hexpand(false);
+        picture.set_valign(gtk::Align::Fill);
+        picture.set_vexpand(false);
+        picture.set_size_request(ATTACHMENT_PREVIEW_WIDTH, ATTACHMENT_PREVIEW_HEIGHT);
+        picture.set_content_fit(gtk::ContentFit::Cover);
+        picture.set_can_shrink(true);
+        return picture.upcast::<gtk::Widget>();
+    }
+
+    if attachment.thumbnail_failed {
+        return attachment_preview_fallback_widget();
+    }
+
+    let loading = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    loading.add_css_class("attachment-preview-loading");
+    loading.set_halign(gtk::Align::Fill);
+    loading.set_hexpand(false);
+    loading.set_valign(gtk::Align::Fill);
+    loading.set_vexpand(false);
+    loading.set_size_request(ATTACHMENT_PREVIEW_WIDTH, ATTACHMENT_PREVIEW_HEIGHT);
+    let spinner = gtk::Spinner::new();
+    spinner.set_halign(gtk::Align::Center);
+    spinner.set_valign(gtk::Align::Center);
+    spinner.set_hexpand(true);
+    spinner.set_vexpand(true);
+    spinner.start();
+    loading.append(&spinner);
+    loading.upcast::<gtk::Widget>()
+}
+
+fn attachment_preview_fallback_widget() -> gtk::Widget {
+    let fallback = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    fallback.add_css_class("attachment-preview-fallback");
+    fallback.set_halign(gtk::Align::Fill);
+    fallback.set_hexpand(false);
+    fallback.set_valign(gtk::Align::Fill);
+    fallback.set_vexpand(false);
+    fallback.set_size_request(ATTACHMENT_PREVIEW_WIDTH, ATTACHMENT_PREVIEW_HEIGHT);
+    let icon = gtk::Image::from_icon_name("image-x-generic-symbolic");
+    icon.set_pixel_size(24);
+    icon.set_halign(gtk::Align::Center);
+    icon.set_valign(gtk::Align::Center);
+    icon.set_hexpand(true);
+    icon.set_vexpand(true);
+    fallback.append(&icon);
+    fallback.upcast::<gtk::Widget>()
+}
+
+fn attachment_remove_button(index: usize, ui_tx: &UiEventSender) -> gtk::Button {
+    let remove = gtk::Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text("Retirer")
+        .build();
+    remove.add_css_class("attachment-remove-button");
+    remove.set_halign(gtk::Align::End);
+    remove.set_valign(gtk::Align::Start);
+    remove.set_has_frame(false);
+    let ui_tx = ui_tx.clone();
+    remove.connect_clicked(move |_| {
+        let _ = ui_tx.send(UiEvent::RemoveAttachment(index));
+    });
+    remove
 }
 
 fn is_image_path(path: &str) -> bool {
@@ -3670,18 +6326,93 @@ fn block_card(title: &str, body: Option<&str>) -> gtk::Box {
     card
 }
 
+fn collapsible_header(title: &str, subtitle: Option<&str>) -> gtk::Box {
+    let header = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    header.add_css_class("collapsible-header");
+
+    let title_label = gtk::Label::new(Some(title));
+    title_label.add_css_class("block-title");
+    title_label.set_xalign(0.0);
+    title_label.set_wrap(true);
+    title_label.set_max_width_chars(88);
+    header.append(&title_label);
+
+    if let Some(subtitle) = subtitle.filter(|value| !value.trim().is_empty()) {
+        let subtitle_label = gtk::Label::new(Some(subtitle.trim()));
+        subtitle_label.add_css_class("block-subtitle");
+        subtitle_label.set_xalign(0.0);
+        subtitle_label.set_wrap(true);
+        subtitle_label.set_max_width_chars(88);
+        header.append(&subtitle_label);
+    }
+
+    header
+}
+
 fn code_card(title: &str, body: &str) -> gtk::Box {
     let card = block_card(title, None);
-    if !body.trim().is_empty() {
-        let output = gtk::Label::new(Some(&truncate_display(body.trim(), 12000)));
-        output.add_css_class("code-output");
-        output.set_xalign(0.0);
-        output.set_wrap(true);
-        output.set_max_width_chars(96);
-        output.set_selectable(true);
-        card.append(&output);
+    let body = body.trim();
+    if !body.is_empty() {
+        card.append(&code_output_content(body));
     }
     card
+}
+
+fn code_output_content(body: &str) -> gtk::Box {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let body = body.trim();
+    if body.is_empty() {
+        return content;
+    }
+
+    const PREVIEW_CHARS: usize = 2400;
+    const HARD_LIMIT_CHARS: usize = 12000;
+    let is_large = body.chars().count() > PREVIEW_CHARS;
+    let full_text = Rc::new(truncate_display(body, HARD_LIMIT_CHARS));
+    let preview_text = if is_large {
+        truncate_display(body, PREVIEW_CHARS)
+    } else {
+        full_text.as_ref().clone()
+    };
+    let output = gtk::Label::new(Some(&preview_text));
+    output.add_css_class("code-output");
+    output.set_xalign(0.0);
+    output.set_wrap(false);
+    output.set_max_width_chars(96);
+    output.set_selectable(true);
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .min_content_height(48)
+        .max_content_height(if is_large { 240 } else { 140 })
+        .build();
+    scroller.set_child(Some(&output));
+    content.append(&scroller);
+
+    if is_large {
+        let button = gtk::Button::with_label("Voir plus");
+        button.add_css_class("runtime-option");
+        button.set_halign(gtk::Align::Start);
+        let expanded = Rc::new(Cell::new(false));
+        let output_for_toggle = output.clone();
+        let full_text_for_toggle = Rc::clone(&full_text);
+        let preview_for_toggle = preview_text;
+        let expanded_for_toggle = Rc::clone(&expanded);
+        button.connect_clicked(move |button| {
+            let next = !expanded_for_toggle.get();
+            expanded_for_toggle.set(next);
+            if next {
+                output_for_toggle.set_text(&full_text_for_toggle);
+                button.set_label("Reduire");
+            } else {
+                output_for_toggle.set_text(&preview_for_toggle);
+                button.set_label("Voir plus");
+            }
+        });
+        content.append(&button);
+    }
+
+    content
 }
 
 fn clear_list_box(list: &gtk::ListBox) {
@@ -3696,12 +6427,84 @@ fn clear_box(container: &gtk::Box) {
     }
 }
 
+fn scroll_scrolled_window_to_bottom(scroll: &gtk::ScrolledWindow) {
+    let adjustment = scroll.vadjustment();
+    let max_value = (adjustment.upper() - adjustment.page_size()).max(0.0);
+    adjustment.set_value(max_value);
+}
+
+fn settle_scrolled_window_to_bottom(
+    scroll: gtk::ScrolledWindow,
+    remaining_passes: u8,
+    interval: Duration,
+) {
+    if remaining_passes == 0 {
+        return;
+    }
+
+    glib::timeout_add_local(interval, move || {
+        scroll_scrolled_window_to_bottom(&scroll);
+        settle_scrolled_window_to_bottom(
+            scroll.clone(),
+            remaining_passes.saturating_sub(1),
+            interval,
+        );
+        glib::ControlFlow::Break
+    });
+}
+
 fn parse_blocks(message: &MessageDto) -> Vec<NativeContentBlock> {
     message
         .blocks
         .as_ref()
         .and_then(|blocks| serde_json::from_value::<Vec<NativeContentBlock>>(blocks.clone()).ok())
         .unwrap_or_default()
+}
+
+fn native_blocks_from_transcript_message(
+    message: &ThreadTranscriptMessage,
+) -> Vec<NativeContentBlock> {
+    if message.blocks.is_empty() {
+        return vec![NativeContentBlock::Text {
+            content: message.content.clone(),
+            plan_mode: None,
+            is_steer: None,
+        }];
+    }
+
+    message
+        .blocks
+        .iter()
+        .map(|block| match block {
+            ThreadTranscriptBlock::Text { content } => NativeContentBlock::Text {
+                content: content.clone(),
+                plan_mode: None,
+                is_steer: None,
+            },
+            ThreadTranscriptBlock::Thinking { content } => NativeContentBlock::Thinking {
+                content: content.clone(),
+            },
+            ThreadTranscriptBlock::Diff { diff, scope } => NativeContentBlock::Diff {
+                diff: diff.clone(),
+                scope: scope.clone(),
+            },
+        })
+        .collect()
+}
+
+fn streaming_message_snapshot(
+    base: &MessageDto,
+    blocks: &[NativeContentBlock],
+    status: MessageStatusDto,
+    model_id: &str,
+) -> anyhow::Result<MessageDto> {
+    let mut message = base.clone();
+    message.blocks = Some(serde_json::to_value(blocks)?);
+    message.status = status;
+    if !model_id.trim().is_empty() {
+        message.turn_model_id = Some(model_id.to_string());
+    }
+    Ok(message)
 }
 
 fn block_has_visible_content(block: &NativeContentBlock) -> bool {
@@ -3763,6 +6566,47 @@ fn block_has_visible_content(block: &NativeContentBlock) -> bool {
     }
 }
 
+fn visible_messages_for_cache(cache: &CachedThreadView) -> Vec<MessageDto> {
+    if cache.history_complete || cache.messages.len() <= INITIAL_MESSAGE_WINDOW_LIMIT {
+        cache.messages.clone()
+    } else {
+        cache
+            .messages
+            .iter()
+            .rev()
+            .take(INITIAL_MESSAGE_WINDOW_LIMIT)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+}
+
+fn upsert_message(messages: &mut Vec<MessageDto>, message: MessageDto) {
+    if let Some(existing) = messages
+        .iter_mut()
+        .find(|candidate| candidate.id == message.id)
+    {
+        *existing = message;
+    } else {
+        messages.push(message);
+        messages.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
+}
+
+fn merge_messages(existing: &[MessageDto], incoming: &[MessageDto]) -> Vec<MessageDto> {
+    let mut merged = existing.to_vec();
+    for message in incoming {
+        upsert_message(&mut merged, message.clone());
+    }
+    merged
+}
+
 fn message_plain_text(message: &MessageDto) -> Option<String> {
     let blocks = parse_blocks(message);
     let text = blocks
@@ -3786,6 +6630,24 @@ fn message_plain_text(message: &MessageDto) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn find_resume_target_index(
+    messages: &[MessageDto],
+    message_id: &str,
+    user_turn_index: usize,
+) -> Option<usize> {
+    messages
+        .iter()
+        .position(|candidate| candidate.id == message_id)
+        .or_else(|| {
+            messages
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| candidate.role == "user")
+                .nth(user_turn_index)
+                .map(|(index, _)| index)
+        })
+}
+
 fn append_text_block(blocks: &mut Vec<NativeContentBlock>, content: &str) {
     match blocks.last_mut() {
         Some(NativeContentBlock::Text {
@@ -3806,6 +6668,60 @@ fn append_thinking_block(blocks: &mut Vec<NativeContentBlock>, content: &str) {
             content: content.to_string(),
         }),
     }
+}
+
+fn append_or_replace_diff_block(blocks: &mut Vec<NativeContentBlock>, diff: &str, scope: &str) {
+    let existing_index = blocks.iter().rposition(|block| {
+        matches!(
+            block,
+            NativeContentBlock::Diff {
+                scope: existing_scope,
+                ..
+            } if existing_scope == scope
+        )
+    });
+
+    if diff.trim().is_empty() {
+        if let Some(index) = existing_index {
+            blocks.remove(index);
+        }
+        return;
+    }
+
+    if let Some(index) = existing_index {
+        if let Some(NativeContentBlock::Diff {
+            diff: existing_diff,
+            ..
+        }) = blocks.get_mut(index)
+        {
+            *existing_diff = diff.to_string();
+        }
+    } else {
+        blocks.push(NativeContentBlock::Diff {
+            diff: diff.to_string(),
+            scope: scope.to_string(),
+        });
+    }
+}
+
+fn diff_scope_label(scope: &DiffScope) -> String {
+    match scope {
+        DiffScope::Turn => "turn".to_string(),
+        DiffScope::File => "file".to_string(),
+        DiffScope::Workspace => "workspace".to_string(),
+    }
+}
+
+fn changes_title(scope: &str) -> String {
+    if scope.trim().is_empty() {
+        "Changements".to_string()
+    } else {
+        format!("Changements ({})", scope.trim())
+    }
+}
+
+fn collapsible_block_key(message_id: &str, block_index: usize, kind: &str) -> String {
+    format!("{message_id}:{block_index}:{kind}")
 }
 
 fn stream_label(stream: &OutputStream) -> &'static str {
@@ -3876,6 +6792,14 @@ fn codex_transcript_sync_needed(thread: &ThreadDto) -> bool {
     let Some(metadata) = thread.engine_metadata.as_ref() else {
         return false;
     };
+    let sync_version = metadata
+        .get("codexTranscriptSyncVersion")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if sync_version < CODEX_TRANSCRIPT_SYNC_VERSION {
+        return true;
+    }
+
     let remote_updated_at = metadata
         .get("codexRemoteUpdatedAt")
         .and_then(Value::as_str)
@@ -3942,5 +6866,14 @@ fn status_class(status: &ThreadStatusDto) -> &'static str {
         ThreadStatusDto::AwaitingApproval => "status-awaiting_approval",
         ThreadStatusDto::Error => "status-error",
         ThreadStatusDto::Completed => "status-completed",
+    }
+}
+
+fn log_perf(label: &str, started: Instant, detail: impl AsRef<str>) {
+    let elapsed = started.elapsed();
+    if elapsed >= PERF_WARN_THRESHOLD {
+        log::info!("perf.{label}: {:?}; {}", elapsed, detail.as_ref());
+    } else {
+        log::debug!("perf.{label}: {:?}; {}", elapsed, detail.as_ref());
     }
 }

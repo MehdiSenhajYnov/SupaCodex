@@ -3,6 +3,8 @@ use std::{
     collections::HashMap,
     env,
     ffi::OsString,
+    fs::File,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -11,6 +13,7 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
+use rusqlite::{params, OpenFlags, OptionalExtension};
 use serde::Deserialize;
 #[cfg(target_os = "windows")]
 use tokio::time::{timeout, Duration as TokioDuration};
@@ -37,8 +40,9 @@ use super::{
     codex_transport::{sanitize_codex_child_env, CodexTransport},
     ActionResult, ApprovalRequestRoute, CodexRemoteThreadSummary, CodexThreadTranscriptSnapshot,
     Engine, EngineEvent, EngineThread, ModelAvailabilityNux, ModelInfo, ModelUpgradeInfo,
-    ReasoningEffortOption, SandboxPolicy, ThreadScope, ThreadSyncSnapshot, ThreadTranscriptMessage,
-    ThreadTranscriptMessageRole, TurnAttachment, TurnCompletionStatus, TurnInput, TurnInputItem,
+    ReasoningEffortOption, SandboxPolicy, ThreadScope, ThreadSyncSnapshot, ThreadTranscriptBlock,
+    ThreadTranscriptMessage, ThreadTranscriptMessageRole, TurnAttachment, TurnCompletionStatus,
+    TurnInput, TurnInputItem,
 };
 
 const INITIALIZE_METHODS: &[&str] = &["initialize"];
@@ -230,6 +234,13 @@ pub struct CodexReviewStarted {
 struct ReconciledTurnCompletion {
     status: TurnCompletionStatus,
     error_message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RolloutTranscriptSnapshot {
+    messages: Vec<ThreadTranscriptMessage>,
+    created_at: i64,
+    updated_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2334,6 +2345,30 @@ impl CodexEngine {
         .await
         .context("failed to read codex thread transcript")?;
 
+        let profile = self.active_profile().await;
+        let rollout_snapshot = {
+            let engine_thread_id = engine_thread_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                read_rollout_thread_transcript_snapshot(&profile, &engine_thread_id)
+            })
+            .await
+            .context("failed to join codex rollout transcript reader")?
+        };
+        let rollout_snapshot = match rollout_snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                log::warn!("failed to read Codex rollout transcript: {error:#}");
+                None
+            }
+        };
+
+        let api_messages = extract_thread_transcript_messages(&result);
+        let messages = rollout_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.messages.clone())
+            .filter(|messages| !messages.is_empty())
+            .unwrap_or(api_messages);
+
         Ok(CodexThreadTranscriptSnapshot {
             sync: ThreadSyncSnapshot {
                 title: extract_thread_title(&result),
@@ -2341,9 +2376,17 @@ impl CodexEngine {
                 raw_status: extract_thread_runtime_status_type(&result),
                 active_flags: extract_thread_runtime_active_flags(&result),
             },
-            messages: extract_thread_transcript_messages(&result),
-            created_at: extract_thread_created_at(&result),
-            updated_at: extract_thread_updated_at(&result),
+            messages,
+            created_at: extract_thread_created_at(&result).or_else(|| {
+                rollout_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.created_at)
+            }),
+            updated_at: extract_thread_updated_at(&result).or_else(|| {
+                rollout_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.updated_at)
+            }),
         })
     }
 
@@ -4630,6 +4673,381 @@ fn extract_thread_turns<'a>(value: &'a serde_json::Value) -> Option<&'a Vec<serd
     None
 }
 
+fn read_rollout_thread_transcript_snapshot(
+    profile: &CodexRuntimeProfile,
+    engine_thread_id: &str,
+) -> anyhow::Result<Option<RolloutTranscriptSnapshot>> {
+    let db_path = profile.codex_home.join("state_5.sqlite");
+    if !db_path.is_file() {
+        return Ok(None);
+    }
+
+    let connection = rusqlite::Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| {
+        format!(
+            "failed to open Codex state database `{}`",
+            db_path.display()
+        )
+    })?;
+    connection.busy_timeout(Duration::from_millis(1_500))?;
+
+    let row = connection
+        .query_row(
+            "SELECT rollout_path, created_at, updated_at FROM threads WHERE id = ?1",
+            params![engine_thread_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .context("failed to query Codex rollout path")?;
+
+    let Some((rollout_path, created_at, updated_at)) = row else {
+        return Ok(None);
+    };
+    let rollout_path = resolve_rollout_path(&profile.codex_home, &rollout_path);
+    if !rollout_path.is_file() {
+        return Ok(None);
+    }
+
+    let file = File::open(&rollout_path)
+        .with_context(|| format!("failed to open Codex rollout `{}`", rollout_path.display()))?;
+    let messages = extract_rollout_transcript_messages(BufReader::new(file))
+        .with_context(|| format!("failed to parse Codex rollout `{}`", rollout_path.display()))?;
+
+    Ok(Some(RolloutTranscriptSnapshot {
+        messages,
+        created_at,
+        updated_at,
+    }))
+}
+
+fn resolve_rollout_path(codex_home: &Path, rollout_path: &str) -> PathBuf {
+    let path = PathBuf::from(rollout_path);
+    if path.is_absolute() {
+        path
+    } else {
+        codex_home.join(path)
+    }
+}
+
+fn extract_rollout_transcript_messages<R: BufRead>(
+    reader: R,
+) -> anyhow::Result<Vec<ThreadTranscriptMessage>> {
+    let mut messages = Vec::new();
+    let mut assistant_blocks = Vec::new();
+    let mut assistant_has_agent_event = false;
+
+    for line in reader.lines() {
+        let line = line.context("failed to read Codex rollout line")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let entry: serde_json::Value =
+            serde_json::from_str(&line).context("failed to parse Codex rollout JSON line")?;
+        let payload = entry.get("payload").unwrap_or(&entry);
+        let payload_type = payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        match (
+            entry.get("type").and_then(serde_json::Value::as_str),
+            payload_type,
+        ) {
+            (Some("event_msg"), "user_message") => {
+                flush_rollout_assistant_message(&mut messages, &mut assistant_blocks);
+                assistant_has_agent_event = false;
+                if let Some(content) = extract_rollout_user_message_text(payload) {
+                    messages.push(transcript_message_with_blocks(
+                        ThreadTranscriptMessageRole::User,
+                        vec![ThreadTranscriptBlock::Text { content }],
+                    ));
+                }
+            }
+            (Some("event_msg"), "agent_message") => {
+                let Some(content) = extract_any_string(payload, &["message"])
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                else {
+                    continue;
+                };
+
+                match payload
+                    .get("phase")
+                    .and_then(serde_json::Value::as_str)
+                    .map(normalize_method)
+                    .as_deref()
+                {
+                    Some("finalanswer") | Some("final_answer") => {
+                        append_transcript_text_block(&mut assistant_blocks, &content);
+                    }
+                    _ => append_transcript_thinking_block(&mut assistant_blocks, &content),
+                }
+                assistant_has_agent_event = true;
+            }
+            (Some("event_msg"), "patch_apply_end") => {
+                if let Some(diff) = extract_rollout_patch_diff(payload) {
+                    append_transcript_diff_block(&mut assistant_blocks, &diff, "turn");
+                }
+            }
+            (Some("event_msg"), "thread_rolled_back") => {
+                assistant_blocks.clear();
+                assistant_has_agent_event = false;
+                let turns = extract_any_i64(payload, &["num_turns", "numTurns"]).unwrap_or(1);
+                drop_last_rollout_turns(&mut messages, turns.max(0) as usize);
+            }
+            (Some("response_item"), "reasoning") => {
+                if let Some(content) = extract_rollout_reasoning_text(payload) {
+                    append_transcript_thinking_block(&mut assistant_blocks, &content);
+                }
+            }
+            (Some("response_item"), "message") if !assistant_has_agent_event => {
+                if payload.get("role").and_then(serde_json::Value::as_str) == Some("assistant") {
+                    if let Some(content) = extract_response_message_text(payload) {
+                        match payload
+                            .get("phase")
+                            .and_then(serde_json::Value::as_str)
+                            .map(normalize_method)
+                            .as_deref()
+                        {
+                            Some("finalanswer") | Some("final_answer") => {
+                                append_transcript_text_block(&mut assistant_blocks, &content);
+                            }
+                            _ => append_transcript_thinking_block(&mut assistant_blocks, &content),
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    flush_rollout_assistant_message(&mut messages, &mut assistant_blocks);
+    Ok(messages)
+}
+
+fn extract_rollout_user_message_text(payload: &serde_json::Value) -> Option<String> {
+    extract_any_string(payload, &["message", "text"])
+        .or_else(|| join_transcript_text_entries(payload.get("text_elements")))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn extract_response_message_text(payload: &serde_json::Value) -> Option<String> {
+    if let Some(content) = extract_any_string(payload, &["content"]) {
+        return Some(content)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    }
+
+    let content_items = payload
+        .get("content")
+        .and_then(serde_json::Value::as_array)?;
+    let mut segments = Vec::new();
+    for entry in content_items {
+        if let Some(text) = entry.as_str() {
+            if !text.trim().is_empty() {
+                segments.push(text.trim().to_string());
+            }
+            continue;
+        }
+
+        let entry_type = entry
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if matches!(entry_type, "text" | "input_text" | "output_text") {
+            if let Some(text) = extract_any_string(entry, &["text", "content"]) {
+                if !text.trim().is_empty() {
+                    segments.push(text.trim().to_string());
+                }
+            }
+        }
+    }
+
+    if segments.is_empty() {
+        None
+    } else {
+        Some(join_transcript_segments(&segments))
+    }
+}
+
+fn extract_rollout_reasoning_text(payload: &serde_json::Value) -> Option<String> {
+    extract_any_string(payload, &["content"])
+        .or_else(|| join_transcript_text_entries(payload.get("summary")))
+        .or_else(|| join_transcript_text_entries(payload.get("content")))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn join_transcript_text_entries(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+
+    let items = value.as_array()?;
+    let mut segments = Vec::new();
+    for entry in items {
+        if let Some(text) = entry.as_str() {
+            if !text.trim().is_empty() {
+                segments.push(text.trim().to_string());
+            }
+            continue;
+        }
+        if let Some(text) = extract_any_string(entry, &["text", "content"]) {
+            if !text.trim().is_empty() {
+                segments.push(text.trim().to_string());
+            }
+        }
+    }
+
+    if segments.is_empty() {
+        None
+    } else {
+        Some(join_transcript_segments(&segments))
+    }
+}
+
+fn extract_rollout_patch_diff(payload: &serde_json::Value) -> Option<String> {
+    let changes = payload.get("changes")?.as_object()?;
+    let mut diffs = Vec::new();
+    for change in changes.values() {
+        if let Some(diff) = extract_any_string(change, &["unified_diff", "unifiedDiff", "diff"]) {
+            if !diff.trim().is_empty() {
+                diffs.push(diff);
+            }
+        }
+    }
+
+    if diffs.is_empty() {
+        None
+    } else {
+        Some(diffs.join("\n\n"))
+    }
+}
+
+fn flush_rollout_assistant_message(
+    messages: &mut Vec<ThreadTranscriptMessage>,
+    assistant_blocks: &mut Vec<ThreadTranscriptBlock>,
+) {
+    if assistant_blocks.is_empty() {
+        return;
+    }
+
+    let blocks = std::mem::take(assistant_blocks);
+    messages.push(transcript_message_with_blocks(
+        ThreadTranscriptMessageRole::Assistant,
+        blocks,
+    ));
+}
+
+fn drop_last_rollout_turns(messages: &mut Vec<ThreadTranscriptMessage>, turns: usize) {
+    for _ in 0..turns {
+        while let Some(message) = messages.pop() {
+            if message.role == ThreadTranscriptMessageRole::User {
+                break;
+            }
+        }
+    }
+}
+
+fn transcript_message_with_blocks(
+    role: ThreadTranscriptMessageRole,
+    blocks: Vec<ThreadTranscriptBlock>,
+) -> ThreadTranscriptMessage {
+    ThreadTranscriptMessage {
+        role,
+        content: transcript_blocks_plain_text(&blocks),
+        blocks,
+    }
+}
+
+fn transcript_blocks_plain_text(blocks: &[ThreadTranscriptBlock]) -> String {
+    let text_segments = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ThreadTranscriptBlock::Text { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if !text_segments.is_empty() {
+        return join_transcript_segments(&text_segments);
+    }
+
+    let fallback_segments = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ThreadTranscriptBlock::Thinking { content } => Some(content.as_str()),
+            ThreadTranscriptBlock::Diff { diff, .. } => Some(diff.as_str()),
+            ThreadTranscriptBlock::Text { .. } => None,
+        })
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    join_transcript_segments(&fallback_segments)
+}
+
+fn append_transcript_text_block(blocks: &mut Vec<ThreadTranscriptBlock>, content: &str) {
+    match blocks.last_mut() {
+        Some(ThreadTranscriptBlock::Text { content: existing }) => {
+            append_transcript_segment(existing, content)
+        }
+        _ => blocks.push(ThreadTranscriptBlock::Text {
+            content: content.to_string(),
+        }),
+    }
+}
+
+fn append_transcript_thinking_block(blocks: &mut Vec<ThreadTranscriptBlock>, content: &str) {
+    match blocks.last_mut() {
+        Some(ThreadTranscriptBlock::Thinking { content: existing }) => {
+            append_transcript_segment(existing, content)
+        }
+        _ => blocks.push(ThreadTranscriptBlock::Thinking {
+            content: content.to_string(),
+        }),
+    }
+}
+
+fn append_transcript_segment(existing: &mut String, content: &str) {
+    if !existing.trim().is_empty() && !content.starts_with('\n') {
+        existing.push_str("\n\n");
+    }
+    existing.push_str(content);
+}
+
+fn append_transcript_diff_block(blocks: &mut Vec<ThreadTranscriptBlock>, diff: &str, scope: &str) {
+    match blocks.last_mut() {
+        Some(ThreadTranscriptBlock::Diff {
+            diff: existing_diff,
+            scope: existing_scope,
+        }) if existing_scope == scope => {
+            if !existing_diff.ends_with("\n\n") {
+                existing_diff.push_str("\n\n");
+            }
+            existing_diff.push_str(diff);
+        }
+        _ => blocks.push(ThreadTranscriptBlock::Diff {
+            diff: diff.to_string(),
+            scope: scope.to_string(),
+        }),
+    }
+}
+
 fn extract_terminal_turn_completion_status(
     value: &serde_json::Value,
 ) -> Option<TurnCompletionStatus> {
@@ -4705,7 +5123,7 @@ fn extract_thread_transcript_messages(value: &serde_json::Value) -> Vec<ThreadTr
                         .map(normalize_method)
                         .as_deref()
                     {
-                        Some("final_answer") => final_answers.push(text),
+                        Some("finalanswer") | Some("final_answer") => final_answers.push(text),
                         _ => commentary_messages.push(text),
                     }
                 }
@@ -4714,30 +5132,35 @@ fn extract_thread_transcript_messages(value: &serde_json::Value) -> Vec<ThreadTr
         }
 
         for content in user_messages {
-            messages.push(ThreadTranscriptMessage {
-                role: ThreadTranscriptMessageRole::User,
-                content,
-            });
+            messages.push(transcript_message_with_blocks(
+                ThreadTranscriptMessageRole::User,
+                vec![ThreadTranscriptBlock::Text { content }],
+            ));
         }
 
-        let assistant_content = if !final_answers.is_empty() {
-            Some(join_transcript_segments(&final_answers))
-        } else if !commentary_messages.is_empty() {
-            commentary_messages
-                .last()
+        let mut assistant_blocks = Vec::new();
+        for content in commentary_messages {
+            append_transcript_thinking_block(&mut assistant_blocks, &content);
+        }
+        if !final_answers.is_empty() {
+            append_transcript_text_block(
+                &mut assistant_blocks,
+                &join_transcript_segments(&final_answers),
+            );
+        } else if assistant_blocks.is_empty() {
+            if let Some(error_message) = extract_nested_string(turn, &["error", "message"])
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
-        } else {
-            extract_nested_string(turn, &["error", "message"])
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        };
+            {
+                append_transcript_text_block(&mut assistant_blocks, &error_message);
+            }
+        }
 
-        if let Some(content) = assistant_content {
-            messages.push(ThreadTranscriptMessage {
-                role: ThreadTranscriptMessageRole::Assistant,
-                content,
-            });
+        if !assistant_blocks.is_empty() {
+            messages.push(transcript_message_with_blocks(
+                ThreadTranscriptMessageRole::Assistant,
+                assistant_blocks,
+            ));
         }
     }
 
@@ -7131,10 +7554,21 @@ mod tests {
                 ThreadTranscriptMessage {
                     role: ThreadTranscriptMessageRole::User,
                     content: "How do I launch the app?".to_string(),
+                    blocks: vec![ThreadTranscriptBlock::Text {
+                        content: "How do I launch the app?".to_string(),
+                    }],
                 },
                 ThreadTranscriptMessage {
                     role: ThreadTranscriptMessageRole::Assistant,
                     content: "Run `npm run dev`.".to_string(),
+                    blocks: vec![
+                        ThreadTranscriptBlock::Thinking {
+                            content: "Checking the project first.".to_string(),
+                        },
+                        ThreadTranscriptBlock::Text {
+                            content: "Run `npm run dev`.".to_string(),
+                        },
+                    ],
                 },
             ]
         );
@@ -7173,8 +7607,91 @@ mod tests {
             messages.last(),
             Some(&ThreadTranscriptMessage {
                 role: ThreadTranscriptMessageRole::Assistant,
-                content: "Latest progress update.".to_string(),
+                content: "First progress update.\n\nLatest progress update.".to_string(),
+                blocks: vec![ThreadTranscriptBlock::Thinking {
+                    content: "First progress update.\n\nLatest progress update.".to_string(),
+                }],
             })
+        );
+    }
+
+    #[test]
+    fn extract_rollout_transcript_messages_preserves_commentary_and_diffs() {
+        let lines = vec![
+            json!({
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "Old question" }
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "phase": "final_answer",
+                    "message": "Old answer"
+                }
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": { "type": "thread_rolled_back", "num_turns": 1 }
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": { "type": "user_message", "message": "New question" }
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "phase": "commentary",
+                    "message": "Checking files."
+                }
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "patch_apply_end",
+                    "changes": {
+                        "src/main.rs": {
+                            "type": "update",
+                            "unified_diff": "@@\n-old\n+new"
+                        }
+                    }
+                }
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "phase": "final_answer",
+                    "message": "Done."
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let messages = extract_rollout_transcript_messages(std::io::Cursor::new(lines))
+            .expect("parse rollout");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "New question");
+        assert_eq!(messages[1].content, "Done.");
+        assert_eq!(
+            messages[1].blocks,
+            vec![
+                ThreadTranscriptBlock::Thinking {
+                    content: "Checking files.".to_string(),
+                },
+                ThreadTranscriptBlock::Diff {
+                    diff: "@@\n-old\n+new".to_string(),
+                    scope: "turn".to_string(),
+                },
+                ThreadTranscriptBlock::Text {
+                    content: "Done.".to_string(),
+                },
+            ]
         );
     }
 

@@ -98,8 +98,7 @@ impl TurnEventMapper {
                 }
             }
             "itemplandelta" => {
-                let content =
-                    extract_any_string(params, &["delta", "text", "content"]).unwrap_or_default();
+                let content = extract_reasoning_delta(params).unwrap_or_default();
                 if content.is_empty() {
                     Vec::new()
                 } else {
@@ -110,8 +109,7 @@ impl TurnEventMapper {
                 self.map_reasoning_summary_part_added(params)
             }
             "itemreasoningsummarytextdelta" | "itemreasoningtextdelta" => {
-                let content =
-                    extract_any_string(params, &["delta", "text", "content"]).unwrap_or_default();
+                let content = extract_reasoning_delta(params).unwrap_or_default();
                 if content.is_empty() {
                     Vec::new()
                 } else {
@@ -1231,6 +1229,20 @@ fn extract_combined_diff(item: &Value) -> Option<String> {
     }
 }
 
+fn extract_reasoning_delta(value: &Value) -> Option<String> {
+    extract_any_string(value, &["delta", "text", "content"])
+        .or_else(|| extract_nested_string(value, &["delta", "text"]))
+        .or_else(|| extract_nested_string(value, &["delta", "content"]))
+        .or_else(|| extract_nested_string(value, &["part", "text"]))
+        .or_else(|| extract_nested_string(value, &["part", "content"]))
+        .or_else(|| extract_nested_string(value, &["summary", "text"]))
+        .or_else(|| extract_nested_string(value, &["summary", "content"]))
+        .or_else(|| extract_nested_string(value, &["item", "text"]))
+        .or_else(|| join_string_array(value.get("delta").and_then(Value::as_array)))
+        .or_else(|| join_string_array(value.get("content").and_then(Value::as_array)))
+        .filter(|content| !content.is_empty())
+}
+
 fn extract_first_change_path(item: &Value) -> Option<String> {
     item.get("changes")
         .and_then(Value::as_array)
@@ -1869,6 +1881,28 @@ mod tests {
         assert_eq!(second.len(), 1);
         match &second[0] {
             EngineEvent::ThinkingDelta { content } => assert_eq!(content, "\n"),
+            other => panic!("expected thinking delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_notification_reads_nested_reasoning_delta_text() {
+        let mut mapper = TurnEventMapper::default();
+
+        let events = mapper.map_notification(
+            "item/reasoning/summaryTextDelta",
+            &json!({
+                "itemId": "reasoning_123",
+                "summaryIndex": 0,
+                "delta": { "text": "Checking the code path." }
+            }),
+        );
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            EngineEvent::ThinkingDelta { content } => {
+                assert_eq!(content, "Checking the code path.");
+            }
             other => panic!("expected thinking delta, got {other:?}"),
         }
     }
