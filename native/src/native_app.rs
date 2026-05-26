@@ -1,7 +1,9 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
+    fmt::Write as _,
     fs,
+    io::Read as _,
     path::Path,
     path::PathBuf,
     rc::Rc,
@@ -15,6 +17,8 @@ use std::{
 use adw::prelude::*;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::{channel::mpsc as futures_mpsc, StreamExt};
+use gtk::gio::prelude::InputStreamExtManual;
+use gtk::glib::prelude::StaticType;
 use gtk::{gdk, gio, glib};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -45,21 +49,32 @@ const APP_ID: &str = "com.supacodex.app";
 const DEFAULT_ENGINE_ID: &str = "codex";
 const DEFAULT_MODEL_ID: &str = "gpt-5.3-codex";
 const SIDEBAR_WIDTH: i32 = 320;
-const COMPOSER_SINGLE_LINE_HEIGHT: i32 = 36;
+const COMPOSER_SINGLE_LINE_HEIGHT: i32 = 32;
 const COMPOSER_LINE_HEIGHT: i32 = 24;
 const COMPOSER_MAX_HEIGHT: i32 = 132;
+const COMPOSER_SINGLE_LINE_VERTICAL_MARGIN: i32 = 7;
+const COMPOSER_MULTI_LINE_VERTICAL_MARGIN: i32 = 8;
 const SIDEBAR_PROJECTS_INITIAL_HEIGHT: i32 = 390;
 const ATTACHMENT_PREVIEW_WIDTH: i32 = 96;
 const ATTACHMENT_PREVIEW_HEIGHT: i32 = 96;
 const ATTACHMENT_MENTION_TAG_NAME: &str = "attachment-mention";
+const PASTED_IMAGE_DIR_NAME: &str = "supacodex-pasted-images";
+const CLIPBOARD_FILE_MIME_TYPES: &[&str] = &["text/uri-list", "x-special/gnome-copied-files"];
 const INITIAL_MESSAGE_WINDOW_LIMIT: usize = 48;
 const BACKGROUND_MESSAGE_PAGE_LIMIT: usize = 160;
+const HISTORY_REVEAL_CHUNK: usize = 48;
 const MESSAGE_SCROLL_SETTLE_PASSES: u8 = 4;
 const MESSAGE_SCROLL_SETTLE_INTERVAL: Duration = Duration::from_millis(32);
-const STREAM_UI_FLUSH_INTERVAL: Duration = Duration::from_millis(48);
+const MESSAGE_AUTO_FOLLOW_DISTANCE: f64 = 96.0;
+const STREAM_UI_FLUSH_INTERVAL: Duration = Duration::from_millis(96);
 const STREAM_DB_FLUSH_INTERVAL: Duration = Duration::from_millis(260);
 const PERF_WARN_THRESHOLD: Duration = Duration::from_millis(24);
 const CODEX_TRANSCRIPT_SYNC_VERSION: i64 = 2;
+const SEARCH_RENDER_DEBOUNCE: Duration = Duration::from_millis(120);
+const COMPOSER_SYNC_DEBOUNCE: Duration = Duration::from_millis(32);
+const BACKGROUND_WORKSPACE_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+const MESSAGE_TEXT_MAX_WIDTH_CHARS: i32 = 88;
+const COLLAPSIBLE_TEXT_MAX_WIDTH_CHARS: i32 = 68;
 
 const STYLE: &str = r#"
 window.supacodex-window > contents,
@@ -496,8 +511,8 @@ window.supacodex-window headerbar.app-header menubutton.mode-pill > button:check
 
 .thread-tabbar,
 .thread-tabbar:backdrop {
-  background: @window_bg_color;
-  background-color: @window_bg_color;
+  background: transparent;
+  background-color: transparent;
   background-image: none;
   border: none;
   box-shadow: none;
@@ -791,6 +806,13 @@ textview.message-edit-view text {
   padding: 9px;
 }
 
+textview.code-output text {
+  background: transparent;
+  color: alpha(@window_fg_color, 0.88);
+  font-family: monospace;
+  font-size: 12px;
+}
+
 .approval-actions button {
   min-height: 30px;
 }
@@ -798,15 +820,20 @@ textview.message-edit-view text {
 .composer-wrap {
   background: color-mix(in srgb, @window_fg_color 7%, transparent);
   border: 1px solid alpha(@window_fg_color, 0.050);
-  border-radius: 24px;
-  padding: 6px 8px;
+  border-radius: 999px;
+  padding: 4px 8px;
 }
 
 .composer-wrap:backdrop {
   background: color-mix(in srgb, @window_fg_color 7%, transparent);
   border: 1px solid alpha(@window_fg_color, 0.050);
-  border-radius: 24px;
-  padding: 6px 8px;
+  border-radius: 999px;
+  padding: 4px 8px;
+}
+
+.composer-wrap.composer-multiline,
+.composer-wrap.composer-multiline:backdrop {
+  border-radius: 18px;
 }
 
 .composer-scroll {
@@ -856,11 +883,12 @@ textview.composer-view text {
   min-height: 16px;
 }
 
-.send-button {
+button.send-button,
+button.send-button:backdrop {
   -gtk-icon-size: 16px;
-  background: transparent;
+  background: alpha(@window_fg_color, 0.055);
   background-image: none;
-  border-color: transparent;
+  border: 1px solid alpha(@window_fg_color, 0.060);
   border-radius: 999px;
   box-shadow: none;
   min-height: 32px;
@@ -868,9 +896,9 @@ textview.composer-view text {
   padding: 0;
 }
 
-.send-button:hover {
-  background: alpha(@window_fg_color, 0.080);
-  border-color: transparent;
+button.send-button:hover {
+  background: alpha(@window_fg_color, 0.105);
+  border-color: alpha(@window_fg_color, 0.085);
 }
 
 .empty-state {
@@ -960,6 +988,11 @@ enum UiEvent {
     StreamingMessageUpdated {
         thread_id: String,
         message: MessageDto,
+    },
+    TurnStarted {
+        thread_id: String,
+        user_message: MessageDto,
+        assistant_message: MessageDto,
     },
     SelectThread(String),
     OpenThreadTab(String),
@@ -1071,6 +1104,16 @@ struct EditingMessageState {
     message_id: String,
     user_turn_index: usize,
     draft: String,
+}
+
+struct MessageRenderPlan {
+    is_user: bool,
+    is_editing: bool,
+    editing: Option<EditingMessageState>,
+    blocks: Vec<NativeContentBlock>,
+    has_visible_blocks: bool,
+    fallback_text: String,
+    empty_status_text: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2169,7 +2212,7 @@ impl NativeBackend {
                 mime_type: attachment.mime_type.clone(),
             });
         }
-        db::messages::insert_user_message(
+        let user_message = db::messages::insert_user_message(
             &self.db,
             &thread.id,
             &user_content,
@@ -2195,7 +2238,11 @@ impl NativeBackend {
             .insert(thread.id.clone(), cancellation.clone());
 
         let _ = ui_tx.send(UiEvent::SelectThread(thread.id.clone()));
-        let _ = ui_tx.send(UiEvent::Reload);
+        let _ = ui_tx.send(UiEvent::TurnStarted {
+            thread_id: thread.id.clone(),
+            user_message,
+            assistant_message: assistant_message.clone(),
+        });
 
         let (event_tx, mut event_rx) = tokio_mpsc::channel::<EngineEvent>(128);
         let engines = self.engines.clone();
@@ -2658,6 +2705,7 @@ struct AppController {
     thread_list: gtk::ListBox,
     messages_box: gtk::Box,
     messages_scroll: gtk::ScrolledWindow,
+    composer_wrap: gtk::Box,
     attachment_bar: gtk::Box,
     composer_scroll: gtk::ScrolledWindow,
     composer: gtk::TextView,
@@ -2679,11 +2727,23 @@ struct AppController {
     syncing_tab_view: Cell<bool>,
     loading_snapshot: Cell<bool>,
     queued_snapshot: Cell<bool>,
+    loading_snapshot_key: RefCell<Option<(Option<String>, Option<String>)>>,
+    search_render_queued: Cell<bool>,
+    composer_sync_queued: Cell<bool>,
     composer_last_height: Cell<i32>,
     composer_last_line_count: Cell<i32>,
     composer_last_send_enabled: Cell<bool>,
     composer_last_running: Cell<bool>,
     render_widgets_created: Cell<usize>,
+    messages_follow_bottom: Rc<Cell<bool>>,
+    messages_programmatic_scroll: Rc<Cell<bool>>,
+    messages_layout_update_depth: Rc<Cell<u32>>,
+    messages_scroll_generation: Rc<Cell<u64>>,
+    rendered_messages_thread_id: RefCell<Option<String>>,
+    workspace_list_signature: RefCell<String>,
+    thread_list_signature: RefCell<String>,
+    messages_render_signature: RefCell<String>,
+    attachment_bar_signature: RefCell<String>,
     runtime_controls_signature: RefCell<String>,
     editing_message: Rc<RefCell<Option<EditingMessageState>>>,
     pending_attachments: RefCell<Vec<PendingAttachment>>,
@@ -2939,6 +2999,7 @@ impl AppController {
             .build();
         attach_button.add_css_class("send-button");
         attach_button.set_valign(gtk::Align::Center);
+        attach_button.set_size_request(32, 32);
         composer_row.append(&attach_button);
 
         let composer = gtk::TextView::new();
@@ -2946,8 +3007,8 @@ impl AppController {
         composer.set_wrap_mode(gtk::WrapMode::WordChar);
         composer.set_vexpand(false);
         composer.set_monospace(false);
-        composer.set_top_margin(18);
-        composer.set_bottom_margin(0);
+        composer.set_top_margin(COMPOSER_SINGLE_LINE_VERTICAL_MARGIN);
+        composer.set_bottom_margin(COMPOSER_SINGLE_LINE_VERTICAL_MARGIN);
         composer.set_left_margin(2);
         composer.set_right_margin(2);
         let composer_scroll = gtk::ScrolledWindow::builder()
@@ -2971,6 +3032,7 @@ impl AppController {
             .build();
         send_button.add_css_class("send-button");
         send_button.set_valign(gtk::Align::Center);
+        send_button.set_size_request(32, 32);
         send_button.set_opacity(0.0);
         send_button.set_sensitive(false);
         composer_row.append(&send_button);
@@ -2992,6 +3054,7 @@ impl AppController {
             thread_list,
             messages_box,
             messages_scroll,
+            composer_wrap: composer_wrap.clone(),
             attachment_bar,
             composer_scroll,
             composer,
@@ -3013,11 +3076,23 @@ impl AppController {
             syncing_tab_view: Cell::new(false),
             loading_snapshot: Cell::new(false),
             queued_snapshot: Cell::new(false),
+            loading_snapshot_key: RefCell::new(None),
+            search_render_queued: Cell::new(false),
+            composer_sync_queued: Cell::new(false),
             composer_last_height: Cell::new(COMPOSER_SINGLE_LINE_HEIGHT),
             composer_last_line_count: Cell::new(1),
             composer_last_send_enabled: Cell::new(false),
             composer_last_running: Cell::new(false),
             render_widgets_created: Cell::new(0),
+            messages_follow_bottom: Rc::new(Cell::new(true)),
+            messages_programmatic_scroll: Rc::new(Cell::new(false)),
+            messages_layout_update_depth: Rc::new(Cell::new(0)),
+            messages_scroll_generation: Rc::new(Cell::new(0)),
+            rendered_messages_thread_id: RefCell::new(None),
+            workspace_list_signature: RefCell::new(String::new()),
+            thread_list_signature: RefCell::new(String::new()),
+            messages_render_signature: RefCell::new(String::new()),
+            attachment_bar_signature: RefCell::new(String::new()),
             runtime_controls_signature: RefCell::new(String::new()),
             editing_message: Rc::new(RefCell::new(None)),
             pending_attachments: RefCell::new(Vec::new()),
@@ -3183,8 +3258,7 @@ impl AppController {
         let weak = Rc::downgrade(&controller);
         controller.search_entry.connect_search_changed(move |_| {
             if let Some(controller) = weak.upgrade() {
-                controller.render_workspaces();
-                controller.render_threads();
+                controller.queue_filter_render();
             }
         });
 
@@ -3198,7 +3272,7 @@ impl AppController {
         let weak = Rc::downgrade(&controller);
         controller.composer.buffer().connect_changed(move |_| {
             if let Some(controller) = weak.upgrade() {
-                controller.sync_composer_state();
+                controller.queue_composer_state_sync();
             }
         });
 
@@ -3218,6 +3292,16 @@ impl AppController {
         let key_controller = gtk::EventControllerKey::new();
         let weak = Rc::downgrade(&controller);
         key_controller.connect_key_pressed(move |_, key, _, state| {
+            if state.contains(gdk::ModifierType::CONTROL_MASK)
+                && matches!(key, gdk::Key::v | gdk::Key::V)
+            {
+                if let Some(controller) = weak.upgrade() {
+                    if controller.handle_paste_image_shortcut() {
+                        return glib::Propagation::Stop;
+                    }
+                }
+            }
+
             let plain_arrow = matches!(key, gdk::Key::Left | gdk::Key::Right)
                 && !state.contains(gdk::ModifierType::SHIFT_MASK)
                 && !state.contains(gdk::ModifierType::CONTROL_MASK);
@@ -3276,9 +3360,19 @@ impl AppController {
             .messages_scroll
             .vadjustment()
             .connect_value_changed(move |adjustment| {
-                if adjustment.value() <= 32.0 {
-                    if let Some(controller) = weak.upgrade() {
-                        controller.reveal_cached_history();
+                if let Some(controller) = weak.upgrade() {
+                    if !controller.messages_programmatic_scroll.get()
+                        && !controller.messages_layout_update_active()
+                    {
+                        let near_bottom = messages_adjustment_is_near_bottom(adjustment);
+                        if !near_bottom {
+                            controller.bump_messages_scroll_generation();
+                        }
+                        controller.messages_follow_bottom.set(near_bottom);
+                        controller.remember_active_thread_scroll_value(adjustment.value());
+                        if adjustment.value() <= 32.0 {
+                            controller.reveal_cached_history();
+                        }
                     }
                 }
             });
@@ -3289,7 +3383,7 @@ impl AppController {
         });
 
         let weak = Rc::downgrade(&controller);
-        glib::timeout_add_local(Duration::from_secs(5), move || {
+        glib::timeout_add_local(BACKGROUND_WORKSPACE_SYNC_INTERVAL, move || {
             if let Some(controller) = weak.upgrade() {
                 let _ = controller.ui_tx.send(UiEvent::SyncActiveWorkspace);
                 return glib::ControlFlow::Continue;
@@ -3317,17 +3411,30 @@ impl AppController {
     }
 
     fn request_view_snapshot(&self) {
+        self.request_view_snapshot_with_mode(false);
+    }
+
+    fn request_view_snapshot_after_data_change(&self) {
+        self.request_view_snapshot_with_mode(true);
+    }
+
+    fn request_view_snapshot_with_mode(&self, force_after_current: bool) {
+        let workspace_id = self.active_workspace_id.borrow().clone();
+        let thread_id = self.active_thread_id.borrow().clone();
+        let request_key = (workspace_id.clone(), thread_id.clone());
         if self.loading_snapshot.get() {
-            self.queued_snapshot.set(true);
+            if force_after_current
+                || self.loading_snapshot_key.borrow().as_ref() != Some(&request_key)
+            {
+                self.queued_snapshot.set(true);
+            }
             return;
         }
 
         self.loading_snapshot.set(true);
-        self.backend.load_view_snapshot_async(
-            self.active_workspace_id.borrow().clone(),
-            self.active_thread_id.borrow().clone(),
-            self.ui_tx.clone(),
-        );
+        *self.loading_snapshot_key.borrow_mut() = Some(request_key);
+        self.backend
+            .load_view_snapshot_async(workspace_id, thread_id, self.ui_tx.clone());
     }
 
     fn apply_view_snapshot(&self, snapshot: ViewSnapshot) {
@@ -3335,6 +3442,7 @@ impl AppController {
             .active_thread
             .as_ref()
             .map(|thread| thread.id.clone());
+        let mut cached_active_messages = None;
         if let Some(thread) = snapshot.active_thread.as_ref() {
             let mut cache = self.thread_view_cache.borrow_mut();
             let entry = cache.entry(thread.id.clone()).or_default();
@@ -3342,13 +3450,15 @@ impl AppController {
             entry.messages = merge_messages(&entry.messages, &snapshot.messages);
             entry.history_complete =
                 snapshot.messages_next_cursor.is_none() || entry.history_complete;
+            cached_active_messages = Some(visible_messages_for_cache(entry));
         }
+        let active_messages = cached_active_messages.unwrap_or_else(|| snapshot.messages.clone());
         *self.workspaces.borrow_mut() = snapshot.workspaces;
         *self.active_workspace_id.borrow_mut() = snapshot.active_workspace_id;
         *self.threads.borrow_mut() = snapshot.threads;
         *self.active_thread_id.borrow_mut() = active_thread_id;
         *self.active_thread_snapshot.borrow_mut() = snapshot.active_thread;
-        *self.active_messages.borrow_mut() = snapshot.messages;
+        *self.active_messages.borrow_mut() = active_messages;
         *self.active_trust_level.borrow_mut() = snapshot.trust_level;
     }
 
@@ -3363,12 +3473,52 @@ impl AppController {
         entry.scroll_value = Some(self.messages_scroll.vadjustment().value());
     }
 
+    fn remember_active_thread_scroll_value(&self, value: f64) {
+        let Some(thread_id) = self.active_thread_id.borrow().clone() else {
+            return;
+        };
+        let mut cache = self.thread_view_cache.borrow_mut();
+        cache.entry(thread_id).or_default().scroll_value = Some(value);
+    }
+
+    fn bump_messages_scroll_generation(&self) {
+        self.messages_scroll_generation
+            .set(self.messages_scroll_generation.get().wrapping_add(1));
+    }
+
+    fn begin_messages_layout_update(&self) {
+        self.messages_layout_update_depth
+            .set(self.messages_layout_update_depth.get().saturating_add(1));
+    }
+
+    fn end_messages_layout_update_after_frame(&self) {
+        let depth = Rc::clone(&self.messages_layout_update_depth);
+        glib::idle_add_local_once(move || {
+            depth.set(depth.get().saturating_sub(1));
+        });
+    }
+
+    fn messages_layout_update_active(&self) -> bool {
+        self.messages_layout_update_depth.get() > 0
+    }
+
     fn active_thread_scroll_value(&self) -> Option<f64> {
         let thread_id = self.active_thread_id.borrow().clone()?;
         self.thread_view_cache
             .borrow()
             .get(&thread_id)
             .and_then(|entry| entry.scroll_value)
+    }
+
+    fn should_follow_messages_bottom(&self) -> bool {
+        if self.messages_follow_bottom.get() {
+            return true;
+        }
+        let near_bottom = self.messages_scroll_is_near_bottom();
+        if near_bottom {
+            self.messages_follow_bottom.set(true);
+        }
+        near_bottom
     }
 
     fn restore_cached_thread_view(&self) {
@@ -3387,15 +3537,22 @@ impl AppController {
         }
     }
 
-    fn restore_active_thread_scroll_after_render(&self) {
-        let Some(scroll_value) = self.active_thread_scroll_value() else {
-            return;
-        };
+    fn restore_messages_scroll_value_after_render(&self, scroll_value: f64) {
         let scroll = self.messages_scroll.clone();
+        let generation = Rc::clone(&self.messages_scroll_generation);
+        let expected_generation = generation.get();
+        let programmatic_scroll = Rc::clone(&self.messages_programmatic_scroll);
         glib::idle_add_local_once(move || {
+            if generation.get() != expected_generation {
+                return;
+            }
             let adjustment = scroll.vadjustment();
             let max_value = (adjustment.upper() - adjustment.page_size()).max(0.0);
-            adjustment.set_value(scroll_value.clamp(0.0, max_value));
+            set_adjustment_value_programmatically(
+                &adjustment,
+                scroll_value.clamp(0.0, max_value),
+                &programmatic_scroll,
+            );
         });
     }
 
@@ -3410,7 +3567,7 @@ impl AppController {
         let Some(thread_id) = self.active_thread_id.borrow().clone() else {
             return;
         };
-        let Some(messages) = self
+        let Some(cached_messages) = self
             .thread_view_cache
             .borrow()
             .get(&thread_id)
@@ -3418,9 +3575,13 @@ impl AppController {
         else {
             return;
         };
-        if messages.len() <= self.active_messages.borrow().len() {
+        let visible_len = self.active_messages.borrow().len();
+        if cached_messages.len() <= visible_len {
             return;
         }
+        let reveal_len = (visible_len + HISTORY_REVEAL_CHUNK).min(cached_messages.len());
+        let start_index = cached_messages.len().saturating_sub(reveal_len);
+        let messages = cached_messages[start_index..].to_vec();
 
         let adjustment = self.messages_scroll.vadjustment();
         let old_upper = adjustment.upper();
@@ -3428,10 +3589,15 @@ impl AppController {
         *self.active_messages.borrow_mut() = messages;
         self.render_messages();
         let scroll = self.messages_scroll.clone();
+        let programmatic_scroll = Rc::clone(&self.messages_programmatic_scroll);
         glib::idle_add_local_once(move || {
             let adjustment = scroll.vadjustment();
             let delta = adjustment.upper() - old_upper;
-            adjustment.set_value((old_value + delta).max(0.0));
+            set_adjustment_value_programmatically(
+                &adjustment,
+                (old_value + delta).max(0.0),
+                &programmatic_scroll,
+            );
         });
     }
 
@@ -3454,7 +3620,8 @@ impl AppController {
             thread.status = ThreadStatusDto::Streaming;
         }
         self.refresh_message_widget(&message);
-        self.sync_composer_state();
+        self.remember_current_messages_render_signature();
+        self.sync_running_send_button_state();
     }
 
     fn snapshot_is_stale(&self, snapshot: &ViewSnapshot) -> bool {
@@ -3474,6 +3641,63 @@ impl AppController {
         };
         self.backend
             .sync_codex_threads_for_workspace_async(workspace_id, self.ui_tx.clone());
+    }
+
+    fn queue_filter_render(self: &Rc<Self>) {
+        if self.search_render_queued.replace(true) {
+            return;
+        }
+
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(SEARCH_RENDER_DEBOUNCE, move || {
+            if let Some(controller) = weak.upgrade() {
+                controller.search_render_queued.set(false);
+                controller.render_workspaces();
+                controller.render_threads();
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn queue_composer_state_sync(self: &Rc<Self>) {
+        if self.composer_sync_queued.replace(true) {
+            return;
+        }
+
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(COMPOSER_SYNC_DEBOUNCE, move || {
+            if let Some(controller) = weak.upgrade() {
+                controller.composer_sync_queued.set(false);
+                controller.sync_composer_state();
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn sync_running_send_button_state(&self) {
+        let running = self
+            .active_thread_id
+            .borrow()
+            .as_ref()
+            .is_some_and(|thread_id| self.backend.is_running(thread_id));
+
+        if self.composer_last_running.replace(running) != running {
+            self.send_button.set_icon_name(if running {
+                "process-stop-symbolic"
+            } else {
+                "mail-send-symbolic"
+            });
+            self.send_button.set_tooltip_text(Some(if running {
+                "Annuler la generation"
+            } else {
+                "Envoyer"
+            }));
+        }
+
+        if running && !self.composer_last_send_enabled.replace(true) {
+            self.send_button.set_opacity(1.0);
+            self.send_button.set_sensitive(true);
+        }
     }
 
     fn render_all(&self) {
@@ -3500,6 +3724,7 @@ impl AppController {
         let query = self.search_entry.text().to_string().to_lowercase();
         let mut visible_ids = Vec::new();
         let mut desired_rows = Vec::new();
+        let mut row_signatures = Vec::new();
 
         for (index, workspace) in self.workspaces.borrow().iter().enumerate() {
             if !query.is_empty()
@@ -3514,6 +3739,7 @@ impl AppController {
                 "{}\u{1f}{}\u{1f}{}\u{1f}{}",
                 workspace.id, workspace.name, workspace.root_path, is_active
             );
+            row_signatures.push(signature.clone());
             let row = {
                 let mut cache = self.workspace_row_cache.borrow_mut();
                 let entry = cache
@@ -3543,9 +3769,16 @@ impl AppController {
             desired_rows.push(row);
         }
 
+        let list_signature = row_signatures.join("\u{1e}");
+        if self.workspace_list_signature.borrow().as_str() == list_signature {
+            *self.visible_workspace_ids.borrow_mut() = visible_ids;
+            return;
+        }
+        *self.workspace_list_signature.borrow_mut() = list_signature;
+        let visible_id_set = visible_ids.iter().cloned().collect::<HashSet<_>>();
         self.workspace_row_cache
             .borrow_mut()
-            .retain(|workspace_id, _| visible_ids.iter().any(|id| id == workspace_id));
+            .retain(|workspace_id, _| visible_id_set.contains(workspace_id));
         clear_list_box(&self.workspace_list);
         for row in desired_rows {
             self.workspace_list.append(&row);
@@ -3558,6 +3791,7 @@ impl AppController {
         let query = self.search_entry.text().to_string().to_lowercase();
         let mut visible_ids = Vec::new();
         let mut desired_rows = Vec::new();
+        let mut row_signatures = Vec::new();
 
         for thread in self.threads.borrow().iter() {
             if !query.is_empty() && !thread.title.to_lowercase().contains(&query) {
@@ -3575,6 +3809,7 @@ impl AppController {
                 thread.status.as_str(),
                 is_active || is_running
             );
+            row_signatures.push(signature.clone());
             let row = {
                 let mut cache = self.thread_row_cache.borrow_mut();
                 if cache
@@ -3656,9 +3891,16 @@ impl AppController {
             }
         }
 
+        let list_signature = row_signatures.join("\u{1e}");
+        if self.thread_list_signature.borrow().as_str() == list_signature {
+            *self.visible_thread_ids.borrow_mut() = visible_ids;
+            return;
+        }
+        *self.thread_list_signature.borrow_mut() = list_signature;
+        let visible_id_set = visible_ids.iter().cloned().collect::<HashSet<_>>();
         self.thread_row_cache
             .borrow_mut()
-            .retain(|thread_id, _| visible_ids.iter().any(|id| id == thread_id));
+            .retain(|thread_id, _| visible_id_set.contains(thread_id));
         clear_list_box(&self.thread_list);
         for row in desired_rows {
             self.thread_list.append(&row);
@@ -3797,10 +4039,9 @@ impl AppController {
     fn render_messages(&self) {
         let started = Instant::now();
         self.render_widgets_created.set(0);
-        let stick_to_bottom = self.messages_scroll_is_near_bottom();
-        clear_box(&self.messages_box);
+        let stick_to_bottom = self.should_follow_messages_bottom();
+        let previously_rendered_thread_id = self.rendered_messages_thread_id.borrow().clone();
         let Some(thread_id) = self.active_thread_id.borrow().clone() else {
-            self.render_empty("Aucun thread selectionne");
             self.title_label.set_text("SupaCodex");
             self.title_label.set_tooltip_text(None);
             self.subtitle_label.set_text("codex");
@@ -3808,17 +4049,45 @@ impl AppController {
             self.subtitle_label.queue_draw();
             self.window.queue_draw();
             self.render_runtime_controls(None);
+            if !self.mark_messages_render_signature("empty:no-thread".to_string()) {
+                return;
+            }
+            self.begin_messages_layout_update();
+            clear_box(&self.messages_box);
+            self.message_widget_cache.borrow_mut().clear();
+            *self.rendered_messages_thread_id.borrow_mut() = None;
+            self.render_empty("Aucun thread selectionne");
+            self.end_messages_layout_update_after_frame();
             return;
         };
 
         let Some(thread) = self.active_thread_snapshot.borrow().clone() else {
-            self.render_empty("Chargement du thread...");
             self.render_runtime_controls(None);
+            if !self.mark_messages_render_signature(format!("loading:{thread_id}")) {
+                return;
+            }
+            self.begin_messages_layout_update();
+            clear_box(&self.messages_box);
+            self.message_widget_cache.borrow_mut().clear();
+            *self.rendered_messages_thread_id.borrow_mut() = None;
+            self.render_empty("Chargement du thread...");
+            self.end_messages_layout_update_after_frame();
             return;
         };
         if thread.id != thread_id {
-            self.render_empty("Chargement du thread...");
             self.render_runtime_controls(None);
+            if !self.mark_messages_render_signature(format!(
+                "loading-mismatch:{thread_id}:{}",
+                thread.id
+            )) {
+                return;
+            }
+            self.begin_messages_layout_update();
+            clear_box(&self.messages_box);
+            self.message_widget_cache.borrow_mut().clear();
+            *self.rendered_messages_thread_id.borrow_mut() = None;
+            self.render_empty("Chargement du thread...");
+            self.end_messages_layout_update_after_frame();
             return;
         };
 
@@ -3861,7 +4130,19 @@ impl AppController {
             });
 
         let messages = self.active_messages.borrow().clone();
+        let render_signature = self.messages_render_signature_for(Some(&thread), &messages);
+        if !self.mark_messages_render_signature(render_signature) {
+            return;
+        }
+        let thread_changed_since_render =
+            previously_rendered_thread_id.as_deref() != Some(thread.id.as_str());
+        let saved_scroll_value = self.active_thread_scroll_value();
+        let current_scroll_value = self.messages_scroll.vadjustment().value();
+        self.begin_messages_layout_update();
+        clear_box(&self.messages_box);
+        self.message_widget_cache.borrow_mut().clear();
         if messages.is_empty() {
+            *self.rendered_messages_thread_id.borrow_mut() = Some(thread.id.clone());
             self.render_empty("Pret a demarrer une conversation.");
         } else {
             let mut user_turn_index = 0usize;
@@ -3875,14 +4156,16 @@ impl AppController {
                 };
                 self.render_message(&thread, &message, message_user_turn_index);
             }
-            if stick_to_bottom {
+            *self.rendered_messages_thread_id.borrow_mut() = Some(thread.id.clone());
+            if stick_to_bottom || (thread_changed_since_render && saved_scroll_value.is_none()) {
                 self.scroll_messages_to_bottom();
-            } else if self.active_thread_scroll_value().is_none() {
-                self.scroll_messages_to_bottom();
+            } else if let Some(scroll_value) = saved_scroll_value {
+                self.restore_messages_scroll_value_after_render(scroll_value);
             } else {
-                self.restore_active_thread_scroll_after_render();
+                self.restore_messages_scroll_value_after_render(current_scroll_value);
             }
         }
+        self.end_messages_layout_update_after_frame();
         log_perf(
             "ui.render_messages",
             started,
@@ -3911,18 +4194,101 @@ impl AppController {
         self.messages_box.append(&empty);
     }
 
+    fn mark_messages_render_signature(&self, signature: String) -> bool {
+        if self.messages_render_signature.borrow().as_str() == signature {
+            return false;
+        }
+        *self.messages_render_signature.borrow_mut() = signature;
+        true
+    }
+
+    fn remember_current_messages_render_signature(&self) {
+        let Some(thread) = self.active_thread_snapshot.borrow().clone() else {
+            return;
+        };
+        if self.active_thread_id.borrow().as_deref() != Some(thread.id.as_str()) {
+            return;
+        }
+        let messages = self.active_messages.borrow().clone();
+        *self.messages_render_signature.borrow_mut() =
+            self.messages_render_signature_for(Some(&thread), &messages);
+    }
+
+    fn messages_render_signature_for(
+        &self,
+        thread: Option<&ThreadDto>,
+        messages: &[MessageDto],
+    ) -> String {
+        let mut signature = String::new();
+        let active_thread_id = self.active_thread_id.borrow();
+        let _ = write!(
+            signature,
+            "thread={:?}\u{1f}running={}",
+            active_thread_id.as_deref(),
+            active_thread_id
+                .as_deref()
+                .is_some_and(|thread_id| self.backend.is_running(thread_id))
+        );
+        if let Some(thread) = thread {
+            let _ = write!(
+                signature,
+                "\u{1f}{}:{}:{}:{}:{}:{}",
+                thread.id,
+                thread.title,
+                thread.status.as_str(),
+                thread.message_count,
+                thread.total_tokens,
+                thread.last_activity_at
+            );
+        }
+        if let Some(editing) = self.editing_message.borrow().as_ref() {
+            let _ = write!(
+                signature,
+                "\u{1f}edit={}:{}:{}:{}",
+                editing.thread_id, editing.message_id, editing.user_turn_index, editing.draft
+            );
+        }
+        for message in messages {
+            let _ = write!(
+                signature,
+                "\u{1e}{}:{}:{}:{}:{}:",
+                message.id,
+                message.role,
+                message.status.as_str(),
+                message.created_at,
+                message.schema_version
+            );
+            if let Some(content) = message.content.as_deref() {
+                signature.push_str(content);
+            }
+            signature.push('\u{1f}');
+            if let Some(blocks) = message.blocks.as_ref() {
+                signature.push_str(&blocks.to_string());
+            }
+        }
+        signature
+    }
+
     fn messages_scroll_is_near_bottom(&self) -> bool {
-        let adjustment = self.messages_scroll.vadjustment();
-        let distance = adjustment.upper() - adjustment.page_size() - adjustment.value();
-        distance <= 48.0
+        messages_adjustment_is_near_bottom(&self.messages_scroll.vadjustment())
     }
 
     fn scroll_messages_to_bottom(&self) {
+        self.messages_follow_bottom.set(true);
         let scroll = self.messages_scroll.clone();
+        let generation = Rc::clone(&self.messages_scroll_generation);
+        let expected_generation = generation.get();
+        let programmatic_scroll = Rc::clone(&self.messages_programmatic_scroll);
         glib::idle_add_local_once(move || {
-            scroll_scrolled_window_to_bottom(&scroll);
+            if generation.get() != expected_generation {
+                return;
+            }
+            scroll_scrolled_window_to_bottom(&scroll, &programmatic_scroll);
             settle_scrolled_window_to_bottom(
                 scroll,
+                generation,
+                programmatic_scroll,
+                expected_generation,
                 MESSAGE_SCROLL_SETTLE_PASSES,
                 MESSAGE_SCROLL_SETTLE_INTERVAL,
             );
@@ -4066,6 +4432,25 @@ impl AppController {
     ) -> Option<gtk::Widget> {
         self.render_widgets_created
             .set(self.render_widgets_created.get().saturating_add(1));
+        let plan = self.message_render_plan(thread, message, user_turn_index)?;
+
+        let outer = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        self.configure_message_outer(&outer, &plan);
+
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        self.configure_message_card(&card, &plan);
+        outer.append(&card);
+        self.populate_message_card(thread, message, user_turn_index, &card, &plan);
+
+        Some(outer.upcast::<gtk::Widget>())
+    }
+
+    fn message_render_plan(
+        &self,
+        thread: &ThreadDto,
+        message: &MessageDto,
+        user_turn_index: Option<usize>,
+    ) -> Option<MessageRenderPlan> {
         let is_user = message.role == "user";
         let mut editing = self.editing_state_for_message(&thread.id, message, user_turn_index);
         if let Some(editing_state) = editing.as_mut() {
@@ -4098,10 +4483,21 @@ impl AppController {
             return None;
         }
 
-        let outer = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        Some(MessageRenderPlan {
+            is_user,
+            is_editing,
+            editing,
+            blocks,
+            has_visible_blocks,
+            fallback_text,
+            empty_status_text,
+        })
+    }
+
+    fn configure_message_outer(&self, outer: &gtk::Box, plan: &MessageRenderPlan) {
         outer.set_hexpand(true);
-        outer.set_margin_start(if is_user {
-            if is_editing {
+        outer.set_margin_start(if plan.is_user {
+            if plan.is_editing {
                 96
             } else {
                 160
@@ -4109,36 +4505,53 @@ impl AppController {
         } else {
             0
         });
-        outer.set_margin_end(if is_user { 0 } else { 160 });
-        outer.set_halign(if is_editing {
+        outer.set_margin_end(if plan.is_user { 0 } else { 160 });
+        outer.set_halign(if plan.is_editing {
             gtk::Align::Fill
-        } else if is_user {
+        } else if plan.is_user {
             gtk::Align::End
         } else {
             gtk::Align::Start
         });
+    }
 
-        let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    fn configure_message_card(&self, card: &gtk::Box, plan: &MessageRenderPlan) {
         card.add_css_class("message-card");
-        if is_user {
+        card.remove_css_class("user-message");
+        card.remove_css_class("assistant-message");
+        card.remove_css_class("message-editing");
+        if plan.is_user {
             card.add_css_class("user-message");
         } else {
             card.add_css_class("assistant-message");
         }
-        if is_editing {
+        if plan.is_editing {
             card.add_css_class("message-editing");
-            card.set_hexpand(true);
         }
-        outer.append(&card);
+        card.set_hexpand(plan.is_editing);
+    }
 
+    fn populate_message_card(
+        &self,
+        thread: &ThreadDto,
+        message: &MessageDto,
+        user_turn_index: Option<usize>,
+        card: &gtk::Box,
+        plan: &MessageRenderPlan,
+    ) {
         let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         toolbar.add_css_class("message-toolbar");
-        let author = gtk::Label::new(Some(if is_user { "Vous" } else { &thread.engine_id }));
+        let author_text = if plan.is_user {
+            "Vous"
+        } else {
+            thread.engine_id.as_str()
+        };
+        let author = gtk::Label::new(Some(author_text));
         author.add_css_class("message-author");
         author.set_xalign(0.0);
         author.set_hexpand(true);
         toolbar.append(&author);
-        if is_user && !is_editing {
+        if plan.is_user && !plan.is_editing {
             let edit_button = gtk::Button::builder()
                 .icon_name("document-edit-symbolic")
                 .tooltip_text("Modifier et reprendre depuis ce message")
@@ -4162,22 +4575,37 @@ impl AppController {
         }
         card.append(&toolbar);
 
-        if let Some(editing_state) = editing {
-            self.render_inline_message_editor(&card, editing_state);
-        } else if let Some(status_text) = empty_status_text {
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        body.set_widget_name("message-body");
+        card.append(&body);
+        self.populate_message_body(thread, message, user_turn_index, &body, plan);
+    }
+
+    fn populate_message_body(
+        &self,
+        thread: &ThreadDto,
+        message: &MessageDto,
+        _user_turn_index: Option<usize>,
+        body: &gtk::Box,
+        plan: &MessageRenderPlan,
+    ) {
+        if let Some(editing_state) = plan.editing.clone() {
+            self.render_inline_message_editor(body, editing_state);
+        } else if let Some(status_text) = plan.empty_status_text {
             let pending = gtk::Label::new(Some(status_text));
+            pending.set_widget_name("message-status");
             pending.add_css_class("dim-label");
             pending.set_xalign(0.0);
-            card.append(&pending);
-        } else if !has_visible_blocks {
-            card.append(&message_label(&fallback_text));
+            body.append(&pending);
+        } else if !plan.has_visible_blocks {
+            let label = message_label(&plan.fallback_text);
+            label.set_widget_name("message-block-text");
+            body.append(&label);
         } else {
-            for (block_index, block) in blocks.into_iter().enumerate() {
-                self.render_block(thread, message, &card, block_index, block);
+            for (block_index, block) in plan.blocks.iter().cloned().enumerate() {
+                self.render_block(thread, message, body, block_index, block);
             }
         }
-
-        Some(outer.upcast::<gtk::Widget>())
     }
 
     fn refresh_message_widget(&self, message: &MessageDto) {
@@ -4185,10 +4613,25 @@ impl AppController {
             return;
         };
         let user_turn_index = self.user_turn_index_for_message(&message.id);
+        let stick_to_bottom = self.should_follow_messages_bottom();
+        let previous = self.message_widget_cache.borrow().get(&message.id).cloned();
+        if let Some(previous) = previous.as_ref().filter(|widget| widget.parent().is_some()) {
+            if self.refresh_message_widget_in_place(previous, &thread, message, user_turn_index) {
+                if stick_to_bottom {
+                    self.scroll_messages_to_bottom();
+                }
+                return;
+            }
+        }
+
         let Some(widget) = self.build_message_widget(&thread, message, user_turn_index) else {
+            if let Some(previous) = self.message_widget_cache.borrow_mut().remove(&message.id) {
+                if previous.parent().is_some() {
+                    self.messages_box.remove(&previous);
+                }
+            }
             return;
         };
-        let stick_to_bottom = self.messages_scroll_is_near_bottom();
         let previous = self
             .message_widget_cache
             .borrow_mut()
@@ -4204,6 +4647,138 @@ impl AppController {
         if stick_to_bottom {
             self.scroll_messages_to_bottom();
         }
+    }
+
+    fn refresh_message_widget_in_place(
+        &self,
+        widget: &gtk::Widget,
+        thread: &ThreadDto,
+        message: &MessageDto,
+        user_turn_index: Option<usize>,
+    ) -> bool {
+        let Some(plan) = self.message_render_plan(thread, message, user_turn_index) else {
+            return false;
+        };
+        if plan.is_user || plan.is_editing {
+            return false;
+        }
+        let Some(outer) = widget.downcast_ref::<gtk::Box>() else {
+            return false;
+        };
+        let Some(card_widget) = outer.first_child() else {
+            return false;
+        };
+        let Ok(card) = card_widget.downcast::<gtk::Box>() else {
+            return false;
+        };
+        let Some(body_widget) = card.last_child() else {
+            return false;
+        };
+        if body_widget.widget_name().as_str() != "message-body" {
+            return false;
+        }
+        let Ok(body) = body_widget.downcast::<gtk::Box>() else {
+            return false;
+        };
+        self.begin_messages_layout_update();
+        self.configure_message_outer(outer, &plan);
+        self.configure_message_card(&card, &plan);
+        if !self.update_message_body_in_place(&body, &plan) {
+            clear_box(&body);
+            self.populate_message_body(thread, message, user_turn_index, &body, &plan);
+        }
+        self.end_messages_layout_update_after_frame();
+        true
+    }
+
+    fn update_message_body_in_place(&self, body: &gtk::Box, plan: &MessageRenderPlan) -> bool {
+        if plan.editing.is_some() {
+            return false;
+        }
+        if let Some(status_text) = plan.empty_status_text {
+            return update_single_label_child(body, "message-status", status_text);
+        }
+        if !plan.has_visible_blocks {
+            return update_single_label_child(body, "message-block-text", &plan.fallback_text);
+        }
+
+        let children = box_children(body);
+        let mut child_index = 0usize;
+        for block in plan
+            .blocks
+            .iter()
+            .filter(|block| block_has_visible_content(block))
+        {
+            let Some(child) = children.get(child_index) else {
+                return false;
+            };
+            if !update_block_widget_in_place(child, block) {
+                return false;
+            }
+            child_index += 1;
+        }
+        child_index == children.len()
+    }
+
+    fn refresh_active_message_widget(&self, message_id: &str) -> bool {
+        let message = self
+            .active_messages
+            .borrow()
+            .iter()
+            .find(|message| message.id == message_id)
+            .cloned();
+        let Some(message) = message else {
+            return false;
+        };
+        self.refresh_message_widget(&message);
+        true
+    }
+
+    fn apply_turn_started(
+        &self,
+        thread_id: &str,
+        user_message: MessageDto,
+        assistant_message: MessageDto,
+    ) {
+        {
+            let mut cache = self.thread_view_cache.borrow_mut();
+            let entry = cache.entry(thread_id.to_string()).or_default();
+            upsert_message(&mut entry.messages, user_message.clone());
+            upsert_message(&mut entry.messages, assistant_message.clone());
+            if entry.thread.is_none() {
+                entry.thread = self.active_thread_snapshot.borrow().clone();
+            }
+        }
+
+        for thread in self.threads.borrow_mut().iter_mut() {
+            if thread.id == thread_id {
+                thread.status = ThreadStatusDto::Streaming;
+                thread.last_activity_at = user_message.created_at.clone();
+            }
+        }
+        if let Some(thread) = self.active_thread_snapshot.borrow_mut().as_mut() {
+            if thread.id == thread_id {
+                thread.status = ThreadStatusDto::Streaming;
+                thread.last_activity_at = user_message.created_at.clone();
+            }
+        }
+
+        if self.active_thread_id.borrow().as_deref() != Some(thread_id) {
+            return;
+        }
+
+        upsert_message(&mut self.active_messages.borrow_mut(), user_message.clone());
+        upsert_message(
+            &mut self.active_messages.borrow_mut(),
+            assistant_message.clone(),
+        );
+        self.messages_follow_bottom.set(true);
+        self.render_threads();
+        self.refresh_message_widget(&user_message);
+        self.refresh_message_widget(&assistant_message);
+        self.scroll_messages_to_bottom();
+        self.remember_current_messages_render_signature();
+        self.sync_running_send_button_state();
     }
 
     fn user_turn_index_for_message(&self, message_id: &str) -> Option<usize> {
@@ -4316,7 +4891,9 @@ impl AppController {
         match block {
             NativeContentBlock::Text { content, .. } => {
                 if !content.trim().is_empty() {
-                    parent.append(&message_label(&content));
+                    let label = message_label(&content);
+                    label.set_widget_name("message-block-text");
+                    parent.append(&label);
                 }
             }
             NativeContentBlock::Thinking { content } => {
@@ -4330,6 +4907,7 @@ impl AppController {
                         "reasoning-block",
                         Some("reasoning-text"),
                     );
+                    card.set_widget_name("message-block-thinking");
                     parent.append(&card);
                 }
             }
@@ -4345,6 +4923,7 @@ impl AppController {
                 let title = changes_title(&scope);
                 let key = collapsible_block_key(&message.id, block_index, "diff");
                 let card = self.collapsible_code_card(key, &title, Some("Diff du code"), &diff);
+                card.set_widget_name("message-block-diff");
                 parent.append(&card);
             }
             NativeContentBlock::Action {
@@ -4356,21 +4935,10 @@ impl AppController {
                 ..
             } => {
                 let title = format!("{action_type}: {summary}");
-                let mut body = output_chunks
-                    .iter()
-                    .map(|chunk| chunk.content.as_str())
-                    .collect::<Vec<_>>()
-                    .join("");
-                if body.trim().is_empty() {
-                    if let Some(result) = result.as_ref() {
-                        body = result
-                            .output
-                            .clone()
-                            .or_else(|| result.error.clone())
-                            .unwrap_or_else(|| "Termine".to_string());
-                    }
-                }
-                parent.append(&code_card(&title, &body));
+                let body = action_body_text(&output_chunks, result.as_ref());
+                let card = code_card(&title, &body);
+                card.set_widget_name("message-block-action");
+                parent.append(&card);
 
                 if let Some(diff) = result
                     .as_ref()
@@ -4384,6 +4952,7 @@ impl AppController {
                         &format!("action-diff-{action_id}"),
                     );
                     let card = self.collapsible_code_card(key, "Changements", Some(&summary), diff);
+                    card.set_widget_name("message-block-action-diff");
                     parent.append(&card);
                 }
             }
@@ -4413,12 +4982,15 @@ impl AppController {
                     actions.add_css_class("approval-actions");
                     let accept = gtk::Button::with_label("Accepter");
                     let decline = gtk::Button::with_label("Refuser");
+                    let decline_for_accept = decline.clone();
                     let thread_id = thread.id.clone();
                     let accept_approval_id = approval_id.clone();
                     let accept_details = details.clone();
                     let backend = Arc::clone(&self.backend);
                     let ui_tx = self.ui_tx.clone();
-                    accept.connect_clicked(move |_| {
+                    accept.connect_clicked(move |button| {
+                        button.set_sensitive(false);
+                        decline_for_accept.set_sensitive(false);
                         backend.respond_to_approval(
                             thread_id.clone(),
                             accept_approval_id.clone(),
@@ -4428,12 +5000,15 @@ impl AppController {
                         );
                     });
 
+                    let accept_for_decline = accept.clone();
                     let thread_id = thread.id.clone();
                     let decline_approval_id = approval_id;
                     let decline_details = details;
                     let backend = Arc::clone(&self.backend);
                     let ui_tx = self.ui_tx.clone();
-                    decline.connect_clicked(move |_| {
+                    decline.connect_clicked(move |button| {
+                        accept_for_decline.set_sensitive(false);
+                        button.set_sensitive(false);
                         backend.respond_to_approval(
                             thread_id.clone(),
                             decline_approval_id.clone(),
@@ -4492,7 +5067,8 @@ impl AppController {
         body_class: Option<&str>,
     ) -> gtk::Box {
         let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        let label = message_label(body);
+        let label = message_label_with_max_width(body, COLLAPSIBLE_TEXT_MAX_WIDTH_CHARS);
+        label.set_widget_name("message-block-thinking-content");
         if let Some(body_class) = body_class {
             label.add_css_class(body_class);
         }
@@ -4576,6 +5152,7 @@ impl AppController {
         let revealer = gtk::Revealer::new();
         revealer.set_transition_type(gtk::RevealerTransitionType::None);
         revealer.set_reveal_child(expanded);
+        revealer.set_visible(expanded);
         revealer.set_child(Some(&content));
         card.append(&revealer);
 
@@ -4584,7 +5161,13 @@ impl AppController {
         let icon_for_toggle = icon.clone();
         header_button.connect_clicked(move |_| {
             let next = !revealer_for_toggle.property::<bool>("reveal-child");
+            if next {
+                revealer_for_toggle.set_visible(true);
+            }
             revealer_for_toggle.set_reveal_child(next);
+            if !next {
+                revealer_for_toggle.set_visible(false);
+            }
             icon_for_toggle.set_icon_name(Some(if next {
                 "pan-down-symbolic"
             } else {
@@ -4599,6 +5182,7 @@ impl AppController {
         let active_thread_id = self.active_thread_id.borrow().clone();
         if let Some(thread_id) = active_thread_id.as_ref() {
             if self.backend.is_running(thread_id) {
+                self.send_button.set_sensitive(false);
                 self.backend
                     .cancel_turn(thread_id.clone(), self.ui_tx.clone());
                 return;
@@ -4634,6 +5218,7 @@ impl AppController {
         }
 
         if let Some(thread_id) = active_thread_id {
+            self.send_button.set_sensitive(false);
             self.backend
                 .send_message(thread_id, message, attachments, self.ui_tx.clone());
         } else if !self.backend.create_thread_and_send_message_async(
@@ -4649,6 +5234,7 @@ impl AppController {
         buffer.set_text("");
         self.pending_attachments.borrow_mut().clear();
         self.render_attachment_bar();
+        self.sync_composer_state();
         self.composer.grab_focus();
     }
 
@@ -4681,13 +5267,21 @@ impl AppController {
         else {
             return;
         };
+        if self.active_workspace_id.borrow().as_deref() == Some(workspace_id.as_str()) {
+            return;
+        }
         self.remember_active_thread_scroll();
         *self.editing_message.borrow_mut() = None;
         *self.active_workspace_id.borrow_mut() = Some(workspace_id);
         *self.active_thread_id.borrow_mut() = None;
         *self.active_thread_snapshot.borrow_mut() = None;
+        self.threads.borrow_mut().clear();
         self.active_messages.borrow_mut().clear();
-        self.render_all();
+        self.render_workspaces();
+        self.render_threads();
+        self.render_thread_tabs();
+        self.render_messages();
+        self.sync_composer_state();
         self.request_view_snapshot();
         self.sync_active_workspace();
     }
@@ -4701,13 +5295,20 @@ impl AppController {
         else {
             return;
         };
+        if self.active_thread_id.borrow().as_deref() == Some(thread_id.as_str()) {
+            self.composer.grab_focus();
+            return;
+        }
         if self.active_thread_id.borrow().as_deref() != Some(thread_id.as_str()) {
             self.remember_active_thread_scroll();
             *self.editing_message.borrow_mut() = None;
         }
         *self.active_thread_id.borrow_mut() = Some(thread_id);
         self.restore_cached_thread_view();
-        self.render_all();
+        self.render_threads();
+        self.render_thread_tabs();
+        self.render_messages();
+        self.sync_composer_state();
         self.request_view_snapshot();
         self.composer.grab_focus();
     }
@@ -4774,7 +5375,75 @@ impl AppController {
         );
     }
 
+    fn handle_paste_image_shortcut(self: &Rc<Self>) -> bool {
+        let clipboard = gtk::prelude::WidgetExt::display(&self.window).clipboard();
+        let formats = clipboard.formats();
+        let insertion_offset = self.composer.buffer().cursor_position();
+
+        if clipboard_formats_include_image(&formats) {
+            let weak = Rc::downgrade(self);
+            clipboard.read_texture_async(None::<&gio::Cancellable>, move |result| {
+                let Some(controller) = weak.upgrade() else {
+                    return;
+                };
+                match result {
+                    Ok(Some(texture)) => match save_clipboard_texture(&texture) {
+                        Ok(path) => controller.add_attachments_at(vec![path], insertion_offset),
+                        Err(error) => controller.toast(error),
+                    },
+                    Ok(None) => {
+                        controller.toast("Aucune image lisible dans le presse-papiers.".to_string())
+                    }
+                    Err(error) => controller.toast(format!(
+                        "Impossible de lire l'image du presse-papiers: {error}"
+                    )),
+                }
+            });
+            return true;
+        }
+
+        if clipboard_formats_include_file_list(&formats) {
+            let weak = Rc::downgrade(self);
+            clipboard.read_async(
+                CLIPBOARD_FILE_MIME_TYPES,
+                glib::Priority::DEFAULT,
+                None::<&gio::Cancellable>,
+                move |result| {
+                    let Some(controller) = weak.upgrade() else {
+                        return;
+                    };
+                    match result {
+                        Ok((stream, _mime_type)) => match read_clipboard_stream_text(stream) {
+                            Ok(text) => {
+                                let paths = image_paths_from_clipboard_text(&text);
+                                if paths.is_empty() {
+                                    controller.toast(
+                                        "Aucune image reconnue dans le presse-papiers.".to_string(),
+                                    );
+                                } else {
+                                    controller.add_attachments_at(paths, insertion_offset);
+                                }
+                            }
+                            Err(error) => controller.toast(error),
+                        },
+                        Err(error) => controller.toast(format!(
+                            "Impossible de lire les fichiers du presse-papiers: {error}"
+                        )),
+                    }
+                },
+            );
+            return true;
+        }
+
+        false
+    }
+
     fn add_attachments(&self, paths: Vec<PathBuf>) {
+        let insertion_offset = self.composer.buffer().cursor_position();
+        self.add_attachments_at(paths, insertion_offset);
+    }
+
+    fn add_attachments_at(&self, paths: Vec<PathBuf>, insertion_offset: i32) {
         if paths.is_empty() {
             return;
         }
@@ -4793,7 +5462,6 @@ impl AppController {
             return;
         }
 
-        let insertion_offset = self.composer.buffer().cursor_position();
         let ui_tx = self.ui_tx.clone();
         self.backend.runtime.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -4843,9 +5511,18 @@ impl AppController {
     }
 
     fn render_attachment_bar(&self) {
-        clear_box(&self.attachment_bar);
         let attachments = self.pending_attachments.borrow().clone();
         self.attachment_bar.set_visible(!attachments.is_empty());
+        let signature = attachments
+            .iter()
+            .map(attachment_bar_item_signature)
+            .collect::<Vec<_>>()
+            .join("\u{1e}");
+        if self.attachment_bar_signature.borrow().as_str() == signature {
+            return;
+        }
+        *self.attachment_bar_signature.borrow_mut() = signature;
+        clear_box(&self.attachment_bar);
 
         for (index, attachment) in attachments.iter().enumerate() {
             if is_image_attachment(attachment) {
@@ -5178,6 +5855,13 @@ impl AppController {
         let show_send_button = running || has_text || has_attachments;
         let composer_height = composer_height_for_text(text.as_str());
         let composer_line_count = composer_line_count(text.as_str());
+        let composer_is_multiline = composer_line_count > 1 || has_attachments;
+
+        if composer_is_multiline {
+            self.composer_wrap.add_css_class("composer-multiline");
+        } else {
+            self.composer_wrap.remove_css_class("composer-multiline");
+        }
 
         if self.composer_last_running.replace(running) != running {
             self.send_button.set_icon_name(if running {
@@ -5197,10 +5881,13 @@ impl AppController {
             self.send_button.set_sensitive(show_send_button);
         }
         if self.composer_last_line_count.replace(composer_line_count) != composer_line_count {
-            self.composer
-                .set_top_margin(if composer_line_count <= 1 { 18 } else { 8 });
-            self.composer
-                .set_bottom_margin(if composer_line_count <= 1 { 0 } else { 8 });
+            let vertical_margin = if composer_line_count <= 1 {
+                COMPOSER_SINGLE_LINE_VERTICAL_MARGIN
+            } else {
+                COMPOSER_MULTI_LINE_VERTICAL_MARGIN
+            };
+            self.composer.set_top_margin(vertical_margin);
+            self.composer.set_bottom_margin(vertical_margin);
         }
         if self.composer_last_height.replace(composer_height) != composer_height {
             self.composer_scroll.set_min_content_height(composer_height);
@@ -5336,16 +6023,21 @@ impl AppController {
                 UiEvent::CodexThreadsSynced {
                     workspace_id,
                     result,
-                } => {
-                    if let Err(error) = result {
+                } => match result {
+                    Ok(changed_count) => {
+                        if self.active_workspace_id.borrow().as_deref()
+                            == Some(workspace_id.as_str())
+                            && changed_count > 0
+                        {
+                            self.request_view_snapshot_after_data_change();
+                        }
+                    }
+                    Err(error) => {
                         log::warn!(
                             "failed to sync Codex threads for workspace {workspace_id}: {error}"
                         );
                     }
-                    if self.active_workspace_id.borrow().as_deref() == Some(workspace_id.as_str()) {
-                        self.request_view_snapshot();
-                    }
-                }
+                },
                 UiEvent::CodexTranscriptSynced { thread_id, result } => {
                     if let Err(error) = result {
                         log::warn!(
@@ -5353,7 +6045,7 @@ impl AppController {
                         );
                     } else if self.active_thread_id.borrow().as_deref() == Some(thread_id.as_str())
                     {
-                        self.request_view_snapshot();
+                        self.request_view_snapshot_after_data_change();
                     }
                 }
                 UiEvent::CodexProfileSet { profile_id, result } => match result {
@@ -5370,7 +6062,7 @@ impl AppController {
                 } => match result {
                     Ok(()) => {
                         log::debug!("workspace trust level updated for {workspace_id}");
-                        self.request_view_snapshot();
+                        self.request_view_snapshot_after_data_change();
                     }
                     Err(error) => self.toast(error),
                 },
@@ -5444,6 +6136,7 @@ impl AppController {
                 }
                 UiEvent::ViewSnapshotLoaded(result) => {
                     self.loading_snapshot.set(false);
+                    *self.loading_snapshot_key.borrow_mut() = None;
                     match result {
                         Ok(snapshot) => {
                             if self.snapshot_is_stale(&snapshot) {
@@ -5487,15 +6180,27 @@ impl AppController {
                 UiEvent::StreamingMessageUpdated { thread_id, message } => {
                     self.apply_streaming_message_update(&thread_id, message);
                 }
+                UiEvent::TurnStarted {
+                    thread_id,
+                    user_message,
+                    assistant_message,
+                } => {
+                    self.apply_turn_started(&thread_id, user_message, assistant_message);
+                }
                 UiEvent::SelectThread(thread_id) => {
-                    if self.active_thread_id.borrow().as_deref() != Some(thread_id.as_str()) {
+                    let changed =
+                        self.active_thread_id.borrow().as_deref() != Some(thread_id.as_str());
+                    if changed {
                         self.remember_active_thread_scroll();
                         *self.editing_message.borrow_mut() = None;
+                        *self.active_thread_id.borrow_mut() = Some(thread_id);
+                        self.restore_cached_thread_view();
+                        self.render_threads();
+                        self.render_thread_tabs();
+                        self.render_messages();
+                        self.sync_composer_state();
+                        self.request_view_snapshot();
                     }
-                    *self.active_thread_id.borrow_mut() = Some(thread_id);
-                    self.restore_cached_thread_view();
-                    self.render_all();
-                    self.request_view_snapshot();
                 }
                 UiEvent::OpenThreadTab(thread_id) => {
                     self.open_thread_tab(&thread_id);
@@ -5509,13 +6214,24 @@ impl AppController {
                     user_turn_index,
                     content,
                 } => {
+                    let target_message_id = message_id.clone();
+                    let previous_message_id = self
+                        .editing_message
+                        .borrow()
+                        .as_ref()
+                        .map(|state| state.message_id.clone());
                     *self.editing_message.borrow_mut() = Some(EditingMessageState {
                         thread_id,
                         message_id,
                         user_turn_index,
                         draft: content,
                     });
-                    self.render_messages();
+                    if let Some(previous_message_id) = previous_message_id {
+                        self.refresh_active_message_widget(&previous_message_id);
+                    }
+                    if !self.refresh_active_message_widget(&target_message_id) {
+                        self.render_messages();
+                    }
                 }
                 UiEvent::UpdateEditMessageDraft {
                     message_id,
@@ -5538,7 +6254,9 @@ impl AppController {
                         .is_some_and(|state| state.message_id == message_id);
                     if should_cancel {
                         *self.editing_message.borrow_mut() = None;
-                        self.render_messages();
+                        if !self.refresh_active_message_widget(&message_id) {
+                            self.render_messages();
+                        }
                     }
                 }
                 UiEvent::SubmitEditMessage(message_id) => {
@@ -5557,7 +6275,9 @@ impl AppController {
                     }
 
                     *self.editing_message.borrow_mut() = None;
-                    self.render_messages();
+                    if !self.refresh_active_message_widget(&message_id) {
+                        self.render_messages();
+                    }
                     self.backend.edit_and_resume(
                         editing.thread_id,
                         editing.message_id,
@@ -5613,7 +6333,7 @@ impl AppController {
         }
 
         if reload_requested {
-            self.request_view_snapshot();
+            self.request_view_snapshot_after_data_change();
         }
         self.ui_tx.mark_processed(processed);
         log_perf(
@@ -5875,8 +6595,9 @@ fn compact_title(title: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         append_or_replace_diff_block, attachment_mention_insert_text, attachment_mention_ranges,
-        compact_title, find_resume_target_index, paths_from_dropped_text, single_line_text,
-        snapshot_request_is_stale, NativeContentBlock, PendingAttachment,
+        compact_title, find_resume_target_index, image_paths_from_clipboard_text, merge_messages,
+        paths_from_dropped_text, single_line_text, snapshot_request_is_stale, upsert_message,
+        NativeContentBlock, PendingAttachment,
     };
     use crate::models::{MessageDto, MessageStatusDto};
 
@@ -5965,6 +6686,30 @@ mod tests {
     }
 
     #[test]
+    fn image_paths_from_clipboard_text_keeps_only_image_files() {
+        let image_path = std::env::temp_dir().join(format!(
+            "supacodex-clipboard-image-test-{}.png",
+            uuid::Uuid::new_v4()
+        ));
+        let text_path = std::env::temp_dir().join(format!(
+            "supacodex-clipboard-text-test-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&image_path, b"image").expect("write image temp file");
+        std::fs::write(&text_path, b"text").expect("write text temp file");
+
+        let paths = image_paths_from_clipboard_text(&format!(
+            "copy\nfile://{}\nfile://{}\n",
+            image_path.to_string_lossy(),
+            text_path.to_string_lossy()
+        ));
+
+        assert_eq!(paths, vec![image_path.clone()]);
+        std::fs::remove_file(image_path).ok();
+        std::fs::remove_file(text_path).ok();
+    }
+
+    #[test]
     fn snapshot_request_staleness_tracks_workspace_and_thread_selection() {
         assert!(!snapshot_request_is_stale(
             Some("workspace-a"),
@@ -6018,6 +6763,35 @@ mod tests {
     }
 
     #[test]
+    fn upsert_message_preserves_arrival_order_for_equal_timestamps() {
+        let mut messages = Vec::new();
+        upsert_message(&mut messages, test_message("z-user", "user"));
+        upsert_message(&mut messages, test_message("a-assistant", "assistant"));
+
+        let ids = messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["z-user", "a-assistant"]);
+    }
+
+    #[test]
+    fn merge_messages_uses_incoming_page_order_before_preserving_existing_newer_messages() {
+        let existing = vec![test_message_at("live-user", "user", "2026-05-24 00:00:02")];
+        let incoming = vec![
+            test_message_at("db-user", "user", "2026-05-24 00:00:01"),
+            test_message_at("db-assistant", "assistant", "2026-05-24 00:00:01"),
+        ];
+
+        let merged = merge_messages(&existing, &incoming);
+        let ids = merged
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["db-user", "db-assistant", "live-user"]);
+    }
+
+    #[test]
     fn diff_updates_replace_existing_scope_snapshot() {
         let mut blocks = Vec::new();
         append_or_replace_diff_block(&mut blocks, "diff --git a/a b/a\n+one", "turn");
@@ -6044,6 +6818,10 @@ mod tests {
     }
 
     fn test_message(id: &str, role: &str) -> MessageDto {
+        test_message_at(id, role, "2026-05-24 00:00:00")
+    }
+
+    fn test_message_at(id: &str, role: &str, created_at: &str) -> MessageDto {
         MessageDto {
             id: id.to_string(),
             thread_id: "thread-a".to_string(),
@@ -6056,7 +6834,7 @@ mod tests {
             schema_version: 1,
             status: MessageStatusDto::Completed,
             token_usage: None,
-            created_at: "2026-05-24 00:00:00".to_string(),
+            created_at: created_at.to_string(),
         }
     }
 }
@@ -6122,6 +6900,36 @@ fn paths_from_dropped_text(text: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+fn clipboard_formats_include_image(formats: &gdk::ContentFormats) -> bool {
+    formats.contains_type(gdk::Texture::static_type())
+        || formats
+            .mime_types()
+            .iter()
+            .any(|mime_type| mime_type.as_str().starts_with("image/"))
+}
+
+fn clipboard_formats_include_file_list(formats: &gdk::ContentFormats) -> bool {
+    CLIPBOARD_FILE_MIME_TYPES
+        .iter()
+        .any(|mime_type| formats.contain_mime_type(mime_type))
+}
+
+fn read_clipboard_stream_text(stream: gio::InputStream) -> Result<String, String> {
+    let mut reader = stream.into_read();
+    let mut text = String::new();
+    reader
+        .read_to_string(&mut text)
+        .map_err(|error| format!("Impossible de lire le presse-papiers: {error}"))?;
+    Ok(text)
+}
+
+fn image_paths_from_clipboard_text(text: &str) -> Vec<PathBuf> {
+    paths_from_dropped_text(text)
+        .into_iter()
+        .filter(|path| is_image_path(path.to_string_lossy().as_ref()))
+        .collect()
+}
+
 fn guess_mime_type(path: &Path) -> Option<String> {
     let extension = path
         .extension()
@@ -6156,6 +6964,18 @@ fn is_image_attachment(attachment: &PendingAttachment) -> bool {
         || is_image_path(&attachment.file_path)
 }
 
+fn attachment_bar_item_signature(attachment: &PendingAttachment) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{:?}\u{1f}{:?}\u{1f}{}",
+        attachment.file_name,
+        attachment.file_path,
+        attachment.size_bytes,
+        attachment.mention,
+        attachment.thumbnail_path,
+        attachment.thumbnail_failed
+    )
+}
+
 fn build_attachment_thumbnail(file_path: &str) -> Result<String, String> {
     let pixbuf = gdk_pixbuf::Pixbuf::from_file_at_scale(
         file_path,
@@ -6173,6 +6993,17 @@ fn build_attachment_thumbnail(file_path: &str) -> Result<String, String> {
         .savev(&thumbnail_path, "png", &[])
         .map_err(|error| format!("Impossible d'ecrire le thumbnail: {error}"))?;
     Ok(thumbnail_path.to_string_lossy().to_string())
+}
+
+fn save_clipboard_texture(texture: &gdk::Texture) -> Result<PathBuf, String> {
+    let image_dir = std::env::temp_dir().join(PASTED_IMAGE_DIR_NAME);
+    fs::create_dir_all(&image_dir)
+        .map_err(|error| format!("Impossible de preparer le collage d'image: {error}"))?;
+    let image_path = image_dir.join(format!("pasted-image-{}.png", uuid::Uuid::new_v4()));
+    texture
+        .save_to_png(&image_path)
+        .map_err(|error| format!("Impossible d'enregistrer l'image collee: {error}"))?;
+    Ok(image_path)
 }
 
 fn attachment_preview_widget(attachment: &PendingAttachment) -> gtk::Widget {
@@ -6296,13 +7127,25 @@ fn row_box(icon_name: &str, title: &str, subtitle: Option<&str>) -> gtk::Box {
 }
 
 fn message_label(text: &str) -> gtk::Label {
+    message_label_with_max_width(text, MESSAGE_TEXT_MAX_WIDTH_CHARS)
+}
+
+fn message_label_with_max_width(text: &str, max_width_chars: i32) -> gtk::Label {
     let label = gtk::Label::new(Some(text.trim()));
     label.add_css_class("message-text");
-    label.set_xalign(0.0);
-    label.set_wrap(true);
-    label.set_max_width_chars(88);
+    configure_wrapped_label(&label, max_width_chars);
     label.set_selectable(true);
     label
+}
+
+fn configure_wrapped_label(label: &gtk::Label, max_width_chars: i32) {
+    label.set_halign(gtk::Align::Start);
+    label.set_hexpand(false);
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    label.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
+    label.set_max_width_chars(max_width_chars);
 }
 
 fn block_card(title: &str, body: Option<&str>) -> gtk::Box {
@@ -6310,16 +7153,12 @@ fn block_card(title: &str, body: Option<&str>) -> gtk::Box {
     card.add_css_class("block-card");
     let title_label = gtk::Label::new(Some(title));
     title_label.add_css_class("block-title");
-    title_label.set_xalign(0.0);
-    title_label.set_wrap(true);
-    title_label.set_max_width_chars(88);
+    configure_wrapped_label(&title_label, MESSAGE_TEXT_MAX_WIDTH_CHARS);
     card.append(&title_label);
     if let Some(body) = body.filter(|value| !value.trim().is_empty()) {
         let body_label = gtk::Label::new(Some(body.trim()));
         body_label.add_css_class("dim-label");
-        body_label.set_xalign(0.0);
-        body_label.set_wrap(true);
-        body_label.set_max_width_chars(88);
+        configure_wrapped_label(&body_label, MESSAGE_TEXT_MAX_WIDTH_CHARS);
         body_label.set_selectable(true);
         card.append(&body_label);
     }
@@ -6332,21 +7171,38 @@ fn collapsible_header(title: &str, subtitle: Option<&str>) -> gtk::Box {
 
     let title_label = gtk::Label::new(Some(title));
     title_label.add_css_class("block-title");
-    title_label.set_xalign(0.0);
-    title_label.set_wrap(true);
-    title_label.set_max_width_chars(88);
+    configure_wrapped_label(&title_label, MESSAGE_TEXT_MAX_WIDTH_CHARS);
     header.append(&title_label);
 
     if let Some(subtitle) = subtitle.filter(|value| !value.trim().is_empty()) {
         let subtitle_label = gtk::Label::new(Some(subtitle.trim()));
         subtitle_label.add_css_class("block-subtitle");
-        subtitle_label.set_xalign(0.0);
-        subtitle_label.set_wrap(true);
-        subtitle_label.set_max_width_chars(88);
+        configure_wrapped_label(&subtitle_label, MESSAGE_TEXT_MAX_WIDTH_CHARS);
         header.append(&subtitle_label);
     }
 
     header
+}
+
+fn action_body_text(
+    output_chunks: &[NativeActionOutputChunk],
+    result: Option<&NativeActionResult>,
+) -> String {
+    let mut body = output_chunks
+        .iter()
+        .map(|chunk| chunk.content.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    if body.trim().is_empty() {
+        if let Some(result) = result {
+            body = result
+                .output
+                .clone()
+                .or_else(|| result.error.clone())
+                .unwrap_or_else(|| "Termine".to_string());
+        }
+    }
+    body
 }
 
 fn code_card(title: &str, body: &str) -> gtk::Box {
@@ -6374,12 +7230,14 @@ fn code_output_content(body: &str) -> gtk::Box {
     } else {
         full_text.as_ref().clone()
     };
-    let output = gtk::Label::new(Some(&preview_text));
+    let output = gtk::TextView::new();
     output.add_css_class("code-output");
-    output.set_xalign(0.0);
-    output.set_wrap(false);
-    output.set_max_width_chars(96);
-    output.set_selectable(true);
+    output.set_editable(false);
+    output.set_cursor_visible(false);
+    output.set_monospace(true);
+    output.set_wrap_mode(gtk::WrapMode::None);
+    output.set_vexpand(false);
+    output.buffer().set_text(&preview_text);
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .vscrollbar_policy(gtk::PolicyType::Never)
@@ -6402,10 +7260,10 @@ fn code_output_content(body: &str) -> gtk::Box {
             let next = !expanded_for_toggle.get();
             expanded_for_toggle.set(next);
             if next {
-                output_for_toggle.set_text(&full_text_for_toggle);
+                output_for_toggle.buffer().set_text(&full_text_for_toggle);
                 button.set_label("Reduire");
             } else {
-                output_for_toggle.set_text(&preview_for_toggle);
+                output_for_toggle.buffer().set_text(&preview_for_toggle);
                 button.set_label("Voir plus");
             }
         });
@@ -6427,14 +7285,172 @@ fn clear_box(container: &gtk::Box) {
     }
 }
 
-fn scroll_scrolled_window_to_bottom(scroll: &gtk::ScrolledWindow) {
+fn box_children(container: &gtk::Box) -> Vec<gtk::Widget> {
+    let mut children = Vec::new();
+    let mut child = container.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        children.push(widget);
+    }
+    children
+}
+
+fn update_single_label_child(body: &gtk::Box, widget_name: &str, text: &str) -> bool {
+    let children = box_children(body);
+    if children.len() != 1 {
+        return false;
+    }
+    update_label_widget(&children[0], widget_name, text)
+}
+
+fn update_label_widget(widget: &gtk::Widget, widget_name: &str, text: &str) -> bool {
+    if widget.widget_name().as_str() != widget_name {
+        return false;
+    }
+    let Some(label) = widget.downcast_ref::<gtk::Label>() else {
+        return false;
+    };
+    let text = text.trim();
+    if label.text().as_str() != text {
+        label.set_text(text);
+    }
+    true
+}
+
+fn update_block_widget_in_place(widget: &gtk::Widget, block: &NativeContentBlock) -> bool {
+    match block {
+        NativeContentBlock::Text { content, .. } => {
+            update_label_widget(widget, "message-block-text", content)
+        }
+        NativeContentBlock::Thinking { content } => {
+            if widget.widget_name().as_str() != "message-block-thinking" {
+                return false;
+            }
+            let Some(label_widget) =
+                find_descendant_by_widget_name(widget, "message-block-thinking-content")
+            else {
+                return false;
+            };
+            update_label_widget(&label_widget, "message-block-thinking-content", content)
+        }
+        NativeContentBlock::Diff { diff, .. } => {
+            widget.widget_name().as_str() == "message-block-diff"
+                && update_code_output_text(widget, diff)
+        }
+        NativeContentBlock::Action {
+            action_type,
+            summary,
+            output_chunks,
+            result,
+            ..
+        } => {
+            if widget.widget_name().as_str() != "message-block-action"
+                || result
+                    .as_ref()
+                    .and_then(|result| result.diff.as_deref())
+                    .is_some_and(|diff| !diff.trim().is_empty())
+            {
+                return false;
+            }
+
+            if let Some(title_widget) = widget.first_child() {
+                let Some(title_label) = title_widget.downcast_ref::<gtk::Label>() else {
+                    return false;
+                };
+                let title = format!("{action_type}: {summary}");
+                if title_label.text().as_str() != title {
+                    title_label.set_text(&title);
+                }
+            }
+
+            let body = action_body_text(output_chunks, result.as_ref());
+            if body.trim().is_empty() {
+                find_descendant_text_view(widget).is_none()
+            } else {
+                update_code_output_text(widget, &body)
+            }
+        }
+        _ => false,
+    }
+}
+
+fn find_descendant_by_widget_name(widget: &gtk::Widget, widget_name: &str) -> Option<gtk::Widget> {
+    if widget.widget_name().as_str() == widget_name {
+        return Some(widget.clone());
+    }
+
+    let mut child = widget.first_child();
+    while let Some(candidate) = child {
+        if let Some(found) = find_descendant_by_widget_name(&candidate, widget_name) {
+            return Some(found);
+        }
+        child = candidate.next_sibling();
+    }
+    None
+}
+
+fn find_descendant_text_view(widget: &gtk::Widget) -> Option<gtk::TextView> {
+    if let Some(text_view) = widget.downcast_ref::<gtk::TextView>() {
+        return Some(text_view.clone());
+    }
+
+    let mut child = widget.first_child();
+    while let Some(candidate) = child {
+        if let Some(found) = find_descendant_text_view(&candidate) {
+            return Some(found);
+        }
+        child = candidate.next_sibling();
+    }
+    None
+}
+
+fn update_code_output_text(widget: &gtk::Widget, body: &str) -> bool {
+    let body = body.trim();
+    if body.chars().count() > 2400 {
+        return false;
+    }
+    let Some(text_view) = find_descendant_text_view(widget) else {
+        return false;
+    };
+    let buffer = text_view.buffer();
+    let current = buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), false)
+        .to_string();
+    if current != body {
+        buffer.set_text(body);
+    }
+    true
+}
+
+fn messages_adjustment_is_near_bottom(adjustment: &gtk::Adjustment) -> bool {
+    let distance = adjustment.upper() - adjustment.page_size() - adjustment.value();
+    distance <= MESSAGE_AUTO_FOLLOW_DISTANCE
+}
+
+fn set_adjustment_value_programmatically(
+    adjustment: &gtk::Adjustment,
+    value: f64,
+    programmatic_scroll: &Rc<Cell<bool>>,
+) {
+    programmatic_scroll.set(true);
+    adjustment.set_value(value);
+    programmatic_scroll.set(false);
+}
+
+fn scroll_scrolled_window_to_bottom(
+    scroll: &gtk::ScrolledWindow,
+    programmatic_scroll: &Rc<Cell<bool>>,
+) {
     let adjustment = scroll.vadjustment();
     let max_value = (adjustment.upper() - adjustment.page_size()).max(0.0);
-    adjustment.set_value(max_value);
+    set_adjustment_value_programmatically(&adjustment, max_value, programmatic_scroll);
 }
 
 fn settle_scrolled_window_to_bottom(
     scroll: gtk::ScrolledWindow,
+    generation: Rc<Cell<u64>>,
+    programmatic_scroll: Rc<Cell<bool>>,
+    expected_generation: u64,
     remaining_passes: u8,
     interval: Duration,
 ) {
@@ -6443,9 +7459,15 @@ fn settle_scrolled_window_to_bottom(
     }
 
     glib::timeout_add_local(interval, move || {
-        scroll_scrolled_window_to_bottom(&scroll);
+        if generation.get() != expected_generation {
+            return glib::ControlFlow::Break;
+        }
+        scroll_scrolled_window_to_bottom(&scroll, &programmatic_scroll);
         settle_scrolled_window_to_bottom(
             scroll.clone(),
+            Rc::clone(&generation),
+            Rc::clone(&programmatic_scroll),
+            expected_generation,
             remaining_passes.saturating_sub(1),
             interval,
         );
@@ -6591,20 +7613,29 @@ fn upsert_message(messages: &mut Vec<MessageDto>, message: MessageDto) {
         *existing = message;
     } else {
         messages.push(message);
-        messages.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.id.cmp(&right.id))
-        });
     }
 }
 
 fn merge_messages(existing: &[MessageDto], incoming: &[MessageDto]) -> Vec<MessageDto> {
-    let mut merged = existing.to_vec();
-    for message in incoming {
-        upsert_message(&mut merged, message.clone());
+    let incoming_ids = incoming
+        .iter()
+        .map(|message| message.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut merged = incoming.to_vec();
+    for message in existing {
+        if !incoming_ids.contains(message.id.as_str()) {
+            insert_message_by_timestamp(&mut merged, message.clone());
+        }
     }
     merged
+}
+
+fn insert_message_by_timestamp(messages: &mut Vec<MessageDto>, message: MessageDto) {
+    let insert_index = messages
+        .iter()
+        .position(|candidate| candidate.created_at > message.created_at)
+        .unwrap_or(messages.len());
+    messages.insert(insert_index, message);
 }
 
 fn message_plain_text(message: &MessageDto) -> Option<String> {

@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 
 use anyhow::Context;
@@ -410,12 +412,14 @@ fn read_threads_for_profile(profile: &CodexProfileConfig) -> anyhow::Result<Vec<
 
     read_threads_with_query(
         &connection,
+        Path::new(&profile.codex_home),
         "SELECT id,
                 cwd,
                 title,
                 first_user_message,
                 created_at,
                 updated_at,
+                rollout_path,
                 model_provider,
                 archived
          FROM threads
@@ -425,19 +429,26 @@ fn read_threads_for_profile(profile: &CodexProfileConfig) -> anyhow::Result<Vec<
 
 fn read_threads_with_query(
     connection: &Connection,
+    codex_home: &Path,
     query: &str,
 ) -> anyhow::Result<Vec<ProfileThreadRow>> {
     let mut statement = connection.prepare(query)?;
     let rows = statement.query_map([], |row| {
+        let last_updated_at = row.get(5)?;
+        let rollout_path: String = row.get(6)?;
         Ok(ProfileThreadRow {
             engine_thread_id: row.get(0)?,
             cwd: row.get(1)?,
             title: row.get(2)?,
             first_user_message: row.get(3)?,
             created_at: row.get(4)?,
-            last_updated_at: row.get(5)?,
-            model_provider: row.get(6)?,
-            archived: row.get::<_, i64>(7)? != 0,
+            last_updated_at: effective_thread_updated_at(
+                last_updated_at,
+                codex_home,
+                &rollout_path,
+            ),
+            model_provider: row.get(7)?,
+            archived: row.get::<_, i64>(8)? != 0,
         })
     })?;
 
@@ -506,6 +517,92 @@ fn timestamp_to_rfc3339(timestamp: i64) -> String {
         .to_rfc3339()
 }
 
+fn effective_thread_updated_at(
+    database_updated_at: i64,
+    codex_home: &Path,
+    rollout_path: &str,
+) -> i64 {
+    rollout_modified_timestamp(codex_home, rollout_path)
+        .map(|rollout_updated_at| database_updated_at.max(rollout_updated_at))
+        .unwrap_or(database_updated_at)
+}
+
+fn rollout_modified_timestamp(codex_home: &Path, rollout_path: &str) -> Option<i64> {
+    let path = resolve_rollout_path(codex_home, rollout_path);
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    let seconds = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    i64::try_from(seconds).ok()
+}
+
+fn resolve_rollout_path(codex_home: &Path, rollout_path: &str) -> PathBuf {
+    let path = PathBuf::from(rollout_path);
+    if path.is_absolute() {
+        path
+    } else {
+        codex_home.join(path)
+    }
+}
+
 fn shell_single_quote_escape(value: &str) -> String {
     format!("'{}'", value.replace('\'', r#"'\''"#))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        io::Write,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use uuid::Uuid;
+
+    use super::{effective_thread_updated_at, rollout_modified_timestamp};
+
+    #[test]
+    fn effective_thread_updated_at_uses_newer_rollout_mtime() {
+        let dir =
+            std::env::temp_dir().join(format!("supacodex-codex-rollout-mtime-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let rollout_path = dir.join("rollout.jsonl");
+        let mut file = fs::File::create(&rollout_path).expect("create rollout");
+        writeln!(file, "{{}}").expect("write rollout");
+
+        let rollout_timestamp =
+            rollout_modified_timestamp(&dir, "rollout.jsonl").expect("rollout mtime");
+        let stale_database_timestamp = 1;
+
+        assert_eq!(
+            effective_thread_updated_at(
+                stale_database_timestamp,
+                &dir,
+                rollout_path.to_string_lossy().as_ref(),
+            ),
+            rollout_timestamp
+        );
+        assert!(rollout_timestamp > stale_database_timestamp);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn effective_thread_updated_at_keeps_database_time_when_rollout_is_missing() {
+        let missing_path = std::env::temp_dir().join(format!(
+            "supacodex-missing-rollout-{}.jsonl",
+            Uuid::new_v4()
+        ));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs() as i64;
+
+        assert_eq!(
+            effective_thread_updated_at(
+                now,
+                std::env::temp_dir().as_path(),
+                missing_path.to_string_lossy().as_ref(),
+            ),
+            now
+        );
+    }
 }

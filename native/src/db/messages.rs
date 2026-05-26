@@ -853,12 +853,13 @@ fn insert_message(
     turn_reasoning_effort: Option<&str>,
 ) -> anyhow::Result<MessageDto> {
     let id = Uuid::new_v4().to_string();
+    let created_at = Utc::now().format("%Y-%m-%d %H:%M:%S%.6f").to_string();
     let conn = db.connect()?;
     conn.execute(
         "INSERT INTO messages (
-            id, thread_id, role, content, blocks_json, schema_version, status, turn_engine_id, turn_model_id, turn_reasoning_effort
+            id, thread_id, role, content, blocks_json, schema_version, status, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at
         )
-     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9)",
+     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10)",
         params![
             id,
             thread_id,
@@ -868,7 +869,8 @@ fn insert_message(
             status.as_str(),
             turn_engine_id,
             turn_model_id,
-            turn_reasoning_effort
+            turn_reasoning_effort,
+            created_at
         ],
     )
     .context("failed to insert message")?;
